@@ -1,0 +1,48 @@
+{
+  "name": "page-watch",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:api\" \"npm:dev:worker\" \"npm:dev:release-worker\" \"npm:dev:magnet-worker\" \"npm:dev:download-worker\" \"npm:dev:library-worker\" \"npm:dev:web\"",
+    "dev:api": "tsx server/index.ts",
+    "dev:worker": "tsx server/worker.ts",
+    "dev:release-worker": "tsx server/release-worker.ts",
+    "dev:magnet-worker": "tsx server/magnet-worker.ts",
+    "dev:download-worker": "tsx server/download-worker.ts",
+    "dev:library-worker": "tsx server/library-worker.ts",
+    "dev:web": "vite --host 0.0.0.0",
+    "migrate:mysql": "tsx server/migrate-sqlite-to-mysql.ts",
+    "verify:mysql-migration": "tsx server/verify-mysql-migration.ts",
+    "build": "vite build",
+    "start": "tsx server/index.ts",
+    "worker": "tsx server/worker.ts",
+    "release-worker": "tsx server/release-worker.ts",
+    "magnet-worker": "tsx server/magnet-worker.ts",
+    "download-worker": "tsx server/download-worker.ts",
+    "library-worker": "tsx server/library-worker.ts"
+  },
+  "dependencies": {
+    "@fastify/static": "^8.3.0",
+    "better-sqlite3": "^12.4.1",
+    "cheerio": "^1.1.2",
+    "dotenv": "^17.4.2",
+    "fastify": "^5.6.1",
+    "mysql2": "^3.24.4",
+    "playwright": "1.63.0",
+    "undici": "^7.16.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.3.1",
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.2",
+    "concurrently": "^9.2.1",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.4"
+  }
+}

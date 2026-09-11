@@ -1,0 +1,63 @@
+name: page-watch
+
+x-page-watch-environment: &page-watch-environment
+  OUTBOUND_PROXY: ${OUTBOUND_PROXY:-}
+  MYSQL_HOST: ${MYSQL_HOST:?请在 deploy/.env 配置 MYSQL_HOST}
+  MYSQL_PORT: ${MYSQL_PORT:-3306}
+  MYSQL_DATABASE: ${MYSQL_DATABASE:?请在 deploy/.env 配置 MYSQL_DATABASE}
+  MYSQL_USER: ${MYSQL_USER:?请在 deploy/.env 配置 MYSQL_USER}
+  MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请在 deploy/.env 配置 MYSQL_PASSWORD}
+
+x-page-watch-service: &page-watch-service
+  image: ${PAGE_WATCH_IMAGE:?请在 deploy/.env 配置 PAGE_WATCH_IMAGE}
+  platform: linux/amd64
+  init: true
+  restart: unless-stopped
+  environment:
+    <<: *page-watch-environment
+
+services:
+  app:
+    <<: *page-watch-service
+    command: npm run start
+    ports:
+      - "${PAGE_WATCH_PORT:-3030}:3030"
+    environment:
+      <<: *page-watch-environment
+      PORT: 3030
+      APP_SESSION_SECURE: ${APP_SESSION_SECURE:-false}
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3030/api/health').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  worker:
+    <<: *page-watch-service
+    command: npm run worker
+    shm_size: 1gb
+    environment:
+      <<: *page-watch-environment
+      PLAYWRIGHT_HEADLESS: "true"
+
+  release-worker:
+    <<: *page-watch-service
+    command: npm run release-worker
+
+  magnet-worker:
+    <<: *page-watch-service
+    command: npm run magnet-worker
+
+  download-worker:
+    <<: *page-watch-service
+    command: npm run download-worker
+
+  library-worker:
+    <<: *page-watch-service
+    command: npm run library-worker
+
+networks:
+  default:
+    name: ${PAGE_WATCH_NETWORK:-page-watch-backend}
+    external: true
