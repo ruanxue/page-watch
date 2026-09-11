@@ -109,10 +109,10 @@ let lastSettingsRefreshAt = 0;
 const SETTINGS_REFRESH_MS = 3_000;
 const missavTitlePattern = '^[A-Za-z]+-\\d+\\s*(.+)$';
 const defaultSubscriptionPresets = [
-  ['MissAV 番号列表', '适用于列表页，读取影片番号与标题。', 'a.text-secondary[alt]', 'dynamic', 'attribute', 'alt', '', 'a.text-secondary[alt]', 'text', null, missavTitlePattern, 'all', 60, 1],
-  ['文章标题列表', '读取文章区域的一级、二级标题。', 'article h1, article h2, main h1, main h2', 'static', 'text', '', '', null, 'text', null, null, 'all', 120, 1],
-  ['商品价格', '读取常见的价格字段，适合监测商品详情页。', '[itemprop="price"], .price, [data-price]', 'static', 'text', '', '', null, 'text', null, null, 'first', 30, 1],
-  ['页面标题', '读取网页标题，适合检查页面是否替换或发布新版本。', 'title', 'static', 'text', '', '', null, 'text', null, null, 'first', 240, 1]
+  ['MissAV 番号列表', '适用于列表页，读取影片番号、标题和全部分页内容。', 'a.text-secondary[alt]', 'dynamic', 'attribute', 'alt', '', 'a.text-secondary[alt]', 'text', null, missavTitlePattern, 'all', 60, '#price-currency', 'page', '/\\s*(\\d+)', 1],
+  ['文章标题列表', '读取文章区域的一级、二级标题。', 'article h1, article h2, main h1, main h2', 'static', 'text', '', '', null, 'text', null, null, 'all', 120, null, 'page', null, 1],
+  ['商品价格', '读取常见的价格字段，适合监测商品详情页。', '[itemprop="price"], .price, [data-price]', 'static', 'text', '', '', null, 'text', null, null, 'first', 30, null, 'page', null, 1],
+  ['页面标题', '读取网页标题，适合检查页面是否替换或发布新版本。', 'title', 'static', 'text', '', '', null, 'text', null, null, 'first', 240, null, 'page', null, 1]
 ] as const;
 
 export async function getSubscription(id: number) {
@@ -296,13 +296,43 @@ async function seedDefaultSubscriptionPresets() {
   await db.transaction(async (tx) => {
     for (const preset of defaultSubscriptionPresets) {
       await tx.run(`INSERT INTO subscription_presets
-        (name, description, selector, render_mode, content_source, attribute_name, match_pattern, title_selector, title_content_source, title_attribute_name, title_match_pattern, result_mode, interval_minutes, is_active, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [...preset, now, now]);
+        (name, description, selector, render_mode, content_source, attribute_name, match_pattern, title_selector, title_content_source, title_attribute_name, title_match_pattern, result_mode, interval_minutes, pagination_selector, pagination_parameter, pagination_match_pattern, is_active, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [...preset, now, now]);
     }
     await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, ?, ?)
       ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`, ['subscription_presets_seeded', '1', now]);
   });
   settings.set('subscription_presets_seeded', '1');
+}
+
+/**
+ * The rule-library split briefly seeded the MissAV preset without its page
+ * counter. Repair only untouched default-shaped presets and new, uninspected
+ * MissAV subscriptions; custom rules and already collected archives stay as-is.
+ */
+async function backfillMissavPaginationDefaults() {
+  const migrationKey = 'missav_list_pagination_backfill_v1';
+  if (getSetting(migrationKey)) return;
+  const now = new Date().toISOString();
+  await db.transaction(async (tx) => {
+    await tx.run(`UPDATE subscription_presets
+      SET description = ?, pagination_selector = ?, pagination_parameter = ?, pagination_match_pattern = ?, updated_at = ?
+      WHERE name = 'MissAV 番号列表'
+        AND selector = 'a.text-secondary[alt]'
+        AND (pagination_selector IS NULL OR TRIM(pagination_selector) = '')`,
+    ['适用于列表页，读取影片番号、标题和全部分页内容。', '#price-currency', 'page', '/\\s*(\\d+)', now]);
+    await tx.run(`UPDATE subscriptions
+      SET pagination_selector = ?, pagination_parameter = ?, pagination_match_pattern = ?,
+          initial_scan_completed = 0, initial_scan_total = NULL, initial_scan_pages_completed = 0, updated_at = ?
+      WHERE last_checked_at IS NULL
+        AND selector = 'a.text-secondary[alt]'
+        AND (pagination_selector IS NULL OR TRIM(pagination_selector) = '')
+        AND (url LIKE 'https://missav123.com/%' OR url LIKE 'http://missav123.com/%')`,
+    ['#price-currency', 'page', '/\\s*(\\d+)', now]);
+    await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, '1', ?)
+      ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`, [migrationKey, now]);
+  });
+  settings.set(migrationKey, '1');
 }
 
 async function seedDefaultInspectionRules() {
@@ -313,4 +343,5 @@ async function seedDefaultInspectionRules() {
 await ensureMySqlSchema(pool);
 await preloadSettings();
 await seedDefaultSubscriptionPresets();
+await backfillMissavPaginationDefaults();
 await seedDefaultInspectionRules();

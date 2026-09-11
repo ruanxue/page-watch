@@ -928,7 +928,7 @@ function Editor({ item, onClose, onSaved, onFullScan, onArchiveCleared }: { item
   return <div className="overlay" role="dialog" aria-modal="true" aria-labelledby="editor-title" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><form className="editor subscription-editor" onSubmit={submit}>
     <header><div><p className="eyebrow">网页订阅</p><h2 id="editor-title">{item ? '编辑订阅' : '新建订阅'}</h2></div><button type="button" className="close" onClick={onClose}>×</button></header>
     <div className="editor-body">
-    {!item && <section className="subscription-rule-picker"><label>检查规则<select value={presetId} onChange={(event) => applyPreset(event.target.value)}><option value="">请选择检查规则</option>{presets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select></label>{selectedPreset && <p>{selectedPreset.description || '已填入内容、标题与分页读取条件。'}</p>}</section>}
+    {!item && <section className="subscription-rule-picker"><label>检查规则<select value={presetId} onChange={(event) => applyPreset(event.target.value)}><option value="">请选择检查规则</option>{presets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select></label>{selectedPreset && <p>{selectedPreset.description || '已填入内容、标题与分页读取条件。'}{form.paginationSelector ? ' 首次计划检查会自动读取全部分页；保存后也可手动全量检查。' : ''}</p>}</section>}
     <label>订阅名称<input autoFocus value={form.name} onChange={(e) => update('name', e.target.value)} placeholder="例如：商品价格" /></label>
     <label>网页地址<input type="url" value={form.url} onChange={(e) => update('url', e.target.value)} placeholder="https://example.com/page" /></label>
     <ScheduleControls form={form} update={update} />
