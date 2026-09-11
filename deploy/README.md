@@ -92,6 +92,28 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
+## 网页提示与一键更新
+
+Page Watch 不会把 Docker Socket 暴露给网页容器。部署配置会将 `deploy/update-state` 挂载到容器中，网页只读取版本状态并提交更新请求；NAS 主机上的更新检查脚本才拥有拉取镜像、重建容器的权限。
+
+首次升级到支持该功能的镜像后，在 NAS 上执行一次：
+
+```bash
+cd /vol1/1000/Docker/pagewatch
+chmod 700 scripts/nas/update-check.sh
+mkdir -p deploy/update-state
+chmod 700 deploy/update-state
+bash scripts/nas/update-check.sh
+```
+
+然后通过 NAS 的任务计划或 root crontab 每 5 分钟执行一次：
+
+```cron
+*/5 * * * * /bin/bash /vol1/1000/Docker/pagewatch/scripts/nas/update-check.sh >> /vol1/1000/Docker/pagewatch/deploy/update-state/updater.log 2>&1
+```
+
+该脚本使用现有的 `docker login ghcr.io` 凭据检查 `stable` 标签。检测到新镜像后，网页顶部会显示“新版本可用 · 立即更新”；点击后，下一次 NAS 更新检查会拉取并重建唯一的 `pagewatch` 容器。更新时服务会短暂重启，MySQL 数据库与 `deploy/.env` 不会变更。
+
 ## 回滚
 
 升级前建议先按既有策略备份 MySQL 的 `page_watch` 数据库。若镜像升级后出现问题，在 GitHub Actions 页面或 GHCR 包页面找到上一版的 `sha-...`、`v...` 标签或摘要，再执行：

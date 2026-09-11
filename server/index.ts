@@ -9,6 +9,7 @@ import { assertJellyfinConfig, listJellyfinLibraries, normalizeJellyfinUrl, test
 import { syncJellyfinLibrary } from './jellyfin-sync.js';
 import { authenticate, clearSessionCookie, configurePassword, createSession, sessionCookie, statusFor, validatePassword } from './auth.js';
 import { getInspectionRules, inspectionRulesJson, normalizeInspectionRules } from './inspection-rules.js';
+import { readUpdateStatus, requestUpdate } from './update-state.js';
 
 const app = Fastify({ logger: { level: 'warn' } });
 const port = Number(process.env.PORT ?? 3030);
@@ -260,6 +261,15 @@ async function listSubscriptions() {
 }
 
 app.get('/api/health', async () => ({ ok: true }));
+app.get('/api/system/update', async () => readUpdateStatus());
+app.post('/api/system/update', async () => {
+  const status = await readUpdateStatus();
+  if (!status.configured) throw new Error('NAS 更新助手尚未配置。请按部署说明启用更新检查任务。');
+  if (!status.updateAvailable) throw new Error('当前没有可安装的新版本。');
+  await requestUpdate();
+  await appendRuntimeLog({ level: 'info', source: 'system', message: '已从网页提交 Page Watch 更新请求，等待 NAS 更新助手执行。' });
+  return { queued: true };
+});
 app.get('/api/events', async (request, reply) => {
   const query = request.query as { channel?: string; subscriptionId?: string };
   const channel: LiveChannel | null = query.channel === 'archive' || query.channel === 'logs' ? query.channel : null;
