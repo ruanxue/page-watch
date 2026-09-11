@@ -3,6 +3,5 @@ dist
 data
 .env
 deploy/.env
-deploy/update-state/
 .npm-cache
 work

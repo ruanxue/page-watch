@@ -107,7 +107,6 @@ type RuntimeLog = {
 type AuthStatus = { setupRequired: boolean; authenticated: boolean };
 type SystemService = { name: string; label: string; status: 'ready' | 'busy' | 'error' | 'missing'; detail: string; lastSeenAt: string | null; healthy: boolean };
 type SystemStatus = { generatedAt: string; services: SystemService[] };
-type UpdateStatus = { configured: boolean; checkedAt: string | null; phase: 'idle' | 'ready' | 'applying' | 'completed' | 'failed'; updateAvailable: boolean; message: string | null };
 
 const blankForm: FormData = {
   name: '', url: '', selector: '', renderMode: 'static', contentSource: 'text', attributeName: '', matchPattern: '', titleSelector: '', titleContentSource: 'text', titleAttributeName: '', titleMatchPattern: '', resultMode: 'first', intervalMinutes: 60, scheduleType: 'hourly', scheduleIntervalHours: 1, scheduleTime: '09:00', scheduleWeekday: 1, isActive: true, paginationSelector: '', paginationParameter: 'page', paginationMatchPattern: ''
@@ -196,8 +195,6 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const [view, setView] = useState<View>(viewFromHash);
   const [rulesOpen, setRulesOpen] = useState(() => window.location.hash === '#rules');
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
-  const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
-  const [updateBusy, setUpdateBusy] = useState(false);
 
   const load = async () => {
     try { setSubscriptions(await request<Subscription[]>('/api/subscriptions')); }
@@ -216,18 +213,6 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
     };
     void loadStatus();
     const timer = window.setInterval(() => void loadStatus(), 15_000);
-    return () => { alive = false; window.clearInterval(timer); };
-  }, []);
-  useEffect(() => {
-    let alive = true;
-    const loadUpdateStatus = async () => {
-      try {
-        const status = await request<UpdateStatus>('/api/system/update');
-        if (alive) setUpdateStatus(status);
-      } catch { if (alive) setUpdateStatus(null); }
-    };
-    void loadUpdateStatus();
-    const timer = window.setInterval(() => void loadUpdateStatus(), 30_000);
     return () => { alive = false; window.clearInterval(timer); };
   }, []);
   useEffect(() => {
@@ -297,17 +282,6 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
     } catch (error) { setNotice(error instanceof Error ? error.message : '操作失败。'); }
   }
 
-  async function applyUpdate() {
-    if (!window.confirm('安装新版本会短暂重启 Page Watch，确定继续吗？')) return;
-    setUpdateBusy(true);
-    try {
-      await request('/api/system/update', { method: 'POST' });
-      setUpdateStatus((current) => current ? { ...current, phase: 'applying' } : current);
-      setNotice('更新请求已提交，NAS 将在下一次更新检查时重建服务。');
-    } catch (error) { setNotice(error instanceof Error ? error.message : '无法提交更新请求。'); }
-    finally { setUpdateBusy(false); }
-  }
-
   async function remove(item: Subscription) {
     if (!window.confirm(`删除订阅“${item.name}”？这会同时删除它的内容档案。`)) return;
     try {
@@ -337,10 +311,7 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
     <section className="workspace">
       <header className="topbar">
         <div><p className="eyebrow">自托管网页监测</p><h1>{view === 'archive' ? '内容档案' : view === 'logs' ? '运行日志' : view === 'downloads' ? '下载与影视库' : '订阅中心'}</h1></div>
-        <div className="topbar-actions">
-          {updateStatus?.updateAvailable && <button type="button" className="update-button" disabled={updateBusy || updateStatus.phase === 'applying'} onClick={() => void applyUpdate()}>{updateBusy || updateStatus.phase === 'applying' ? '正在请求更新…' : '新版本可用 · 立即更新'}</button>}
-          {view === 'subscriptions' && <><button type="button" className="secondary" onClick={() => openRules()}>检查规则</button><button className="primary" onClick={() => setEditor('new')}><span>＋</span> 新建订阅</button></>}
-        </div>
+        {view === 'subscriptions' && <div className="topbar-actions"><button type="button" className="secondary" onClick={() => openRules()}>检查规则</button><button className="primary" onClick={() => setEditor('new')}><span>＋</span> 新建订阅</button></div>}
       </header>
 
       {view === 'subscriptions' ? <><section className="summary" aria-label="订阅概览">

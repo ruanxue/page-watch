@@ -28,9 +28,6 @@ services:
       <<: *page-watch-environment
       PORT: 3030
       APP_SESSION_SECURE: ${APP_SESSION_SECURE:-false}
-      UPDATE_STATE_DIR: /var/lib/pagewatch-update
-    volumes:
-      - ./update-state:/var/lib/pagewatch-update
     healthcheck:
       test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3030/api/health').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))\""]
       interval: 30s
