@@ -307,11 +307,11 @@ async function seedDefaultSubscriptionPresets() {
 
 /**
  * The rule-library split briefly seeded the MissAV preset without its page
- * counter. Repair only untouched default-shaped presets and new, uninspected
- * MissAV subscriptions; custom rules and already collected archives stay as-is.
+ * counter. Repair the standard MissAV list configuration wherever it is still
+ * missing. Existing archives stay intact; their next check becomes a full scan.
  */
 async function backfillMissavPaginationDefaults() {
-  const migrationKey = 'missav_list_pagination_backfill_v1';
+  const migrationKey = 'missav_list_pagination_backfill_v2';
   if (getSetting(migrationKey)) return;
   const now = new Date().toISOString();
   await db.transaction(async (tx) => {
@@ -324,8 +324,7 @@ async function backfillMissavPaginationDefaults() {
     await tx.run(`UPDATE subscriptions
       SET pagination_selector = ?, pagination_parameter = ?, pagination_match_pattern = ?,
           initial_scan_completed = 0, initial_scan_total = NULL, initial_scan_pages_completed = 0, updated_at = ?
-      WHERE last_checked_at IS NULL
-        AND selector = 'a.text-secondary[alt]'
+      WHERE selector = 'a.text-secondary[alt]'
         AND (pagination_selector IS NULL OR TRIM(pagination_selector) = '')
         AND (url LIKE 'https://missav123.com/%' OR url LIKE 'http://missav123.com/%')`,
     ['#price-currency', 'page', '/\\s*(\\d+)', now]);
