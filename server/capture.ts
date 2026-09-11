@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { setDefaultResultOrder } from 'node:dns';
 import dns from 'node:dns/promises';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -8,6 +9,10 @@ import { ProxyAgent } from 'undici';
 import { db, getOutboundProxyUrl, queueMagnetJob, queueReleaseJob, type DatabaseClient, type Subscription } from './db.js';
 import { describeError } from './error-details.js';
 import { expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
+
+// Some DNS forwarders return an unusable ::1 AAAA record together with a valid
+// public A record.  Prefer the valid IPv4 address for Node's outbound requests.
+setDefaultResultOrder('ipv4first');
 
 export type CaptureResult = {
   title: string;
@@ -115,6 +120,10 @@ function isPrivateIp(value: string) {
   return first === 172 && second >= 16 && second <= 31;
 }
 
+function isIpv6Loopback(value: string) {
+  return value.replace(/^\[|\]$/g, '').toLowerCase() === '::1';
+}
+
 export async function assertSafeUrl(raw: string) {
   let url: URL;
   try { url = new URL(raw); } catch { throw new Error('请输入有效的网页地址。'); }
@@ -128,7 +137,19 @@ export async function assertSafeUrl(raw: string) {
   // them here would make a correctly configured proxy unusable. Literal and
   // locally resolved private addresses remain blocked above/below.
   if (!addresses.length && !getOutboundProxyUrl()) throw new Error('无法解析该网页地址。');
-  if (addresses.some((address) => isPrivateIp(address.address))) throw new Error('不允许访问解析到内网的地址。');
+  const privateAddresses = addresses.filter((address) => isPrivateIp(address.address));
+  const publicAddresses = addresses.filter((address) => !isPrivateIp(address.address));
+  // A few router DNS forwarders (including common proxy-router setups) append
+  // ::1 to every hostname while still returning a valid public IPv4 A record.
+  // Accept only that narrow mixed result; all other private/mixed DNS answers
+  // remain blocked to prevent an external hostname from reaching the LAN.
+  const hasOnlyIpv6LoopbackAlongsidePublicAddress = publicAddresses.length > 0
+    && privateAddresses.length > 0
+    && privateAddresses.every((address) => isIpv6Loopback(address.address));
+  if (privateAddresses.length > 0 && !hasOnlyIpv6LoopbackAlongsidePublicAddress) {
+    const resolved = addresses.map((address) => address.address).join(', ');
+    throw new Error(`不允许访问解析到内网的地址（${url.hostname}：${resolved}）。`);
+  }
   return url;
 }
 
