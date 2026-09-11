@@ -1,6 +1,7 @@
 services:
   app:
     build: .
+    container_name: pagewatch
     command: npm run all-in-one
     init: true
     restart: unless-stopped

@@ -19,6 +19,7 @@ x-page-watch-service: &page-watch-service
 services:
   app:
     <<: *page-watch-service
+    container_name: pagewatch
     command: npm run all-in-one
     shm_size: 1gb
     ports:
