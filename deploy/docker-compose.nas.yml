@@ -19,7 +19,8 @@ x-page-watch-service: &page-watch-service
 services:
   app:
     <<: *page-watch-service
-    command: npm run start
+    command: npm run all-in-one
+    shm_size: 1gb
     ports:
       - "${PAGE_WATCH_PORT:-3030}:3030"
     environment:
@@ -32,30 +33,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
-
-  worker:
-    <<: *page-watch-service
-    command: npm run worker
-    shm_size: 1gb
-    environment:
-      <<: *page-watch-environment
-      PLAYWRIGHT_HEADLESS: "true"
-
-  release-worker:
-    <<: *page-watch-service
-    command: npm run release-worker
-
-  magnet-worker:
-    <<: *page-watch-service
-    command: npm run magnet-worker
-
-  download-worker:
-    <<: *page-watch-service
-    command: npm run download-worker
-
-  library-worker:
-    <<: *page-watch-service
-    command: npm run library-worker
 
 networks:
   default:

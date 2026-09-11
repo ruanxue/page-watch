@@ -1,7 +1,10 @@
 services:
   app:
     build: .
+    command: npm run all-in-one
+    init: true
     restart: unless-stopped
+    shm_size: 1gb
     ports:
       - "3030:3030"
     environment:
@@ -19,62 +22,3 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
-
-  worker:
-    build: .
-    restart: unless-stopped
-    command: npm run worker
-    environment:
-      PLAYWRIGHT_HEADLESS: "true"
-      OUTBOUND_PROXY: ${OUTBOUND_PROXY:-}
-      MYSQL_HOST: ${MYSQL_HOST}
-      MYSQL_PORT: ${MYSQL_PORT:-3306}
-      MYSQL_DATABASE: ${MYSQL_DATABASE}
-      MYSQL_USER: ${MYSQL_USER}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
-
-  release-worker:
-    build: .
-    restart: unless-stopped
-    command: npm run release-worker
-    environment:
-      OUTBOUND_PROXY: ${OUTBOUND_PROXY:-}
-      MYSQL_HOST: ${MYSQL_HOST}
-      MYSQL_PORT: ${MYSQL_PORT:-3306}
-      MYSQL_DATABASE: ${MYSQL_DATABASE}
-      MYSQL_USER: ${MYSQL_USER}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
-
-  magnet-worker:
-    build: .
-    restart: unless-stopped
-    command: npm run magnet-worker
-    environment:
-      OUTBOUND_PROXY: ${OUTBOUND_PROXY:-}
-      MYSQL_HOST: ${MYSQL_HOST}
-      MYSQL_PORT: ${MYSQL_PORT:-3306}
-      MYSQL_DATABASE: ${MYSQL_DATABASE}
-      MYSQL_USER: ${MYSQL_USER}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
-
-  download-worker:
-    build: .
-    restart: unless-stopped
-    command: npm run download-worker
-    environment:
-      MYSQL_HOST: ${MYSQL_HOST}
-      MYSQL_PORT: ${MYSQL_PORT:-3306}
-      MYSQL_DATABASE: ${MYSQL_DATABASE}
-      MYSQL_USER: ${MYSQL_USER}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
-
-  library-worker:
-    build: .
-    restart: unless-stopped
-    command: npm run library-worker
-    environment:
-      MYSQL_HOST: ${MYSQL_HOST}
-      MYSQL_PORT: ${MYSQL_PORT:-3306}
-      MYSQL_DATABASE: ${MYSQL_DATABASE}
-      MYSQL_USER: ${MYSQL_USER}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}

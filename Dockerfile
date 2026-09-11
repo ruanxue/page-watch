@@ -9,4 +9,4 @@ RUN npm run build
 ENV NODE_ENV=production
 ENV PORT=3030
 EXPOSE 3030
-CMD ["npm", "run", "start"]
+CMD ["npm", "run", "all-in-one"]

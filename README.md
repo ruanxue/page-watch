@@ -19,9 +19,9 @@ npm run dev
 docker compose up -d --build
 ```
 
-打开 `http://NAS_IP:3030`。Compose 会启动网页服务、网页检查 Worker、发行日期 Worker、单线程磁力检索 Worker、qBittorrent 下载 Worker 和 Jellyfin 影视库同步 Worker。订阅、档案、发行日期、磁力检索、下载与影视库状态、运行日志保存在 MySQL；请按你的 NAS 备份策略备份 `page_watch` 数据库。
+打开 `http://NAS_IP:3030`。Compose 只启动一个 Page Watch 容器；容器内主管理器统一托管网页服务、网页检查、发行日期、单线程磁力检索、qBittorrent 下载和 Jellyfin 影视库同步任务。订阅、档案、发行日期、磁力检索、下载与影视库状态、运行日志保存在 MySQL；请按你的 NAS 备份策略备份 `page_watch` 数据库。
 
-部署前请复制 `.env.example` 为 `.env`，填写 `MYSQL_HOST`、`MYSQL_DATABASE`、`MYSQL_USER` 与 `MYSQL_PASSWORD`。Docker 容器会通过这些变量连接 NAS 上已有的 MySQL，而不会自行创建数据库容器。网页服务带有 Docker 健康检查；检查、磁力检索、下载和影视库同步服务通过数据库心跳向网页报告状态，异常退出时 Docker 会自动重启它们。
+部署前请复制 `.env.example` 为 `.env`，填写 `MYSQL_HOST`、`MYSQL_DATABASE`、`MYSQL_USER` 与 `MYSQL_PASSWORD`。Docker 容器会通过这些变量连接 NAS 上已有的 MySQL，而不会自行创建数据库容器。网页服务带有 Docker 健康检查；单容器主管理器会在内部重启异常退出的任务，容器本身异常退出时由 Docker 自动重启。
 
 ### 首次访问与安全
 

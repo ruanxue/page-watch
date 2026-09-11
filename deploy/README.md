@@ -1,6 +1,6 @@
 # NAS 镜像部署
 
-这套部署文件不在 NAS 构建源码。GitHub Actions 在每次推送 `main` 后构建 `linux/amd64` 镜像并发布到 GitHub Container Registry（GHCR）；NAS 只拉取已验证的镜像。
+这套部署文件不在 NAS 构建源码。GitHub Actions 在每次推送 `main` 后构建 `linux/amd64` 单容器镜像并发布到 GitHub Container Registry（GHCR）；NAS 只拉取已验证的镜像。
 
 ## 一次性准备
 
@@ -51,7 +51,7 @@
    bash scripts/nas/update.sh
    ```
 
-打开 `http://NAS_LAN_IP:3030`。原有 MySQL 数据库继续被使用；订阅、档案、规则、下载配置、Jellyfin 配置和日志不会随镜像升级而丢失。
+打开 `http://NAS_LAN_IP:3030`。Page Watch 只运行一个容器，容器内的主管理器会统一托管网页服务、网页检查、发行日期、磁力检索、qBittorrent 下载和 Jellyfin 同步任务。原有 MySQL 数据库继续被使用；订阅、档案、规则、下载配置、Jellyfin 配置和日志不会随镜像升级而丢失。
 
 ## 内部服务地址
 
@@ -108,7 +108,7 @@ bash scripts/nas/rollback.sh ghcr.io/YOUR_GITHUB_OWNER/YOUR_REPOSITORY:sha-PASTE
 ```bash
 docker network inspect page-watch-backend
 docker compose --env-file deploy/.env -f deploy/docker-compose.nas.yml ps
-docker compose --env-file deploy/.env -f deploy/docker-compose.nas.yml logs -f
+docker compose --env-file deploy/.env -f deploy/docker-compose.nas.yml logs -f app
 ```
 
 不要把 `.env`、GitHub 令牌、MySQL 密码、qBittorrent/Jellyfin API 密钥提交进 Git。`deploy/.env` 已被 `.gitignore` 排除。
