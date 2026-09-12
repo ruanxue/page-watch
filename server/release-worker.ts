@@ -5,6 +5,10 @@ import { expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
 
 const POLL_MS = 1_000;
 const BACKFILL_BATCH_SIZE = 100;
+// This was the generic result emitted before ISO datetime values such as
+// `2026-08-28T00:00:00+08:00` were matched correctly. Requeue it once after
+// upgrading, while leaving genuine, detailed "unavailable" results alone.
+const PREVIOUS_DATE_PATTERN_RESULT = '详情页未找到标签“发行日期”对应的日期值。';
 
 type ReleaseJob = {
   id: number;
@@ -23,17 +27,20 @@ async function queueLegacyReleaseLookups() {
   if (!rule.enabled) return;
   const entries = await db.all<LegacyEntry>(`SELECT a.id, a.subscription_id, a.content, a.detail_url, s.url AS subscription_url
     FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
-    WHERE a.release_status = 'unsearched' ORDER BY a.id ASC LIMIT ?`, [BACKFILL_BATCH_SIZE]);
+    WHERE a.release_status = 'unsearched'
+      OR (a.release_status = 'unavailable' AND a.release_error = ?)
+    ORDER BY a.id ASC LIMIT ?`, [PREVIOUS_DATE_PATTERN_RESULT, BACKFILL_BATCH_SIZE]);
   for (const entry of entries) {
     const detailUrl = expandReleaseUrl(rule.urlTemplate, { detailUrl: entry.detail_url, subscriptionUrl: entry.subscription_url, content: entry.content });
     const now = new Date().toISOString();
     if (!detailUrl) {
-      await db.run(`UPDATE archive_entries SET release_status = 'unavailable', release_checked_at = ?, release_error = ?, updated_at = ? WHERE id = ? AND release_status = 'unsearched'`,
-        [now, '当前发行日期规则无法生成详情页地址；请检查详情页地址模板或内容链接。', now, entry.id]);
+      await db.run(`UPDATE archive_entries SET release_status = 'unavailable', release_checked_at = ?, release_error = ?, updated_at = ?
+        WHERE id = ? AND (release_status = 'unsearched' OR (release_status = 'unavailable' AND release_error = ?))`,
+      [now, '当前发行日期规则无法生成详情页地址；请检查详情页地址模板或内容链接。', now, entry.id, PREVIOUS_DATE_PATTERN_RESULT]);
       continue;
     }
     const changed = await db.run(`UPDATE archive_entries SET release_status = 'pending', release_error = NULL, updated_at = ?
-      WHERE id = ? AND release_status = 'unsearched'`, [now, entry.id]);
+      WHERE id = ? AND (release_status = 'unsearched' OR (release_status = 'unavailable' AND release_error = ?))`, [now, entry.id, PREVIOUS_DATE_PATTERN_RESULT]);
     if (changed.changes) await queueReleaseJob(entry.id);
   }
 }
@@ -108,6 +115,10 @@ let working = false;
 let lastInfrastructureLogAt = 0;
 let lastStalledRecoveryAt = 0;
 
+async function heartbeat() {
+  await reportWorkerHeartbeat('release', working ? '正在读取发行日期详情页' : '发行日期详情页读取', working ? 'busy' : 'ready').catch(() => undefined);
+}
+
 async function recoverStalledJobs() {
   if (Date.now() - lastStalledRecoveryAt < 60_000) return;
   lastStalledRecoveryAt = Date.now();
@@ -128,7 +139,7 @@ async function tick() {
   if (working) return;
   working = true;
   try {
-    await reportWorkerHeartbeat('release', '发行日期详情页读取').catch(() => undefined);
+    await heartbeat();
     await refreshSettings();
     await recoverStalledJobs();
     await queueLegacyReleaseLookups();
@@ -144,3 +155,5 @@ void appendRuntimeLog({ level: 'info', source: 'system', message: '发行日期 
 console.log('Page Watch release-date worker started');
 void tick();
 setInterval(() => void tick(), POLL_MS);
+const heartbeatTimer = setInterval(() => void heartbeat(), 15_000);
+heartbeatTimer.unref();

@@ -20,6 +20,11 @@ export type ReleaseDateLookupResult =
   | { status: 'found'; releaseDate: string }
   | { status: 'unavailable'; reason: string };
 
+type ReleaseDateExtraction = {
+  releaseDate: string | null;
+  reason: string;
+};
+
 function normalize(text: string) {
   return text.replace(/\s+/g, ' ').trim();
 }
@@ -41,18 +46,57 @@ function matchedValue(value: string, pattern: string) {
   return validDate(match[1] ?? '') ? match[1] : match[0];
 }
 
-/** Parse a configured labelled detail-page field into a normal YYYY-MM-DD date. */
-export function extractReleaseDate(html: string, rule: Pick<ReleaseDateRule, 'containerSelector' | 'labelSelector' | 'labelText' | 'valueSelector' | 'valueSource' | 'valueAttribute' | 'valueMatchPattern'>) {
+function normalizedLabel(value: string) {
+  return normalize(value).replace(/[：:]/g, '');
+}
+
+function securityChallengeReason(html: string) {
   const $ = cheerio.load(html);
-  for (const element of $(rule.containerSelector).toArray()) {
-    const label = normalize($(element).find(rule.labelSelector).first().text()).replace(/[：:]/g, '');
-    if (label !== normalize(rule.labelText).replace(/[：:]/g, '')) continue;
-    const valueElement = $(element).find(rule.valueSelector).first();
-    const value = rule.valueSource === 'attribute' ? valueElement.attr(rule.valueAttribute) ?? '' : valueElement.text();
-    const matched = matchedValue(normalize(value), rule.valueMatchPattern);
-    if (matched) return validDate(matched);
+  const title = normalize($('title').first().text());
+  const body = normalize($('body').text()).slice(0, 4_000);
+  if (/just a moment|attention required|checking your browser|verify you are human|performing security verification/i.test(`${title}\n${body}`)) {
+    return '详情页被网站安全验证拦截，未获取到实际内容；请确认代理可访问目标站点后重试。';
   }
   return null;
+}
+
+function inspectReleaseDate(html: string, rule: Pick<ReleaseDateRule, 'containerSelector' | 'labelSelector' | 'labelText' | 'valueSelector' | 'valueSource' | 'valueAttribute' | 'valueMatchPattern'>): ReleaseDateExtraction {
+  const challengeReason = securityChallengeReason(html);
+  if (challengeReason) return { releaseDate: null, reason: challengeReason };
+
+  const $ = cheerio.load(html);
+  const containers = $(rule.containerSelector).toArray();
+  if (!containers.length) {
+    return { releaseDate: null, reason: `详情页未找到字段容器“${rule.containerSelector}”。` };
+  }
+
+  const expectedLabel = normalizedLabel(rule.labelText);
+  const labelledContainers = containers.filter((element) => normalizedLabel($(element).find(rule.labelSelector).first().text()) === expectedLabel);
+  if (!labelledContainers.length) {
+    return { releaseDate: null, reason: `字段容器中未找到标签“${rule.labelText}”。` };
+  }
+
+  for (const element of labelledContainers) {
+    const valueElement = $(element).find(rule.valueSelector).first();
+    if (!valueElement.length) continue;
+    const value = rule.valueSource === 'attribute' ? valueElement.attr(rule.valueAttribute) ?? '' : valueElement.text();
+    const normalizedValue = normalize(value);
+    if (!normalizedValue) continue;
+    const matched = matchedValue(normalizedValue, rule.valueMatchPattern);
+    if (!matched) {
+      return { releaseDate: null, reason: `日期值“${normalizedValue.slice(0, 80)}”不符合当前日期匹配规则。` };
+    }
+    const releaseDate = validDate(matched);
+    if (releaseDate) return { releaseDate, reason: '' };
+    return { releaseDate: null, reason: `日期值“${matched}”不是有效的 YYYY-MM-DD 日期。` };
+  }
+
+  return { releaseDate: null, reason: `标签“${rule.labelText}”中未找到日期节点“${rule.valueSelector}”或可读取的日期值。` };
+}
+
+/** Parse a configured labelled detail-page field into a normal YYYY-MM-DD date. */
+export function extractReleaseDate(html: string, rule: Pick<ReleaseDateRule, 'containerSelector' | 'labelSelector' | 'labelText' | 'valueSelector' | 'valueSource' | 'valueAttribute' | 'valueMatchPattern'>) {
+  return inspectReleaseDate(html, rule).releaseDate;
 }
 
 async function waitForRequestSlot(requestGapMs: number) {
@@ -80,8 +124,11 @@ async function fetchDetail(url: URL, requestGapMs: number, redirectsLeft = 3): P
       if (redirectsLeft <= 0) throw new Error('详情页重定向次数过多。');
       return fetchDetail(await assertSafeUrl(new URL(location, url).toString()), requestGapMs, redirectsLeft - 1);
     }
-    if (!response.ok) throw new Error(`详情页返回 HTTP ${response.status}。`);
     const html = await response.text();
+    if (!response.ok) {
+      const challengeReason = securityChallengeReason(html);
+      throw new Error(challengeReason ? `${challengeReason}（HTTP ${response.status}）。` : `详情页返回 HTTP ${response.status}。`);
+    }
     if (html.length > 5_000_000) throw new Error('详情页超过 5 MB，已停止解析。');
     return html;
   } catch (error) {
@@ -112,8 +159,31 @@ async function fetchDetailInBrowser(url: URL, rule: ReleaseDateRule): Promise<st
     const page = await browser.newPage({ userAgent: 'PageWatch/0.1 (+self-hosted webpage monitor)' });
     const response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 30_000 });
     await assertSafeUrl(page.url());
-    if (response && !response.ok()) throw new Error(`详情页返回 HTTP ${response.status()}。`);
-    await page.locator(rule.valueSelector).first().waitFor({ state: 'attached', timeout: 12_000 }).catch(() => undefined);
+    const initialHtml = response && !response.ok() ? await page.content() : null;
+    if (response && !response.ok()) {
+      const challengeReason = securityChallengeReason(initialHtml ?? '');
+      throw new Error(challengeReason ? `${challengeReason}（HTTP ${response.status()}）。` : `详情页返回 HTTP ${response.status()}。`);
+    }
+    await page.waitForFunction((config) => {
+      const normalizeLabel = (value: string) => value.replace(/\s+/g, ' ').trim().replace(/[：:]/g, '');
+      const expectedLabel = normalizeLabel(config.labelText);
+      return Array.from(document.querySelectorAll(config.containerSelector)).some((container) => {
+        const label = container.querySelector(config.labelSelector)?.textContent ?? '';
+        if (normalizeLabel(label) !== expectedLabel) return false;
+        const valueElement = container.querySelector(config.valueSelector);
+        if (!valueElement) return false;
+        return config.valueSource === 'attribute'
+          ? Boolean(valueElement.getAttribute(config.valueAttribute)?.trim())
+          : Boolean(valueElement.textContent?.trim());
+      });
+    }, {
+      containerSelector: rule.containerSelector,
+      labelSelector: rule.labelSelector,
+      labelText: rule.labelText,
+      valueSelector: rule.valueSelector,
+      valueSource: rule.valueSource,
+      valueAttribute: rule.valueAttribute
+    }, { timeout: 12_000 }).catch(() => undefined);
     return await page.content();
   } catch (error) {
     if (error instanceof Error && /timeout/i.test(error.message)) throw new Error(describeError(error, { action: '发行日期详情页浏览器读取', target: url.hostname, proxyUrl }));
@@ -126,8 +196,8 @@ async function fetchDetailInBrowser(url: URL, rule: ReleaseDateRule): Promise<st
 export async function lookupReleaseDate(rawUrl: string, rule: ReleaseDateRule): Promise<ReleaseDateLookupResult> {
   const url = await assertSafeUrl(rawUrl);
   const html = rule.renderMode === 'dynamic' ? await fetchDetailInBrowser(url, rule) : await fetchDetail(url, rule.requestIntervalMs);
-  const releaseDate = extractReleaseDate(html, rule);
-  return releaseDate
-    ? { status: 'found', releaseDate }
-    : { status: 'unavailable', reason: `详情页未找到标签“${rule.labelText}”对应的日期值。` };
+  const result = inspectReleaseDate(html, rule);
+  return result.releaseDate
+    ? { status: 'found', releaseDate: result.releaseDate }
+    : { status: 'unavailable', reason: result.reason };
 }

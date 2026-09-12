@@ -50,7 +50,9 @@ export const defaultInspectionRules: InspectionRules = {
     valueSelector: 'time',
     valueSource: 'attribute',
     valueAttribute: 'datetime',
-    valueMatchPattern: '\\b(?:19\\d{2}|20\\d{2})-\\d{2}-\\d{2}\\b',
+    // `datetime` values use an ISO suffix (for example `2026-08-28T00:00:00+08:00`).
+    // Do not put a word boundary after the day: `8T` has no word boundary.
+    valueMatchPattern: '\\b(?:19\\d{2}|20\\d{2})-\\d{2}-\\d{2}(?!\\d)',
     requestIntervalMs: 800
   },
   magnet: {
@@ -70,7 +72,10 @@ export const defaultInspectionRules: InspectionRules = {
   }
 };
 
-const legacyReleaseDatePattern = '\\b(19\\d{2}|20\\d{2})-(\\d{2})-(\\d{2})\\b';
+const legacyReleaseDatePatterns = new Set([
+  '\\b(19\\d{2}|20\\d{2})-(\\d{2})-(\\d{2})\\b',
+  '\\b(?:19\\d{2}|20\\d{2})-\\d{2}-\\d{2}\\b'
+]);
 
 function cloneDefaults(): InspectionRules {
   return JSON.parse(JSON.stringify(defaultInspectionRules)) as InspectionRules;
@@ -116,7 +121,7 @@ export function coerceInspectionRules(value: unknown): InspectionRules {
       valueSelector: nonEmptyString(release.valueSelector, defaults.releaseDate.valueSelector),
       valueSource: source(release.valueSource, defaults.releaseDate.valueSource),
       valueAttribute: nonEmptyString(release.valueAttribute, defaults.releaseDate.valueAttribute, 128),
-      valueMatchPattern: release.valueMatchPattern === legacyReleaseDatePattern
+      valueMatchPattern: legacyReleaseDatePatterns.has(String(release.valueMatchPattern ?? ''))
         ? defaults.releaseDate.valueMatchPattern
         : nonEmptyString(release.valueMatchPattern, defaults.releaseDate.valueMatchPattern, 480),
       requestIntervalMs: requestGap(release.requestIntervalMs, defaults.releaseDate.requestIntervalMs)

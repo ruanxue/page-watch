@@ -3,7 +3,7 @@ import type { ServerResponse } from 'node:http';
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
 import { assertSafeUrl, previewCapture } from './capture.js';
-import { appendRuntimeLog, db, getJellyfinSettings, getOutboundProxyUrl, getQbittorrentSettings, getSetting, getSubscription, queueDownloadJob, queueJob, queueMagnetJob, reportWorkerHeartbeat, setSetting, type Subscription } from './db.js';
+import { appendRuntimeLog, db, getJellyfinSettings, getOutboundProxyUrl, getQbittorrentSettings, getSetting, getSubscription, queueDownloadJob, queueJob, queueMagnetJob, queueReleaseJob, reportWorkerHeartbeat, setSetting, type Subscription } from './db.js';
 import { assertQbittorrentConfig, normalizeQbittorrentUrl, testQbittorrentConnection } from './qbittorrent.js';
 import { assertJellyfinConfig, listJellyfinLibraries, normalizeJellyfinUrl, testJellyfinConnection } from './jellyfin.js';
 import { syncJellyfinLibrary } from './jellyfin-sync.js';
@@ -395,7 +395,7 @@ app.get('/api/archive', async (request) => {
   const limit = Number.isInteger(limitValue) ? Math.min(Math.max(limitValue, 1), 10_000) : 10_000;
   const subscriptionId = Number(query.subscriptionId);
   const hasSubscriptionId = Number.isInteger(subscriptionId) && subscriptionId > 0;
-  return db.all(`SELECT a.id, a.content, a.title, a.detail_url, a.first_seen_at, a.release_date, a.release_status, a.magnet_status, a.magnet_value, a.magnet_checked_at, a.magnet_error,
+  return db.all(`SELECT a.id, a.content, a.title, a.detail_url, a.first_seen_at, a.release_date, a.release_status, a.release_error, a.magnet_status, a.magnet_value, a.magnet_checked_at, a.magnet_error,
       a.download_status, a.download_queued_at, a.download_added_at, a.download_torrent_hash, a.download_checked_at, a.download_error,
       a.download_progress, a.download_speed, a.download_size, a.downloaded_bytes, a.download_save_path, a.download_content_path, a.download_removed_at,
       a.jellyfin_status, a.jellyfin_item_id, a.jellyfin_item_name, a.jellyfin_matched_at, a.jellyfin_error,
@@ -422,6 +422,28 @@ app.post('/api/subscriptions/:id/magnet-backfill', async (request, reply) => {
   });
   if (queued) {
     await appendRuntimeLog({ level: 'info', source: 'queue', subscriptionId: id, message: `磁力检索补全已开始：${queued} 项已加入检索队列。` });
+  }
+  return reply.code(202).send({ queued, skipped: candidates.length - queued });
+});
+
+app.post('/api/subscriptions/:id/release-backfill', async (request, reply) => {
+  const id = Number((request.params as { id: string }).id);
+  const subscription = await getSubscription(id);
+  if (!subscription) return reply.code(404).send({ error: '订阅不存在。' });
+  if (!getInspectionRules().releaseDate.enabled) return reply.code(400).send({ error: '发行日期规则当前已停用，请先在“检查规则”中启用。' });
+  const candidates = await db.all<{ id: number }>(`SELECT id FROM archive_entries
+    WHERE subscription_id = ? AND release_status IN ('unsearched', 'unavailable', 'failed') ORDER BY id ASC`, [id]);
+  let queued = 0;
+  await db.transaction(async (tx) => {
+    for (const entry of candidates) {
+      const now = new Date().toISOString();
+      await tx.run(`UPDATE archive_entries
+        SET release_date = NULL, release_status = 'pending', release_checked_at = NULL, release_error = NULL, updated_at = ? WHERE id = ?`, [now, entry.id]);
+      if ((await queueReleaseJob(entry.id, tx)).queued) queued += 1;
+    }
+  });
+  if (queued) {
+    await appendRuntimeLog({ level: 'info', source: 'queue', subscriptionId: id, message: `发行日期检索已开始：${queued} 项已加入读取队列。` });
   }
   return reply.code(202).send({ queued, skipped: candidates.length - queued });
 });

@@ -75,6 +75,10 @@ let working = false;
 let lastInfrastructureLogAt = 0;
 let lastStalledRecoveryAt = 0;
 
+async function heartbeat() {
+  await reportWorkerHeartbeat('download', working ? '正在提交或同步 qBittorrent 下载' : 'qBittorrent 下载队列与状态同步', working ? 'busy' : 'ready').catch(() => undefined);
+}
+
 async function reportInfrastructureError(error: unknown) {
   const message = error instanceof Error ? error.message : '未知数据库或 Worker 错误';
   console.error(`Download worker tick failed: ${message}`);
@@ -217,7 +221,7 @@ async function tick() {
   if (working) return;
   working = true;
   try {
-    await reportWorkerHeartbeat('download', 'qBittorrent 下载队列与状态同步').catch(() => undefined);
+    await heartbeat();
     await refreshSettings();
     await recoverStalledJobs();
     await runNextDownloadJob();
@@ -234,3 +238,5 @@ void appendRuntimeLog({ level: 'info', source: 'system', message: 'qBittorrent �
 console.log('Page Watch qBittorrent download worker started');
 void tick();
 setInterval(() => void tick(), POLL_MS);
+const heartbeatTimer = setInterval(() => void heartbeat(), 15_000);
+heartbeatTimer.unref();

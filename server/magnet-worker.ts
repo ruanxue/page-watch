@@ -98,6 +98,10 @@ let working = false;
 let lastInfrastructureLogAt = 0;
 let lastStalledRecoveryAt = 0;
 
+async function heartbeat() {
+  await reportWorkerHeartbeat('magnet', working ? '正在检索磁力链接' : '磁力检索队列', working ? 'busy' : 'ready').catch(() => undefined);
+}
+
 async function reportInfrastructureError(error: unknown) {
   const message = error instanceof Error ? error.message : '未知数据库或 Worker 错误';
   console.error(`Magnet worker tick failed: ${message}`);
@@ -118,7 +122,7 @@ async function tick() {
   if (working) return;
   working = true;
   try {
-    await reportWorkerHeartbeat('magnet', '磁力检索队列').catch(() => undefined);
+    await heartbeat();
     await refreshSettings();
     await recoverStalledJobs();
     await runNextMagnetJob();
@@ -134,3 +138,5 @@ void appendRuntimeLog({ level: 'info', source: 'system', message: '磁力检索 
 console.log('Page Watch magnet lookup worker started');
 void tick();
 setInterval(() => void tick(), POLL_MS);
+const heartbeatTimer = setInterval(() => void heartbeat(), 15_000);
+heartbeatTimer.unref();

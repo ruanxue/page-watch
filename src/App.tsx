@@ -65,6 +65,7 @@ type ArchiveEntry = {
   first_seen_at: string;
   release_date: string | null;
   release_status: 'unsearched' | 'pending' | 'found' | 'unavailable' | 'failed';
+  release_error: string | null;
   magnet_status: 'unsearched' | 'pending' | 'found' | 'not_found' | 'failed';
   magnet_value: string | null;
   magnet_checked_at: string | null;
@@ -246,6 +247,7 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
   }), [subscriptions]);
   const unhealthyServices = systemStatus?.services.filter((service) => !service.healthy) ?? [];
   const servicesHealthy = Boolean(systemStatus && unhealthyServices.length === 0);
+  const serviceAttention = unhealthyServices.map((service) => `${service.label}：${service.status === 'missing' ? '尚未启动' : service.detail}`).join('；');
 
   function openRules() {
     setRulesOpen(true);
@@ -301,9 +303,9 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
         <a className={`nav-item ${view === 'logs' ? 'active' : ''}`} href="#logs"><span>≡</span> 运行日志</a>
         <button className="nav-item nav-button" onClick={() => setNetworkSettingsOpen(true)}><span>⌁</span> 网络代理</button>
       </nav>
-      <div className={`sidebar-note ${servicesHealthy ? '' : 'needs-attention'}`} title={unhealthyServices.map((service) => `${service.label}：${service.detail}`).join('\n')}>
+      <div className={`sidebar-note ${servicesHealthy ? '' : 'needs-attention'}`} title={serviceAttention}>
         <span className="pulse" /> {servicesHealthy ? '后台服务运行正常' : systemStatus ? `服务需要注意（${unhealthyServices.length}）` : '正在确认服务状态…'}
-        <small>{servicesHealthy ? '网页、检查、磁力、下载与影视库服务均有心跳' : '可在运行日志中查看异常详情'}</small>
+        <small>{servicesHealthy ? '网页、检查、磁力、下载与影视库服务均有心跳' : serviceAttention || '正在读取服务状态…'}</small>
         <button type="button" className="sign-out" onClick={() => void onLogout()}>退出登录</button>
       </div>
     </aside>
@@ -450,6 +452,14 @@ function JellyfinCell({ entry, baseUrl }: { entry: ArchiveEntry; baseUrl: string
   return <span className="jellyfin-status muted">未启用</span>;
 }
 
+function ReleaseDateCell({ entry }: { entry: ArchiveEntry }) {
+  if (entry.release_date) return <span className="release-date-value">{entry.release_date}</span>;
+  if (entry.release_status === 'pending') return <span className="release-status pending">读取中…</span>;
+  if (entry.release_status === 'unavailable') return <span className="release-status unavailable" title={entry.release_error ?? '详情页未找到符合规则的发行日期。'}>未找到</span>;
+  if (entry.release_status === 'failed') return <span className="release-status failed" title={entry.release_error ?? '发行日期读取失败。'}>读取失败</span>;
+  return <span className="release-status unsearched" title={entry.release_error ?? '尚未加入发行日期读取队列；请检查发行日期规则是否启用。'}>待读取</span>;
+}
+
 function ArchivePage({ subscriptions, onNotice }: { subscriptions: Subscription[]; onNotice: (message: string) => void }) {
   const [selected, setSelected] = useState<Subscription | null>(null);
   const [entries, setEntries] = useState<ArchiveEntry[]>([]);
@@ -457,6 +467,7 @@ function ArchivePage({ subscriptions, onNotice }: { subscriptions: Subscription[
   const [jellyfinBaseUrl, setJellyfinBaseUrl] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [releaseBackfillBusy, setReleaseBackfillBusy] = useState(false);
   const [backfillBusy, setBackfillBusy] = useState(false);
   const [downloadBackfillBusy, setDownloadBackfillBusy] = useState(false);
   const [retryingId, setRetryingId] = useState<number | null>(null);
@@ -482,6 +493,16 @@ function ArchivePage({ subscriptions, onNotice }: { subscriptions: Subscription[
     stream.addEventListener('archive', refresh);
     return () => stream.close();
   }, [selected?.id]);
+  const backfillReleaseDates = async () => {
+    if (!selected) return;
+    setReleaseBackfillBusy(true);
+    try {
+      const result = await request<{ queued: number; skipped: number }>(`/api/subscriptions/${selected.id}/release-backfill`, { method: 'POST' });
+      onNotice(result.queued ? `已加入 ${result.queued} 项发行日期读取队列。` : '没有待读取或可重试的发行日期。');
+      await loadArchive(selected, true);
+    } catch (reason) { onNotice(reason instanceof Error ? reason.message : '无法检索发行日期。'); }
+    finally { setReleaseBackfillBusy(false); }
+  };
   const backfillMagnets = async () => {
     if (!selected) return;
     setBackfillBusy(true);
@@ -537,8 +558,8 @@ function ArchivePage({ subscriptions, onNotice }: { subscriptions: Subscription[
     } catch { onNotice('浏览器无法复制，请检查剪贴板权限。'); }
   };
   if (selected) return <section id="archive" className="archive-section">
-    <div className="section-head"><div><button className="back-button" onClick={() => setSelected(null)}>← 内容档案</button><h2>{selected.name}</h2><p>{shortUrl(selected.url)} · 共 {selected.archive_count} 条归档内容</p></div><div className="archive-actions"><button className="secondary" disabled={backfillBusy} onClick={() => void backfillMagnets()}>{backfillBusy ? '正在排队…' : '补全磁力链接'}</button><button className="secondary" disabled={downloadBackfillBusy} onClick={() => void backfillDownloads()}>{downloadBackfillBusy ? '正在排队…' : '提交可下载项'}</button><button className="quiet" onClick={() => void loadArchive(selected)}>↻ 刷新</button></div></div>
-    {loading ? <div className="empty">正在读取内容…</div> : error ? <div className="form-error">{error}</div> : entries.length === 0 ? <div className="empty-card archive-empty"><h3>尚无归档内容</h3><p>完成一次检查后，提取结果会出现在这里。</p></div> : <div className="archive-table-wrap"><table className="archive-table"><thead><tr><th className="archive-index">序号</th><th>番号</th><th>标题</th><th>发行日期</th><th>磁力链接</th><th>影视库</th><th>操作</th></tr></thead><tbody>{entries.map((entry, index) => { const detailUrl = archiveContentUrl(entry); const searchUrl = magnetSearchUrl(inspectionRules, entry.content); return <tr key={entry.id}><td className="archive-index">{index + 1}</td><td>{detailUrl ? <a className="archive-content-link" href={detailUrl} target="_blank" rel="noreferrer" title="打开所属网站的详情页"><code>{entry.content}</code></a> : <code>{entry.content}</code>}</td><td className="archive-title">{entry.title || '—'}</td><td>{entry.release_date || (entry.release_status === 'pending' ? '读取中…' : '—')}</td><td className="magnet-cell">{entry.magnet_status === 'found' ? <button className="magnet-action magnet-copy" type="button" onClick={() => void copyMagnet(entry)}>复制</button> : entry.magnet_status === 'pending' ? <span className="magnet-action magnet-pending">检索中</span> : entry.magnet_status === 'not_found' ? <button className="magnet-action magnet-retry" type="button" disabled={retryingId === entry.id} aria-busy={retryingId === entry.id} aria-label={retryingId === entry.id ? '正在加入磁力检索队列' : '未找到磁力链接，重新检索'} title={retryingId === entry.id ? '正在加入队列' : '未找到，点击重新检索'} onClick={() => void retryMagnet(entry)}>重试</button> : entry.magnet_status === 'failed' ? <button className="magnet-action magnet-retry magnet-failed" type="button" disabled={retryingId === entry.id} aria-busy={retryingId === entry.id} aria-label={retryingId === entry.id ? '正在加入磁力检索队列' : '磁力检索失败，重新检索'} title={retryingId === entry.id ? '正在加入队列' : '检索失败，点击重新检索'} onClick={() => void retryMagnet(entry)}>重试</button> : <span className="magnet-action">待补全</span>}</td><td className="jellyfin-cell"><JellyfinCell entry={entry} baseUrl={jellyfinBaseUrl} /></td><td className="download-cell">{entry.magnet_status === 'found' ? <DownloadCell entry={entry} downloadingId={downloadingId} onSubmit={submitDownload} /> : searchUrl ? <a className="download-action magnet-search-link" href={searchUrl} target="_blank" rel="noreferrer" title={`前往磁力搜索页面检索 ${entry.content}`}>搜索</a> : '—'}</td></tr>; })}</tbody></table></div>}
+    <div className="section-head"><div><button className="back-button" onClick={() => setSelected(null)}>← 内容档案</button><h2>{selected.name}</h2><p>{shortUrl(selected.url)} · 共 {selected.archive_count} 条归档内容</p></div><div className="archive-actions"><button className="secondary" disabled={releaseBackfillBusy} onClick={() => void backfillReleaseDates()}>{releaseBackfillBusy ? '正在排队…' : '检索发行日期'}</button><button className="secondary" disabled={backfillBusy} onClick={() => void backfillMagnets()}>{backfillBusy ? '正在排队…' : '补全磁力链接'}</button><button className="secondary" disabled={downloadBackfillBusy} onClick={() => void backfillDownloads()}>{downloadBackfillBusy ? '正在排队…' : '提交可下载项'}</button><button className="quiet" onClick={() => void loadArchive(selected)}>↻ 刷新</button></div></div>
+    {loading ? <div className="empty">正在读取内容…</div> : error ? <div className="form-error">{error}</div> : entries.length === 0 ? <div className="empty-card archive-empty"><h3>尚无归档内容</h3><p>完成一次检查后，提取结果会出现在这里。</p></div> : <div className="archive-table-wrap"><table className="archive-table"><thead><tr><th className="archive-index">序号</th><th>番号</th><th>标题</th><th>发行日期</th><th>磁力链接</th><th>影视库</th><th>操作</th></tr></thead><tbody>{entries.map((entry, index) => { const detailUrl = archiveContentUrl(entry); const searchUrl = magnetSearchUrl(inspectionRules, entry.content); return <tr key={entry.id}><td className="archive-index">{index + 1}</td><td>{detailUrl ? <a className="archive-content-link" href={detailUrl} target="_blank" rel="noreferrer" title="打开所属网站的详情页"><code>{entry.content}</code></a> : <code>{entry.content}</code>}</td><td className="archive-title">{entry.title || '—'}</td><td><ReleaseDateCell entry={entry} /></td><td className="magnet-cell">{entry.magnet_status === 'found' ? <button className="magnet-action magnet-copy" type="button" onClick={() => void copyMagnet(entry)}>复制</button> : entry.magnet_status === 'pending' ? <span className="magnet-action magnet-pending">检索中</span> : entry.magnet_status === 'not_found' ? <button className="magnet-action magnet-retry" type="button" disabled={retryingId === entry.id} aria-busy={retryingId === entry.id} aria-label={retryingId === entry.id ? '正在加入磁力检索队列' : '未找到磁力链接，重新检索'} title={retryingId === entry.id ? '正在加入队列' : '未找到，点击重新检索'} onClick={() => void retryMagnet(entry)}>重试</button> : entry.magnet_status === 'failed' ? <button className="magnet-action magnet-retry magnet-failed" type="button" disabled={retryingId === entry.id} aria-busy={retryingId === entry.id} aria-label={retryingId === entry.id ? '正在加入磁力检索队列' : '磁力检索失败，重新检索'} title={retryingId === entry.id ? '正在加入队列' : '检索失败，点击重新检索'} onClick={() => void retryMagnet(entry)}>重试</button> : <span className="magnet-action">待补全</span>}</td><td className="jellyfin-cell"><JellyfinCell entry={entry} baseUrl={jellyfinBaseUrl} /></td><td className="download-cell">{entry.magnet_status === 'found' ? <DownloadCell entry={entry} downloadingId={downloadingId} onSubmit={submitDownload} /> : searchUrl ? <a className="download-action magnet-search-link" href={searchUrl} target="_blank" rel="noreferrer" title={`前往磁力搜索页面检索 ${entry.content}`}>搜索</a> : '—'}</td></tr>; })}</tbody></table></div>}
   </section>;
   return <section id="archive" className="archive-section">
     <div className="section-head"><div><h2>内容档案</h2><p>按订阅查看首次获取到的内容。</p></div></div>
@@ -589,7 +610,7 @@ type InspectionRules = {
 };
 
 const defaultInspectionRules: InspectionRules = {
-  releaseDate: { enabled: true, urlTemplate: '{{detailUrl}}', renderMode: 'dynamic', containerSelector: 'div.text-secondary', labelSelector: 'span', labelText: '发行日期', valueSelector: 'time', valueSource: 'attribute', valueAttribute: 'datetime', valueMatchPattern: '\\b(?:19\\d{2}|20\\d{2})-\\d{2}-\\d{2}\\b', requestIntervalMs: 800 },
+  releaseDate: { enabled: true, urlTemplate: '{{detailUrl}}', renderMode: 'dynamic', containerSelector: 'div.text-secondary', labelSelector: 'span', labelText: '发行日期', valueSelector: 'time', valueSource: 'attribute', valueAttribute: 'datetime', valueMatchPattern: '\\b(?:19\\d{2}|20\\d{2})-\\d{2}-\\d{2}(?!\\d)', requestIntervalMs: 800 },
   magnet: { enabled: true, origins: ['https://cilisousuo.co', 'https://cilisousuo.cc', 'https://cilisousuo.net'], searchUrlTemplate: '{{origin}}/search?q={{content}}', itemSelector: 'li.item', filenameSelector: '.filename', filenamePrefix: 'hhd800.com@', detailLinkSelector: 'a.link', detailPathPrefix: '/magnet/', valueSelector: 'input#input-magnet', valueSource: 'attribute', valueAttribute: 'value', valueMatchPattern: '^magnet:\\?', requestIntervalMs: 800 }
 };
 

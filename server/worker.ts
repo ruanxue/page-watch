@@ -70,6 +70,10 @@ let working = false;
 let lastInfrastructureLogAt = 0;
 let lastStalledRecoveryAt = 0;
 
+async function heartbeat() {
+  await reportWorkerHeartbeat('capture', working ? '正在执行网页检查' : '检查计划与网页抓取', working ? 'busy' : 'ready').catch(() => undefined);
+}
+
 async function reportInfrastructureError(error: unknown) {
   const message = error instanceof Error ? error.message : '未知数据库或 Worker 错误';
   console.error(`Check worker tick failed: ${message}`);
@@ -92,7 +96,7 @@ async function tick() {
   if (working) return;
   working = true;
   try {
-    await reportWorkerHeartbeat('capture', '检查计划与网页抓取').catch(() => undefined);
+    await heartbeat();
     await refreshSettings();
     await recoverStalledJobs();
     await enqueueDueSubscriptions();
@@ -110,3 +114,5 @@ void appendRuntimeLog({ level: 'info', source: 'system', message: '检查 Worker
 console.log('Page Watch worker started');
 void tick();
 setInterval(() => void tick(), POLL_MS);
+const heartbeatTimer = setInterval(() => void heartbeat(), 15_000);
+heartbeatTimer.unref();
