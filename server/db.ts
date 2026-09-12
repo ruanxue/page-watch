@@ -100,6 +100,9 @@ export type Subscription = {
   initial_scan_completed: number;
   initial_scan_total: number | null;
   initial_scan_pages_completed: number;
+  initial_scan_run_id: string | null;
+  initial_scan_next_page: number;
+  next_scheduled_at: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -119,20 +122,32 @@ export async function getSubscription(id: number) {
   return db.get<Subscription>('SELECT * FROM subscriptions WHERE id = ?', [id]);
 }
 
-export async function queueJob(subscriptionId: number) {
-  const existing = await db.get<{ id: number }>("SELECT id FROM jobs WHERE subscription_id = ? AND status IN ('queued', 'running')", [subscriptionId]);
-  if (existing) return { id: existing.id, queued: false };
+export const JOB_PRIORITY = { normal: 0, manual: 100 } as const;
+export type JobPriority = (typeof JOB_PRIORITY)[keyof typeof JOB_PRIORITY];
+
+async function queueUnique(table: 'jobs' | 'release_jobs' | 'magnet_jobs' | 'download_jobs' | 'library_jobs', column: 'subscription_id' | 'archive_entry_id', id: number, priority: JobPriority, client: DatabaseClient) {
+  const existing = await client.get<{ id: number; priority: number }>(`SELECT id, priority FROM \`${table}\` WHERE \`${column}\` = ? AND status IN ('queued', 'running')`, [id]);
+  if (existing) {
+    // A manual request upgrades waiting automatic work, but never interrupts a
+    // running worker task.
+    if (existing.priority < priority) await client.run(`UPDATE \`${table}\` SET priority = ? WHERE id = ? AND status = 'queued'`, [priority, existing.id]);
+    return { id: existing.id, queued: false };
+  }
   try {
-    const result = await db.run("INSERT INTO jobs (subscription_id, status, requested_at) VALUES (?, 'queued', ?)", [subscriptionId, new Date().toISOString()]);
+    const result = await client.run(`INSERT INTO \`${table}\` (\`${column}\`, status, requested_at, priority) VALUES (?, 'queued', ?, ?)`, [id, new Date().toISOString(), priority]);
     return { id: result.lastInsertRowid, queued: true };
   } catch (error) {
-    const duplicate = await db.get<{ id: number }>("SELECT id FROM jobs WHERE subscription_id = ? AND status IN ('queued', 'running')", [subscriptionId]);
+    const duplicate = await client.get<{ id: number }>(`SELECT id FROM \`${table}\` WHERE \`${column}\` = ? AND status IN ('queued', 'running')`, [id]);
     if (duplicate) return { id: duplicate.id, queued: false };
     throw error;
   }
 }
 
-export type MagnetStatus = 'unsearched' | 'pending' | 'found' | 'not_found' | 'failed';
+export async function queueJob(subscriptionId: number, priority: JobPriority = JOB_PRIORITY.normal, client: DatabaseClient = db) {
+  return queueUnique('jobs', 'subscription_id', subscriptionId, priority, client);
+}
+
+export type MagnetStatus = 'unsearched' | 'pending' | 'found' | 'not_found' | 'failed' | 'skipped';
 export type DownloadStatus = 'not_queued' | 'queued' | 'running' | 'added' | 'waiting' | 'downloading' | 'paused' | 'completed' | 'removed' | 'failed';
 
 export type WorkerName = 'api' | 'capture' | 'release' | 'magnet' | 'download' | 'library';
@@ -144,45 +159,23 @@ export async function reportWorkerHeartbeat(workerName: WorkerName, detail: stri
   [workerName, status, detail.slice(0, 255), new Date().toISOString()]);
 }
 
-export async function queueMagnetJob(archiveEntryId: number, client: DatabaseClient = db) {
-  const existing = await client.get<{ id: number }>("SELECT id FROM magnet_jobs WHERE archive_entry_id = ? AND status IN ('queued', 'running')", [archiveEntryId]);
-  if (existing) return { id: existing.id, queued: false };
-  try {
-    const result = await client.run("INSERT INTO magnet_jobs (archive_entry_id, status, requested_at) VALUES (?, 'queued', ?)", [archiveEntryId, new Date().toISOString()]);
-    return { id: result.lastInsertRowid, queued: true };
-  } catch (error) {
-    const duplicate = await client.get<{ id: number }>("SELECT id FROM magnet_jobs WHERE archive_entry_id = ? AND status IN ('queued', 'running')", [archiveEntryId]);
-    if (duplicate) return { id: duplicate.id, queued: false };
-    throw error;
-  }
+export async function queueMagnetJob(archiveEntryId: number, client: DatabaseClient = db, priority: JobPriority = JOB_PRIORITY.normal) {
+  return queueUnique('magnet_jobs', 'archive_entry_id', archiveEntryId, priority, client);
 }
 
 /** Add a detail-page release-date lookup without allowing duplicate active work. */
-export async function queueReleaseJob(archiveEntryId: number, client: DatabaseClient = db) {
-  const existing = await client.get<{ id: number }>("SELECT id FROM release_jobs WHERE archive_entry_id = ? AND status IN ('queued', 'running')", [archiveEntryId]);
-  if (existing) return { id: existing.id, queued: false };
-  try {
-    const result = await client.run("INSERT INTO release_jobs (archive_entry_id, status, requested_at) VALUES (?, 'queued', ?)", [archiveEntryId, new Date().toISOString()]);
-    return { id: result.lastInsertRowid, queued: true };
-  } catch (error) {
-    const duplicate = await client.get<{ id: number }>("SELECT id FROM release_jobs WHERE archive_entry_id = ? AND status IN ('queued', 'running')", [archiveEntryId]);
-    if (duplicate) return { id: duplicate.id, queued: false };
-    throw error;
-  }
+export async function queueReleaseJob(archiveEntryId: number, client: DatabaseClient = db, priority: JobPriority = JOB_PRIORITY.normal) {
+  return queueUnique('release_jobs', 'archive_entry_id', archiveEntryId, priority, client);
 }
 
 /** Add an archive item to the qBittorrent submission queue, without allowing a duplicate active job. */
-export async function queueDownloadJob(archiveEntryId: number, client: DatabaseClient = db) {
-  const existing = await client.get<{ id: number }>("SELECT id FROM download_jobs WHERE archive_entry_id = ? AND status IN ('queued', 'running')", [archiveEntryId]);
-  if (existing) return { id: existing.id, queued: false };
-  try {
-    const result = await client.run("INSERT INTO download_jobs (archive_entry_id, status, requested_at) VALUES (?, 'queued', ?)", [archiveEntryId, new Date().toISOString()]);
-    return { id: result.lastInsertRowid, queued: true };
-  } catch (error) {
-    const duplicate = await client.get<{ id: number }>("SELECT id FROM download_jobs WHERE archive_entry_id = ? AND status IN ('queued', 'running')", [archiveEntryId]);
-    if (duplicate) return { id: duplicate.id, queued: false };
-    throw error;
-  }
+export async function queueDownloadJob(archiveEntryId: number, client: DatabaseClient = db, priority: JobPriority = JOB_PRIORITY.normal) {
+  return queueUnique('download_jobs', 'archive_entry_id', archiveEntryId, priority, client);
+}
+
+/** Exact Jellyfin lookup runs ahead of automatic magnet searching. */
+export async function queueLibraryJob(archiveEntryId: number, client: DatabaseClient = db, priority: JobPriority = JOB_PRIORITY.normal) {
+  return queueUnique('library_jobs', 'archive_entry_id', archiveEntryId, priority, client);
 }
 
 type RuntimeLogInput = {
@@ -249,6 +242,7 @@ export type JellyfinSettings = {
   apiKey: string;
   libraryIds: string[];
   syncIntervalMinutes: number;
+  skipMagnetWhenAvailable: boolean;
 };
 
 function savedStringArray(value: string) {
@@ -265,7 +259,8 @@ export function getJellyfinSettings(): JellyfinSettings {
     url: getSetting('jellyfin_url').trim(),
     apiKey: getSetting('jellyfin_api_key'),
     libraryIds: savedStringArray(getSetting('jellyfin_library_ids')),
-    syncIntervalMinutes: Number.isInteger(interval) && interval >= 5 && interval <= 1440 ? interval : 60
+    syncIntervalMinutes: Number.isInteger(interval) && interval >= 5 && interval <= 1440 ? interval : 60,
+    skipMagnetWhenAvailable: getSetting('jellyfin_skip_magnet_when_available') !== '0'
   };
 }
 

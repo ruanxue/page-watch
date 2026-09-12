@@ -1,5 +1,5 @@
 import { captureSubscription } from './capture.js';
-import { appendRuntimeLog, db, getSubscription, queueJob, refreshSettings, reportWorkerHeartbeat, type Subscription } from './db.js';
+import { appendRuntimeLog, db, getSubscription, JOB_PRIORITY, queueJob, refreshSettings, reportWorkerHeartbeat, type Subscription } from './db.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription } from './retry.js';
 
 const POLL_MS = 10_000;
@@ -22,18 +22,49 @@ function scheduledAfter(subscription: Subscription, last: Date) {
   return next;
 }
 
+function scheduleStaggerMinutes(subscription: Subscription) {
+  // Stable and tiny: recurring work does not bunch up after a restart, while
+  // a manually started task remains immediate.
+  return (subscription.id * 17) % 4;
+}
+
+function nextScheduledAt(subscription: Subscription, now: Date) {
+  if (subscription.schedule_type === 'hourly') {
+    const anchor = subscription.next_scheduled_at ? new Date(subscription.next_scheduled_at) : new Date(subscription.last_checked_at ?? subscription.updated_at);
+    let next = new Date(anchor.getTime() + subscription.schedule_interval_hours * 3_600_000);
+    while (next <= now) next = new Date(next.getTime() + subscription.schedule_interval_hours * 3_600_000);
+    return next;
+  }
+  const base = new Date(now);
+  const [hours, minutes] = subscription.schedule_time.split(':').map(Number);
+  base.setHours(hours, minutes + scheduleStaggerMinutes(subscription), 0, 0);
+  if (subscription.schedule_type === 'daily') {
+    if (base <= now) base.setDate(base.getDate() + 1);
+    return base;
+  }
+  const days = (subscription.schedule_weekday - base.getDay() + 7) % 7;
+  base.setDate(base.getDate() + days);
+  if (base <= now) base.setDate(base.getDate() + 7);
+  return base;
+}
+
 async function enqueueDueSubscriptions() {
   const subscriptions = await db.all<Subscription>('SELECT * FROM subscriptions WHERE is_active = 1');
-  const now = Date.now();
+  const now = new Date();
   for (const subscription of subscriptions) {
-    const anchor = subscription.last_checked_at ?? subscription.updated_at;
-    if (now >= scheduledAfter(subscription, new Date(anchor)).getTime()) await queueJob(subscription.id);
+    const due = subscription.next_scheduled_at ? new Date(subscription.next_scheduled_at) : scheduledAfter(subscription, new Date(subscription.last_checked_at ?? subscription.updated_at));
+    if (now >= due) {
+      const queued = await queueJob(subscription.id, JOB_PRIORITY.normal);
+      const next = nextScheduledAt(subscription, now);
+      await db.run('UPDATE subscriptions SET next_scheduled_at = ? WHERE id = ?', [next.toISOString(), subscription.id]);
+      if (queued.queued) await appendRuntimeLog({ level: 'info', source: 'queue', subscriptionId: subscription.id, message: `计划检查已排队（${subscription.schedule_type === 'hourly' ? '按小时' : `${scheduleStaggerMinutes(subscription)} 分钟错峰`}）。` });
+    }
   }
 }
 
 async function runNextJob() {
   const now = new Date().toISOString();
-  const job = await db.get<{ id: number; subscription_id: number; attempt_count: number }>("SELECT * FROM jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?) ORDER BY requested_at ASC LIMIT 1", [now]);
+  const job = await db.get<{ id: number; subscription_id: number; attempt_count: number; priority: number }>("SELECT * FROM jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?) ORDER BY priority DESC, requested_at ASC, id ASC LIMIT 1", [now]);
   if (!job) return;
   const started = await db.run("UPDATE jobs SET status = 'running', started_at = ?, retry_after = NULL WHERE id = ? AND status = 'queued'", [now, job.id]);
   if (!started.changes) return;
@@ -42,7 +73,7 @@ async function runNextJob() {
     subscription = await getSubscription(job.subscription_id);
     if (!subscription) throw new Error('订阅已删除。');
     const fullScan = Boolean(subscription.pagination_selector && !subscription.initial_scan_completed);
-    await appendRuntimeLog({ level: 'info', source: 'worker', subscriptionId: subscription.id, jobId: job.id, message: fullScan ? '开始全量检查。' : '开始检查第一页。' });
+    await appendRuntimeLog({ level: 'info', source: 'worker', subscriptionId: subscription.id, jobId: job.id, message: fullScan ? (subscription.initial_scan_run_id ? `恢复全量检查：从第 ${subscription.initial_scan_next_page} 页继续。` : '开始全量检查。') : '开始检查第一页。' });
     const result = await captureSubscription(subscription);
     await db.run("UPDATE jobs SET status = 'completed', finished_at = ? WHERE id = ?", [new Date().toISOString(), job.id]);
     const additions = result.addedCount ? `，新增 ${result.addedCount} 条内容` : '，没有新增内容';

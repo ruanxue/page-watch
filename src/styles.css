@@ -234,3 +234,4 @@ body { background: #f8fafc; }
 
 .subscription-rule-picker { margin-top: 17px; padding: 14px; border: 1px solid #dbeafe; border-radius: 10px; background: #f8fbff; }.subscription-rule-picker label { margin: 0 !important; }.subscription-rule-picker p { margin: 9px 0 0; color: #64748b; font-size: .75rem; line-height: 1.5; }
 .archive-content-link { display: inline-flex; max-width: 100%; align-items: center; color: #1d4ed8; text-decoration: none; }.archive-content-link::after { margin-left: 5px; color: #60a5fa; content: '↗'; font-size: .72rem; }.archive-content-link:hover code { color: #1e40af; text-decoration: underline; text-underline-offset: 3px; }
+.queue-progress, .archive-queue-progress { margin: 5px 0 0; color: #64748b; font-size: .75rem; line-height: 1.35; }.magnet-skipped { color: #64748b; border-color: #cbd5e1; background: #f8fafc; }.jellyfin-skip-toggle { margin-top: 8px !important; }

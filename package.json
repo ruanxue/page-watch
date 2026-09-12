@@ -15,6 +15,7 @@
     "migrate:mysql": "tsx server/migrate-sqlite-to-mysql.ts",
     "verify:mysql-migration": "tsx server/verify-mysql-migration.ts",
     "build": "vite build",
+    "test": "node --import tsx --test server/*.test.ts",
     "all-in-one": "tsx server/all-in-one.ts",
     "start": "tsx server/index.ts",
     "worker": "tsx server/worker.ts",

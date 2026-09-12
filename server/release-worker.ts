@@ -1,5 +1,5 @@
 import { appendRuntimeLog, db, queueReleaseJob, refreshSettings, reportWorkerHeartbeat } from './db.js';
-import { lookupReleaseDate } from './release-date.js';
+import { lookupReleaseDate, ReleaseDateBrowserSession } from './release-date.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription } from './retry.js';
 import { expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
 
@@ -9,6 +9,7 @@ const BACKFILL_BATCH_SIZE = 100;
 // `2026-08-28T00:00:00+08:00` were matched correctly. Requeue it once after
 // upgrading, while leaving genuine, detailed "unavailable" results alone.
 const PREVIOUS_DATE_PATTERN_RESULT = '详情页未找到标签“发行日期”对应的日期值。';
+const browserSession = new ReleaseDateBrowserSession();
 
 type ReleaseJob = {
   id: number;
@@ -61,7 +62,7 @@ async function logProgress(subscriptionId: number) {
 async function runNextReleaseJob() {
   const job = await db.get<ReleaseJob>(`SELECT j.id, j.archive_entry_id, j.attempt_count, a.subscription_id, a.content, a.detail_url, s.url AS subscription_url
     FROM release_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id
-    WHERE j.status = 'queued' AND (j.retry_after IS NULL OR j.retry_after <= ?) ORDER BY j.requested_at ASC, j.id ASC LIMIT 1`, [new Date().toISOString()]);
+    WHERE j.status = 'queued' AND (j.retry_after IS NULL OR j.retry_after <= ?) ORDER BY j.priority DESC, j.requested_at ASC, j.id ASC LIMIT 1`, [new Date().toISOString()]);
   if (!job) return;
   const started = await db.run("UPDATE release_jobs SET status = 'running', started_at = ?, retry_after = NULL WHERE id = ? AND status = 'queued'", [new Date().toISOString(), job.id]);
   if (!started.changes) return;
@@ -78,7 +79,7 @@ async function runNextReleaseJob() {
     }
     const detailUrl = expandReleaseUrl(rule.urlTemplate, { detailUrl: job.detail_url, subscriptionUrl: job.subscription_url, content: job.content });
     if (!detailUrl) throw new Error('发行日期规则无法生成详情页地址；请检查详情页地址模板或内容链接。');
-    const result = await lookupReleaseDate(detailUrl, rule);
+    const result = await lookupReleaseDate(detailUrl, rule, browserSession);
     const finishedAt = new Date().toISOString();
     await db.transaction(async (tx) => {
       if (result.status === 'found') {
@@ -157,3 +158,5 @@ void tick();
 setInterval(() => void tick(), POLL_MS);
 const heartbeatTimer = setInterval(() => void heartbeat(), 15_000);
 heartbeatTimer.unref();
+process.once('SIGTERM', () => { void browserSession.close(); });
+process.once('SIGINT', () => { void browserSession.close(); });

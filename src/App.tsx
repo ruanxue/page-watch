@@ -29,8 +29,12 @@ type Subscription = {
   initial_scan_completed: number;
   initial_scan_total: number | null;
   initial_scan_pages_completed: number;
+  initial_scan_run_id: string | null;
+  initial_scan_next_page: number;
+  next_scheduled_at: string | null;
   full_scan_active: number;
   archive_count: number;
+  queue_summary: Record<string, { done: number; total: number }> | string;
 };
 
 type FormData = {
@@ -66,7 +70,7 @@ type ArchiveEntry = {
   release_date: string | null;
   release_status: 'unsearched' | 'pending' | 'found' | 'unavailable' | 'failed';
   release_error: string | null;
-  magnet_status: 'unsearched' | 'pending' | 'found' | 'not_found' | 'failed';
+  magnet_status: 'unsearched' | 'pending' | 'found' | 'not_found' | 'failed' | 'skipped';
   magnet_value: string | null;
   magnet_checked_at: string | null;
   magnet_error: string | null;
@@ -217,10 +221,10 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
     return () => { alive = false; window.clearInterval(timer); };
   }, []);
   useEffect(() => {
-    if (!subscriptions.some((item) => item.full_scan_active)) return;
-    const timer = window.setInterval(() => void load(), 1500);
-    return () => window.clearInterval(timer);
-  }, [subscriptions]);
+    const stream = new EventSource('/api/events?channel=subscriptions');
+    stream.addEventListener('subscriptions', () => void load());
+    return () => stream.close();
+  }, []);
   useEffect(() => {
     const syncView = () => {
       setView(viewFromHash());
@@ -382,10 +386,14 @@ function Empty({ onCreate }: { onCreate: () => void }) {
 }
 
 function SubscriptionCard({ item, onRun, onEdit, onConfigure, onToggle, onDelete }: { item: Subscription; onRun: (item: Subscription) => void; onEdit: (item: Subscription) => void; onConfigure: (item: Subscription) => void; onToggle: (item: Subscription) => void; onDelete: (item: Subscription) => void }) {
+  const summary = typeof item.queue_summary === 'string' ? JSON.parse(item.queue_summary) as Record<string, { done: number; total: number }> : item.queue_summary;
+  const progress = [['check', '检查'], ['release', '发行日期'], ['magnet', '磁力'], ['library', '影视库'], ['download', '下载']].flatMap(([key, label]) => {
+    const value = summary?.[key]; return value?.total ? [`${label} ${value.done}/${value.total}`] : [];
+  });
   return <article className={`subscription-card ${item.last_error ? 'has-error' : ''}`}>
     <div className="card-top"><div className="site-ident">{shortUrl(item.url).slice(0, 1).toUpperCase()}</div><div className="card-title"><h3>{item.name}</h3><a href={item.url} target="_blank" rel="noreferrer">{shortUrl(item.url)} ↗</a></div><button className="icon-button" title="编辑订阅" onClick={() => onEdit(item)}>⋯</button></div>
     <div className="selector-row"><span>SELECTOR</span><code>{item.selector || '尚未配置'}</code>{item.selector && <>{item.content_source === 'attribute' && <span className="attribute-pill">@{item.attribute_name}</span>}{item.result_mode === 'all' && <span className="attribute-pill">全部</span>}{item.match_pattern && <span className="attribute-pill">匹配</span>}<span className={`mode ${item.render_mode}`}>{item.render_mode === 'dynamic' ? '浏览器渲染' : 'HTML 抓取'}</span></>}</div>
-    {item.last_error && <div className="error-line">上次失败：{item.last_error}</div>}
+    {item.last_error && <div className="error-line">上次失败：{item.last_error}</div>}{progress.length > 0 && <div className="queue-progress" title="队列状态会实时更新">{progress.join(' · ')}</div>}
     <footer className="card-footer"><button type="button" className={`subscription-switch ${item.is_active ? 'on' : ''}`} role="switch" aria-checked={Boolean(item.is_active)} disabled={!item.selector} title={!item.selector ? '请先配置读取规则' : item.is_active ? '暂停订阅' : '启用订阅'} onClick={() => onToggle(item)}><span aria-hidden="true" /><em>{item.is_active ? '已启用' : '已暂停'}</em></button>{item.is_active && <span>{scheduleLabel(item)}</span>}<span>上次：{formatTime(item.last_checked_at)}</span>{Boolean(item.full_scan_active) && <span className="scan-progress"><b>{item.initial_scan_total ? `全量 ${item.initial_scan_pages_completed}/${item.initial_scan_total}` : '全量准备中'}</b><i><em style={{ width: item.initial_scan_total ? `${Math.min(100, item.initial_scan_pages_completed / item.initial_scan_total * 100)}%` : '18%' }} /></i></span>}<div className="card-actions"><button type="button" onClick={() => onConfigure(item)}>{item.selector ? '规则' : '配置规则'}</button><button disabled={!item.selector} title={!item.selector ? '请先配置读取规则' : undefined} onClick={() => onRun(item)}>立即检查</button><button className="danger" onClick={() => onDelete(item)}>删除</button></div></footer>
   </article>;
 }
@@ -465,6 +473,9 @@ function ArchivePage({ subscriptions, onNotice }: { subscriptions: Subscription[
   const [entries, setEntries] = useState<ArchiveEntry[]>([]);
   const [inspectionRules, setInspectionRules] = useState<InspectionRules | null>(null);
   const [jellyfinBaseUrl, setJellyfinBaseUrl] = useState('');
+  useEffect(() => {
+    setSelected((current) => current ? subscriptions.find((item) => item.id === current.id) ?? current : null);
+  }, [subscriptions]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [releaseBackfillBusy, setReleaseBackfillBusy] = useState(false);
@@ -557,9 +568,13 @@ function ArchivePage({ subscriptions, onNotice }: { subscriptions: Subscription[
       onNotice('磁力链接已复制到剪贴板。');
     } catch { onNotice('浏览器无法复制，请检查剪贴板权限。'); }
   };
+  const selectedSummary = selected ? (typeof selected.queue_summary === 'string' ? JSON.parse(selected.queue_summary) as Record<string, { done: number; total: number }> : selected.queue_summary) : null;
+  const selectedProgress = selectedSummary ? [['check', '检查'], ['release', '发行日期'], ['magnet', '磁力'], ['library', '影视库'], ['download', '下载']].flatMap(([key, label]) => {
+    const value = selectedSummary[key]; return value?.total ? [`${label} ${value.done}/${value.total}`] : [];
+  }) : [];
   if (selected) return <section id="archive" className="archive-section">
-    <div className="section-head"><div><button className="back-button" onClick={() => setSelected(null)}>← 内容档案</button><h2>{selected.name}</h2><p>{shortUrl(selected.url)} · 共 {selected.archive_count} 条归档内容</p></div><div className="archive-actions"><button className="secondary" disabled={releaseBackfillBusy} onClick={() => void backfillReleaseDates()}>{releaseBackfillBusy ? '正在排队…' : '检索发行日期'}</button><button className="secondary" disabled={backfillBusy} onClick={() => void backfillMagnets()}>{backfillBusy ? '正在排队…' : '补全磁力链接'}</button><button className="secondary" disabled={downloadBackfillBusy} onClick={() => void backfillDownloads()}>{downloadBackfillBusy ? '正在排队…' : '提交可下载项'}</button><button className="quiet" onClick={() => void loadArchive(selected)}>↻ 刷新</button></div></div>
-    {loading ? <div className="empty">正在读取内容…</div> : error ? <div className="form-error">{error}</div> : entries.length === 0 ? <div className="empty-card archive-empty"><h3>尚无归档内容</h3><p>完成一次检查后，提取结果会出现在这里。</p></div> : <div className="archive-table-wrap"><table className="archive-table"><thead><tr><th className="archive-index">序号</th><th>番号</th><th>标题</th><th>发行日期</th><th>磁力链接</th><th>影视库</th><th>操作</th></tr></thead><tbody>{entries.map((entry, index) => { const detailUrl = archiveContentUrl(entry); const searchUrl = magnetSearchUrl(inspectionRules, entry.content); return <tr key={entry.id}><td className="archive-index">{index + 1}</td><td>{detailUrl ? <a className="archive-content-link" href={detailUrl} target="_blank" rel="noreferrer" title="打开所属网站的详情页"><code>{entry.content}</code></a> : <code>{entry.content}</code>}</td><td className="archive-title">{entry.title || '—'}</td><td><ReleaseDateCell entry={entry} /></td><td className="magnet-cell">{entry.magnet_status === 'found' ? <button className="magnet-action magnet-copy" type="button" onClick={() => void copyMagnet(entry)}>复制</button> : entry.magnet_status === 'pending' ? <span className="magnet-action magnet-pending">检索中</span> : entry.magnet_status === 'not_found' ? <button className="magnet-action magnet-retry" type="button" disabled={retryingId === entry.id} aria-busy={retryingId === entry.id} aria-label={retryingId === entry.id ? '正在加入磁力检索队列' : '未找到磁力链接，重新检索'} title={retryingId === entry.id ? '正在加入队列' : '未找到，点击重新检索'} onClick={() => void retryMagnet(entry)}>重试</button> : entry.magnet_status === 'failed' ? <button className="magnet-action magnet-retry magnet-failed" type="button" disabled={retryingId === entry.id} aria-busy={retryingId === entry.id} aria-label={retryingId === entry.id ? '正在加入磁力检索队列' : '磁力检索失败，重新检索'} title={retryingId === entry.id ? '正在加入队列' : '检索失败，点击重新检索'} onClick={() => void retryMagnet(entry)}>重试</button> : <span className="magnet-action">待补全</span>}</td><td className="jellyfin-cell"><JellyfinCell entry={entry} baseUrl={jellyfinBaseUrl} /></td><td className="download-cell">{entry.magnet_status === 'found' ? <DownloadCell entry={entry} downloadingId={downloadingId} onSubmit={submitDownload} /> : searchUrl ? <a className="download-action magnet-search-link" href={searchUrl} target="_blank" rel="noreferrer" title={`前往磁力搜索页面检索 ${entry.content}`}>搜索</a> : '—'}</td></tr>; })}</tbody></table></div>}
+    <div className="section-head"><div><button className="back-button" onClick={() => setSelected(null)}>← 内容档案</button><h2>{selected.name}</h2><p>{shortUrl(selected.url)} · 共 {selected.archive_count} 条归档内容{selected.full_scan_active ? ` · 全量 ${selected.initial_scan_pages_completed}/${selected.initial_scan_total ?? '?'}` : ''}</p>{selectedProgress.length > 0 && <p className="archive-queue-progress">{selectedProgress.join(' · ')}</p>}</div><div className="archive-actions"><button className="secondary" disabled={releaseBackfillBusy} onClick={() => void backfillReleaseDates()}>{releaseBackfillBusy ? '正在排队…' : '检索发行日期'}</button><button className="secondary" disabled={backfillBusy} onClick={() => void backfillMagnets()}>{backfillBusy ? '正在排队…' : '补全磁力链接'}</button><button className="secondary" disabled={downloadBackfillBusy} onClick={() => void backfillDownloads()}>{downloadBackfillBusy ? '正在排队…' : '提交可下载项'}</button><button className="quiet" onClick={() => void loadArchive(selected)}>↻ 刷新</button></div></div>
+    {loading ? <div className="empty">正在读取内容…</div> : error ? <div className="form-error">{error}</div> : entries.length === 0 ? <div className="empty-card archive-empty"><h3>尚无归档内容</h3><p>完成一次检查后，提取结果会出现在这里。</p></div> : <div className="archive-table-wrap"><table className="archive-table"><thead><tr><th className="archive-index">序号</th><th>番号</th><th>标题</th><th>发行日期</th><th>磁力链接</th><th>影视库</th><th>操作</th></tr></thead><tbody>{entries.map((entry, index) => { const detailUrl = archiveContentUrl(entry); const searchUrl = magnetSearchUrl(inspectionRules, entry.content); return <tr key={entry.id}><td className="archive-index">{index + 1}</td><td>{detailUrl ? <a className="archive-content-link" href={detailUrl} target="_blank" rel="noreferrer" title="打开所属网站的详情页"><code>{entry.content}</code></a> : <code>{entry.content}</code>}</td><td className="archive-title">{entry.title || '—'}</td><td><ReleaseDateCell entry={entry} /></td><td className="magnet-cell">{entry.magnet_status === 'found' ? <button className="magnet-action magnet-copy" type="button" onClick={() => void copyMagnet(entry)}>复制</button> : entry.magnet_status === 'skipped' ? <span className="magnet-action magnet-skipped" title="Jellyfin 已入库，自动跳过磁力检索">已跳过</span> : entry.magnet_status === 'pending' ? <span className="magnet-action magnet-pending">检索中</span> : entry.magnet_status === 'not_found' ? <button className="magnet-action magnet-retry" type="button" disabled={retryingId === entry.id} aria-busy={retryingId === entry.id} aria-label={retryingId === entry.id ? '正在加入磁力检索队列' : '未找到磁力链接，重新检索'} title={retryingId === entry.id ? '正在加入队列' : '未找到，点击重新检索'} onClick={() => void retryMagnet(entry)}>重试</button> : entry.magnet_status === 'failed' ? <button className="magnet-action magnet-retry magnet-failed" type="button" disabled={retryingId === entry.id} aria-busy={retryingId === entry.id} aria-label={retryingId === entry.id ? '正在加入磁力检索队列' : '磁力检索失败，重新检索'} title={retryingId === entry.id ? '正在加入队列' : '检索失败，点击重新检索'} onClick={() => void retryMagnet(entry)}>重试</button> : <span className="magnet-action">待补全</span>}</td><td className="jellyfin-cell"><JellyfinCell entry={entry} baseUrl={jellyfinBaseUrl} /></td><td className="download-cell">{entry.magnet_status === 'found' ? <DownloadCell entry={entry} downloadingId={downloadingId} onSubmit={submitDownload} /> : searchUrl ? <a className="download-action magnet-search-link" href={searchUrl} target="_blank" rel="noreferrer" title={`前往磁力搜索页面检索 ${entry.content}`}>搜索</a> : '—'}</td></tr>; })}</tbody></table></div>}
   </section>;
   return <section id="archive" className="archive-section">
     <div className="section-head"><div><h2>内容档案</h2><p>按订阅查看首次获取到的内容。</p></div></div>
@@ -835,13 +850,14 @@ type JellyfinSettings = {
   apiKeyConfigured: boolean;
   libraryIds: string[];
   syncIntervalMinutes: number;
+  skipMagnetWhenAvailable: boolean;
   lastSyncedAt: string | null;
 };
 
 type JellyfinLibrary = { id: string; name: string; collectionType: string | null };
 type JellyfinForm = Omit<JellyfinSettings, 'apiKeyConfigured' | 'lastSyncedAt'> & { apiKey: string };
 
-const blankJellyfinForm: JellyfinForm = { enabled: false, url: '', apiKey: '', libraryIds: [], syncIntervalMinutes: 60 };
+const blankJellyfinForm: JellyfinForm = { enabled: false, url: '', apiKey: '', libraryIds: [], syncIntervalMinutes: 60, skipMagnetWhenAvailable: true };
 
 function JellyfinSettingsPanel({ onNotice }: { onNotice: (message: string) => void }) {
   const [form, setForm] = useState<JellyfinForm>(blankJellyfinForm);
@@ -853,7 +869,7 @@ function JellyfinSettingsPanel({ onNotice }: { onNotice: (message: string) => vo
   const update = <K extends keyof JellyfinForm>(key: K, value: JellyfinForm[K]) => setForm((old) => ({ ...old, [key]: value }));
   useEffect(() => {
     void request<JellyfinSettings>('/api/settings/jellyfin').then((settings) => {
-      setForm({ enabled: settings.enabled, url: settings.url, apiKey: '', libraryIds: settings.libraryIds, syncIntervalMinutes: settings.syncIntervalMinutes });
+      setForm({ enabled: settings.enabled, url: settings.url, apiKey: '', libraryIds: settings.libraryIds, syncIntervalMinutes: settings.syncIntervalMinutes, skipMagnetWhenAvailable: settings.skipMagnetWhenAvailable });
       setApiKeyConfigured(settings.apiKeyConfigured);
     }).catch((reason) => setError(reason instanceof Error ? reason.message : '无法读取 Jellyfin 设置。')).finally(() => setLoading(false));
   }, []);
@@ -863,7 +879,7 @@ function JellyfinSettingsPanel({ onNotice }: { onNotice: (message: string) => vo
   };
   const save = async (showNotice = true) => {
     const settings = await request<JellyfinSettings>('/api/settings/jellyfin', { method: 'PUT', body: JSON.stringify(payload()) });
-    setForm((old) => ({ ...old, enabled: settings.enabled, url: settings.url, apiKey: '', libraryIds: settings.libraryIds, syncIntervalMinutes: settings.syncIntervalMinutes }));
+    setForm((old) => ({ ...old, enabled: settings.enabled, url: settings.url, apiKey: '', libraryIds: settings.libraryIds, syncIntervalMinutes: settings.syncIntervalMinutes, skipMagnetWhenAvailable: settings.skipMagnetWhenAvailable }));
     setApiKeyConfigured(settings.apiKeyConfigured);
     if (showNotice) onNotice(settings.enabled ? 'Jellyfin 影视库设置已保存，等待同步。' : 'Jellyfin 影视库同步已关闭。');
   };
@@ -893,6 +909,7 @@ function JellyfinSettingsPanel({ onNotice }: { onNotice: (message: string) => vo
       <label>Jellyfin Web 地址<input disabled={loading || busy} value={form.url} onChange={(event) => update('url', event.target.value)} placeholder="例如 http://192.168.1.20:8096" /><span className="field-note">填写 Jellyfin Web UI 的局域网地址和端口。</span></label>
       <label>API 密钥<input type="password" autoComplete="off" disabled={loading || busy} value={form.apiKey} onChange={(event) => update('apiKey', event.target.value)} placeholder={apiKeyConfigured ? '已保存；留空则不修改' : '在 Jellyfin 管理后台创建的 API 密钥'} /><span className="field-note">密钥仅保存于服务端，不会再返回或显示。</span></label>
       <label>同步间隔（分钟）<input type="number" min="5" max="1440" disabled={loading || busy || !form.enabled} value={form.syncIntervalMinutes} onChange={(event) => update('syncIntervalMinutes', Number(event.target.value))} /></label>
+      <label className="toggle jellyfin-skip-toggle"><input type="checkbox" checked={form.skipMagnetWhenAvailable} disabled={loading || busy || !form.enabled} onChange={(event) => update('skipMagnetWhenAvailable', event.target.checked)} /><span />已入库时自动跳过磁力检索</label>
       {libraries.length > 0 && <fieldset className="jellyfin-libraries" disabled={loading || busy || !form.enabled}><legend>同步的媒体库</legend><div>{libraries.map((library) => <label key={library.id} className="library-choice"><input type="checkbox" checked={form.libraryIds.includes(library.id)} onChange={() => toggleLibrary(library.id)} /><span><b>{library.name}</b>{library.collectionType ? <small>{library.collectionType}</small> : null}</span></label>)}</div><span className="field-note">可多选；同步只读取所选媒体库中的影片项目。</span></fieldset>}
       {libraries.length === 0 && <p className="field-note jellyfin-library-hint">先保存并测试连接，即可读取并选择 Jellyfin 媒体库。</p>}
     </section>

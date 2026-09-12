@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import * as cheerio from 'cheerio';
-import { chromium } from 'playwright';
+import { chromium, type Browser } from 'playwright';
 import { ProxyAgent } from 'undici';
 import { assertSafeUrl } from './capture.js';
 import { getOutboundProxyUrl } from './db.js';
@@ -146,7 +146,77 @@ function localBrowserExecutable() {
   return localBrowserCandidates.find((candidate) => fs.existsSync(candidate));
 }
 
-async function fetchDetailInBrowser(url: URL, rule: ReleaseDateRule): Promise<string> {
+export class ReleaseDateBrowserSession {
+  private browser: Browser | null = null;
+  private proxyUrl: string | null = null;
+  private openedAt = 0;
+  private pageCount = 0;
+
+  async close() {
+    const browser = this.browser;
+    this.browser = null;
+    this.proxyUrl = null;
+    this.pageCount = 0;
+    this.openedAt = 0;
+    await browser?.close().catch(() => undefined);
+  }
+
+  private async ensureBrowser() {
+    const proxyUrl = getOutboundProxyUrl() || null;
+    const stale = !this.browser || !this.browser.isConnected() || this.proxyUrl !== proxyUrl || this.pageCount >= 25 || Date.now() - this.openedAt >= 15 * 60_000;
+    if (!stale) return this.browser!;
+    await this.close();
+    const executablePath = localBrowserExecutable();
+    this.browser = await chromium.launch({
+      headless: process.env.PLAYWRIGHT_HEADLESS !== 'false',
+      ...(executablePath ? { executablePath } : {}),
+      ...(proxyUrl ? { proxy: { server: proxyUrl } } : {})
+    });
+    this.proxyUrl = proxyUrl;
+    this.openedAt = Date.now();
+    return this.browser;
+  }
+
+  async fetch(url: URL, rule: ReleaseDateRule): Promise<string> {
+    await waitForRequestSlot(rule.requestIntervalMs);
+    const proxyUrl = getOutboundProxyUrl();
+    let context: Awaited<ReturnType<Browser['newContext']>> | null = null;
+    try {
+      const browser = await this.ensureBrowser();
+      // An isolated context prevents page cookies, storage and service workers
+      // from leaking from one archive entry to another.
+      context = await browser.newContext({ userAgent: 'PageWatch/0.1 (+self-hosted webpage monitor)' });
+      const page = await context.newPage();
+      const response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await assertSafeUrl(page.url());
+      const initialHtml = response && !response.ok() ? await page.content() : null;
+      if (response && !response.ok()) {
+        const challengeReason = securityChallengeReason(initialHtml ?? '');
+        throw new Error(challengeReason ? `${challengeReason}（HTTP ${response.status()}）。` : `详情页返回 HTTP ${response.status()}。`);
+      }
+      await page.waitForFunction((config) => {
+        const normalizeLabel = (value: string) => value.replace(/\s+/g, ' ').trim().replace(/[：:]/g, '');
+        const expectedLabel = normalizeLabel(config.labelText);
+        return Array.from(document.querySelectorAll(config.containerSelector)).some((container) => {
+          const label = container.querySelector(config.labelSelector)?.textContent ?? '';
+          if (normalizeLabel(label) !== expectedLabel) return false;
+          const valueElement = container.querySelector(config.valueSelector);
+          return Boolean(valueElement && (config.valueSource === 'attribute' ? valueElement.getAttribute(config.valueAttribute)?.trim() : valueElement.textContent?.trim()));
+        });
+      }, { containerSelector: rule.containerSelector, labelSelector: rule.labelSelector, labelText: rule.labelText, valueSelector: rule.valueSelector, valueSource: rule.valueSource, valueAttribute: rule.valueAttribute }, { timeout: 12_000 }).catch(() => undefined);
+      this.pageCount += 1;
+      return await page.content();
+    } catch (error) {
+      // A timeout/disconnect must not poison later tasks in the reusable browser.
+      await this.close();
+      if (error instanceof Error && /timeout/i.test(error.message)) throw new Error(describeError(error, { action: '发行日期详情页浏览器读取', target: url.hostname, proxyUrl }));
+      throw new Error(describeError(error, { action: '发行日期详情页浏览器读取', target: url.hostname, proxyUrl }));
+    } finally { await context?.close().catch(() => undefined); }
+  }
+}
+
+async function fetchDetailInBrowser(url: URL, rule: ReleaseDateRule, session?: ReleaseDateBrowserSession): Promise<string> {
+  if (session) return session.fetch(url, rule);
   await waitForRequestSlot(rule.requestIntervalMs);
   const proxyUrl = getOutboundProxyUrl();
   const executablePath = localBrowserExecutable();
@@ -193,9 +263,9 @@ async function fetchDetailInBrowser(url: URL, rule: ReleaseDateRule): Promise<st
   }
 }
 
-export async function lookupReleaseDate(rawUrl: string, rule: ReleaseDateRule): Promise<ReleaseDateLookupResult> {
+export async function lookupReleaseDate(rawUrl: string, rule: ReleaseDateRule, session?: ReleaseDateBrowserSession): Promise<ReleaseDateLookupResult> {
   const url = await assertSafeUrl(rawUrl);
-  const html = rule.renderMode === 'dynamic' ? await fetchDetailInBrowser(url, rule) : await fetchDetail(url, rule.requestIntervalMs);
+  const html = rule.renderMode === 'dynamic' ? await fetchDetailInBrowser(url, rule, session) : await fetchDetail(url, rule.requestIntervalMs);
   const result = inspectReleaseDate(html, rule);
   return result.releaseDate
     ? { status: 'found', releaseDate: result.releaseDate }

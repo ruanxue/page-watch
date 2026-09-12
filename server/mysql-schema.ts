@@ -32,6 +32,9 @@ export async function ensureMySqlSchema(pool: Pool) {
     initial_scan_completed TINYINT NOT NULL DEFAULT 0,
     initial_scan_total INT NULL,
     initial_scan_pages_completed INT NOT NULL DEFAULT 0,
+    initial_scan_run_id VARCHAR(64) NULL,
+    initial_scan_next_page INT NOT NULL DEFAULT 1,
+    next_scheduled_at VARCHAR(40) NULL,
     created_at VARCHAR(40) NOT NULL,
     updated_at VARCHAR(40) NOT NULL DEFAULT '1970-01-01T00:00:00.000Z',
     PRIMARY KEY (id)
@@ -47,9 +50,11 @@ export async function ensureMySqlSchema(pool: Pool) {
     error TEXT NULL,
     attempt_count INT NOT NULL DEFAULT 0,
     retry_after VARCHAR(40) NULL,
+    priority INT NOT NULL DEFAULT 0,
     active_subscription_id INT GENERATED ALWAYS AS (CASE WHEN status IN ('queued', 'running') THEN subscription_id ELSE NULL END) STORED,
     PRIMARY KEY (id),
     KEY idx_jobs_status (status, requested_at),
+    KEY idx_jobs_priority (status, priority, requested_at),
     UNIQUE KEY idx_jobs_active_subscription (active_subscription_id)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 
@@ -115,9 +120,11 @@ export async function ensureMySqlSchema(pool: Pool) {
     error TEXT NULL,
     attempt_count INT NOT NULL DEFAULT 0,
     retry_after VARCHAR(40) NULL,
+    priority INT NOT NULL DEFAULT 0,
     active_archive_entry_id INT GENERATED ALWAYS AS (CASE WHEN status IN ('queued', 'running') THEN archive_entry_id ELSE NULL END) STORED,
     PRIMARY KEY (id),
     KEY idx_release_jobs_status (status, requested_at),
+    KEY idx_release_jobs_priority (status, priority, requested_at),
     UNIQUE KEY idx_release_jobs_active_entry (active_archive_entry_id)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 
@@ -131,9 +138,11 @@ export async function ensureMySqlSchema(pool: Pool) {
     error TEXT NULL,
     attempt_count INT NOT NULL DEFAULT 0,
     retry_after VARCHAR(40) NULL,
+    priority INT NOT NULL DEFAULT 0,
     active_archive_entry_id INT GENERATED ALWAYS AS (CASE WHEN status IN ('queued', 'running') THEN archive_entry_id ELSE NULL END) STORED,
     PRIMARY KEY (id),
     KEY idx_magnet_jobs_status (status, requested_at),
+    KEY idx_magnet_jobs_priority (status, priority, requested_at),
     UNIQUE KEY idx_magnet_jobs_active_entry (active_archive_entry_id)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 
@@ -147,9 +156,11 @@ export async function ensureMySqlSchema(pool: Pool) {
     error TEXT NULL,
     attempt_count INT NOT NULL DEFAULT 0,
     retry_after VARCHAR(40) NULL,
+    priority INT NOT NULL DEFAULT 0,
     active_archive_entry_id INT GENERATED ALWAYS AS (CASE WHEN status IN ('queued', 'running') THEN archive_entry_id ELSE NULL END) STORED,
     PRIMARY KEY (id),
     KEY idx_download_jobs_status (status, requested_at),
+    KEY idx_download_jobs_priority (status, priority, requested_at),
     UNIQUE KEY idx_download_jobs_active_entry (active_archive_entry_id)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 
@@ -193,6 +204,43 @@ export async function ensureMySqlSchema(pool: Pool) {
     PRIMARY KEY (worker_name)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 
+  // A full scan is deliberately invisible until every page has succeeded.
+  // These rows are its durable checkpoint, so a retried job can continue at
+  // the next page without re-reading completed pages.
+  await pool.query(`CREATE TABLE IF NOT EXISTS initial_scan_items (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    subscription_id INT NOT NULL,
+    scan_id VARCHAR(64) NOT NULL,
+    page_number INT NOT NULL,
+    item_position INT NOT NULL,
+    content TEXT NOT NULL,
+    title TEXT NULL,
+    detail_url TEXT NULL,
+    content_hash CHAR(64) NOT NULL,
+    created_at VARCHAR(40) NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY idx_initial_scan_item_unique (subscription_id, scan_id, content_hash),
+    KEY idx_initial_scan_item_order (subscription_id, scan_id, page_number, item_position, id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+
+  await pool.query(`CREATE TABLE IF NOT EXISTS library_jobs (
+    id INT NOT NULL AUTO_INCREMENT,
+    archive_entry_id INT NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'queued',
+    requested_at VARCHAR(40) NOT NULL,
+    started_at VARCHAR(40) NULL,
+    finished_at VARCHAR(40) NULL,
+    error TEXT NULL,
+    attempt_count INT NOT NULL DEFAULT 0,
+    retry_after VARCHAR(40) NULL,
+    priority INT NOT NULL DEFAULT 0,
+    active_archive_entry_id INT GENERATED ALWAYS AS (CASE WHEN status IN ('queued', 'running') THEN archive_entry_id ELSE NULL END) STORED,
+    PRIMARY KEY (id),
+    KEY idx_library_jobs_status (status, requested_at),
+    KEY idx_library_jobs_priority (status, priority, requested_at),
+    UNIQUE KEY idx_library_jobs_active_entry (active_archive_entry_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+
   // CREATE TABLE IF NOT EXISTS does not amend an existing table, so add newer
   // archive fields safely for installations created by earlier releases.
   await addColumnIfMissing(pool, 'archive_entries', 'detail_url', 'TEXT NULL');
@@ -222,15 +270,30 @@ export async function ensureMySqlSchema(pool: Pool) {
   await pool.query("UPDATE archive_entries SET updated_at = first_seen_at WHERE updated_at = '1970-01-01T00:00:00.000Z'");
   await addColumnIfMissing(pool, 'jobs', 'attempt_count', 'INT NOT NULL DEFAULT 0');
   await addColumnIfMissing(pool, 'jobs', 'retry_after', 'VARCHAR(40) NULL');
+  await addColumnIfMissing(pool, 'jobs', 'priority', 'INT NOT NULL DEFAULT 0');
+  await addColumnIfMissing(pool, 'release_jobs', 'attempt_count', 'INT NOT NULL DEFAULT 0');
+  await addColumnIfMissing(pool, 'release_jobs', 'retry_after', 'VARCHAR(40) NULL');
+  await addColumnIfMissing(pool, 'release_jobs', 'priority', 'INT NOT NULL DEFAULT 0');
   await addColumnIfMissing(pool, 'magnet_jobs', 'attempt_count', 'INT NOT NULL DEFAULT 0');
   await addColumnIfMissing(pool, 'magnet_jobs', 'retry_after', 'VARCHAR(40) NULL');
+  await addColumnIfMissing(pool, 'magnet_jobs', 'priority', 'INT NOT NULL DEFAULT 0');
   await addColumnIfMissing(pool, 'download_jobs', 'attempt_count', 'INT NOT NULL DEFAULT 0');
   await addColumnIfMissing(pool, 'download_jobs', 'retry_after', 'VARCHAR(40) NULL');
+  await addColumnIfMissing(pool, 'download_jobs', 'priority', 'INT NOT NULL DEFAULT 0');
+  await addColumnIfMissing(pool, 'subscriptions', 'initial_scan_run_id', 'VARCHAR(64) NULL');
+  await addColumnIfMissing(pool, 'subscriptions', 'initial_scan_next_page', 'INT NOT NULL DEFAULT 1');
+  await addColumnIfMissing(pool, 'subscriptions', 'next_scheduled_at', 'VARCHAR(40) NULL');
   await addColumnIfMissing(pool, 'subscriptions', 'pagination_parameter', "VARCHAR(64) NOT NULL DEFAULT 'page'");
   await addColumnIfMissing(pool, 'subscriptions', 'pagination_match_pattern', 'VARCHAR(1024) NULL');
   await addColumnIfMissing(pool, 'subscription_presets', 'pagination_selector', 'TEXT NULL');
   await addColumnIfMissing(pool, 'subscription_presets', 'pagination_parameter', "VARCHAR(64) NOT NULL DEFAULT 'page'");
   await addColumnIfMissing(pool, 'subscription_presets', 'pagination_match_pattern', 'VARCHAR(1024) NULL');
+
+  // Index creation is safe when API and workers boot together.
+  await addIndexIfMissing(pool, 'jobs', 'idx_jobs_priority', 'KEY idx_jobs_priority (status, priority, requested_at)');
+  await addIndexIfMissing(pool, 'release_jobs', 'idx_release_jobs_priority', 'KEY idx_release_jobs_priority (status, priority, requested_at)');
+  await addIndexIfMissing(pool, 'magnet_jobs', 'idx_magnet_jobs_priority', 'KEY idx_magnet_jobs_priority (status, priority, requested_at)');
+  await addIndexIfMissing(pool, 'download_jobs', 'idx_download_jobs_priority', 'KEY idx_download_jobs_priority (status, priority, requested_at)');
 }
 
 async function addColumnIfMissing(pool: Pool, table: string, column: string, definition: string) {
@@ -245,4 +308,12 @@ async function addColumnIfMissing(pool: Pool, table: string, column: string, def
       if ((error as { code?: string }).code !== 'ER_DUP_FIELDNAME') throw error;
     }
   }
+}
+
+async function addIndexIfMissing(pool: Pool, table: string, index: string, definition: string) {
+  const [rows] = await pool.query<(RowDataPacket & { present: number })[]>(`SELECT COUNT(*) AS present
+    FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?`, [table, index]);
+  if (Number(rows[0]?.present ?? 0) > 0) return;
+  try { await pool.query(`ALTER TABLE \`${table}\` ADD ${definition}`); }
+  catch (error) { if ((error as { code?: string }).code !== 'ER_DUP_KEYNAME') throw error; }
 }

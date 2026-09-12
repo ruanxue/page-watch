@@ -6,7 +6,7 @@ import net from 'node:net';
 import * as cheerio from 'cheerio';
 import { chromium } from 'playwright';
 import { ProxyAgent } from 'undici';
-import { db, getOutboundProxyUrl, queueMagnetJob, queueReleaseJob, type DatabaseClient, type Subscription } from './db.js';
+import { db, getJellyfinSettings, getOutboundProxyUrl, queueLibraryJob, queueMagnetJob, queueReleaseJob, type DatabaseClient, type Subscription } from './db.js';
 import { describeError } from './error-details.js';
 import { expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
 
@@ -235,6 +235,7 @@ function archiveItems(content: string) {
 
 async function archiveNewItems(subscription: Subscription, items: CapturedItem[], capturedAt: string, client: DatabaseClient) {
   const rules = getInspectionRules();
+  const jellyfin = getJellyfinSettings();
   const currentItems = uniqueItems(items);
   const archivedCount = await client.get<{ count: number }>('SELECT COUNT(*) AS count FROM archive_entries WHERE subscription_id = ?', [subscription.id]);
   const previousItems = new Set(archiveItems(subscription.last_content ?? ''));
@@ -242,11 +243,17 @@ async function archiveNewItems(subscription: Subscription, items: CapturedItem[]
   for (const item of additions) {
     const detailUrl = item.detailUrl;
     const releaseUrl = rules.releaseDate.enabled ? expandReleaseUrl(rules.releaseDate.urlTemplate, { detailUrl, subscriptionUrl: subscription.url, content: item.content }) : null;
+    const shouldCheckLibraryFirst = rules.magnet.enabled && jellyfin.enabled && jellyfin.libraryIds.length > 0 && jellyfin.skipMagnetWhenAvailable;
     const result = await client.run(`INSERT IGNORE INTO archive_entries
       (subscription_id, content, title, content_hash, first_seen_at, detail_url, release_status, magnet_status, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [subscription.id, item.content, item.title, hash(item.content), capturedAt, detailUrl, releaseUrl ? 'pending' : 'unsearched', rules.magnet.enabled ? 'pending' : 'unsearched', capturedAt]);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [subscription.id, item.content, item.title, hash(item.content), capturedAt, detailUrl, releaseUrl ? 'pending' : 'unsearched', rules.magnet.enabled && !shouldCheckLibraryFirst ? 'pending' : 'unsearched', capturedAt]);
     if (result.changes) {
-      if (rules.magnet.enabled) await queueMagnetJob(result.lastInsertRowid, client);
+      if (rules.magnet.enabled) {
+        if (shouldCheckLibraryFirst) {
+          await client.run(`UPDATE archive_entries SET jellyfin_status = 'pending', jellyfin_error = NULL, updated_at = ? WHERE id = ?`, [capturedAt, result.lastInsertRowid]);
+          await queueLibraryJob(result.lastInsertRowid, client);
+        } else await queueMagnetJob(result.lastInsertRowid, client);
+      }
       if (releaseUrl) await queueReleaseJob(result.lastInsertRowid, client);
     }
   }
@@ -274,40 +281,81 @@ async function capturePage(subscription: Subscription, rawUrl: string, includePa
 }
 
 export async function captureSubscription(subscription: Subscription) {
+  const isFullScan = Boolean(!subscription.initial_scan_completed && subscription.pagination_selector);
+  if (isFullScan) return captureInitialFullScan(subscription);
+
   let first: CaptureResult;
-  try {
-    first = await capturePage(subscription, subscription.url, !subscription.initial_scan_completed && Boolean(subscription.pagination_selector));
-  } catch (error) {
-    throw new Error(describeError(error, { action: '第 1 页读取', target: new URL(subscription.url).hostname, proxyUrl: getOutboundProxyUrl() }), { cause: error });
-  }
-  const capturedItems = [...first.items];
-  const total = !subscription.initial_scan_completed && subscription.pagination_selector ? (first.pageCount ?? 1) : 1;
-  if (!subscription.initial_scan_completed && subscription.pagination_selector) {
-    await db.run('UPDATE subscriptions SET initial_scan_total = ?, initial_scan_pages_completed = 1, last_error = NULL WHERE id = ? AND updated_at = ?', [total, subscription.id, subscription.updated_at]);
-    for (let page = 2; page <= total; page += 1) {
-      const url = new URL(subscription.url);
-      url.searchParams.set(subscription.pagination_parameter || 'page', String(page));
-      let result: CaptureResult;
-      try {
-        result = await capturePage(subscription, url.toString());
-      } catch (error) {
-        throw new Error(describeError(error, { action: `第 ${page}/${total} 页读取`, target: url.hostname, proxyUrl: getOutboundProxyUrl() }), { cause: error });
-      }
-      capturedItems.push(...result.items);
-      await db.run('UPDATE subscriptions SET initial_scan_pages_completed = ? WHERE id = ? AND updated_at = ?', [page, subscription.id, subscription.updated_at]);
-    }
-  }
-  const items = uniqueItems(capturedItems);
+  try { first = await capturePage(subscription, subscription.url); }
+  catch (error) { throw new Error(describeError(error, { action: '第 1 页读取', target: new URL(subscription.url).hostname, proxyUrl: getOutboundProxyUrl() }), { cause: error }); }
+  const items = uniqueItems(first.items);
   const content = contentForItems(items);
   const result = { ...first, items, content, hash: hash(content) };
   const changed = Boolean(subscription.last_hash && subscription.last_hash !== result.hash);
   const now = new Date().toISOString();
   const stored = await db.transaction(async (tx) => {
     const write = await tx.run(`UPDATE subscriptions
-      SET last_checked_at = ?, last_hash = ?, last_content = ?, last_error = NULL, initial_scan_completed = CASE WHEN pagination_selector IS NULL THEN initial_scan_completed ELSE 1 END, initial_scan_total = CASE WHEN pagination_selector IS NULL THEN initial_scan_total ELSE ? END, initial_scan_pages_completed = CASE WHEN pagination_selector IS NULL THEN initial_scan_pages_completed ELSE ? END, updated_at = ?
-      WHERE id = ? AND updated_at = ?`, [now, result.hash, result.content, total, total, now, subscription.id, subscription.updated_at]);
+      SET last_checked_at = ?, last_hash = ?, last_content = ?, last_error = NULL, updated_at = ?
+      WHERE id = ? AND updated_at = ?`, [now, result.hash, result.content, now, subscription.id, subscription.updated_at]);
     const addedCount = write.changes ? await archiveNewItems(subscription, result.items, now, tx) : 0;
     return { stored: Boolean(write.changes), addedCount };
   });
-  return { ...result, changed, capturedAt: now, ...stored, itemCount: result.items.length, totalPages: total };
+  return { ...result, changed, capturedAt: now, ...stored, itemCount: result.items.length, totalPages: 1 };
+}
+
+async function stagePage(subscription: Subscription, scanId: string, page: number, items: CapturedItem[]) {
+  const now = new Date().toISOString();
+  await db.transaction(async (tx) => {
+    for (let position = 0; position < items.length; position += 1) {
+      const item = items[position];
+      await tx.run(`INSERT IGNORE INTO initial_scan_items
+        (subscription_id, scan_id, page_number, item_position, content, title, detail_url, content_hash, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [subscription.id, scanId, page, position + 1, item.content, item.title, item.detailUrl, hash(item.content), now]);
+    }
+    await tx.run(`UPDATE subscriptions SET initial_scan_pages_completed = GREATEST(initial_scan_pages_completed, ?), initial_scan_next_page = ?, last_error = NULL, updated_at = ?
+      WHERE id = ? AND initial_scan_run_id = ?`, [page, page + 1, now, subscription.id, scanId]);
+  });
+}
+
+async function captureInitialFullScan(subscription: Subscription) {
+  let scanId = subscription.initial_scan_run_id;
+  let total = subscription.initial_scan_total ?? 0;
+  let first: CaptureResult | null = null;
+  let nextPage = Math.max(1, subscription.initial_scan_next_page || 1);
+  if (!scanId) {
+    try { first = await capturePage(subscription, subscription.url, true); }
+    catch (error) { throw new Error(describeError(error, { action: '第 1 页读取', target: new URL(subscription.url).hostname, proxyUrl: getOutboundProxyUrl() }), { cause: error }); }
+    scanId = crypto.randomUUID();
+    total = first.pageCount ?? 1;
+    const now = new Date().toISOString();
+    await db.transaction(async (tx) => {
+      await tx.run('DELETE FROM initial_scan_items WHERE subscription_id = ?', [subscription.id]);
+      await tx.run(`UPDATE subscriptions SET initial_scan_run_id = ?, initial_scan_total = ?, initial_scan_pages_completed = 0, initial_scan_next_page = 1, last_error = NULL, updated_at = ? WHERE id = ?`, [scanId, total, now, subscription.id]);
+    });
+    await stagePage(subscription, scanId, 1, first.items);
+    nextPage = 2;
+  }
+  for (let page = nextPage; page <= total; page += 1) {
+    const url = new URL(subscription.url);
+    url.searchParams.set(subscription.pagination_parameter || 'page', String(page));
+    let result: CaptureResult;
+    try { result = await capturePage(subscription, url.toString()); }
+    catch (error) { throw new Error(describeError(error, { action: `第 ${page}/${total} 页读取`, target: url.hostname, proxyUrl: getOutboundProxyUrl() }), { cause: error }); }
+    await stagePage(subscription, scanId, page, result.items);
+  }
+  const staged = await db.all<{ content: string; title: string | null; detail_url: string | null }>(`SELECT content, title, detail_url FROM initial_scan_items
+    WHERE subscription_id = ? AND scan_id = ? ORDER BY page_number ASC, item_position ASC, id ASC`, [subscription.id, scanId]);
+  const items = uniqueItems(staged.map((item) => ({ content: item.content, title: item.title, detailUrl: item.detail_url })));
+  const content = contentForItems(items);
+  const now = new Date().toISOString();
+  const result = { title: first?.title ?? subscription.name, items, content, hash: hash(content), pageCount: total };
+  const changed = Boolean(subscription.last_hash && subscription.last_hash !== result.hash);
+  const stored = await db.transaction(async (tx) => {
+    const write = await tx.run(`UPDATE subscriptions SET last_checked_at = ?, last_hash = ?, last_content = ?, last_error = NULL,
+      initial_scan_completed = 1, initial_scan_total = ?, initial_scan_pages_completed = ?, initial_scan_run_id = NULL, initial_scan_next_page = 1, updated_at = ?
+      WHERE id = ? AND initial_scan_run_id = ?`, [now, result.hash, result.content, total, total, now, subscription.id, scanId]);
+    const addedCount = write.changes ? await archiveNewItems(subscription, items, now, tx) : 0;
+    if (write.changes) await tx.run('DELETE FROM initial_scan_items WHERE subscription_id = ? AND scan_id = ?', [subscription.id, scanId]);
+    return { stored: Boolean(write.changes), addedCount };
+  });
+  return { ...result, changed, capturedAt: now, ...stored, itemCount: items.length, totalPages: total };
 }

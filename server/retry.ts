@@ -1,7 +1,10 @@
 export const MAX_JOB_ATTEMPTS = 3;
 
 export function retryDelayMs(attempt: number) {
-  return attempt === 1 ? 30_000 : 2 * 60_000;
+  const base = attempt === 1 ? 30_000 : 2 * 60_000;
+  // Keep retries spread across services started at the same time. The small
+  // jitter never changes the documented ~30 s / ~2 min cadence materially.
+  return base + Math.floor(Math.random() * 5_001);
 }
 
 /**
@@ -17,5 +20,6 @@ export function isRetryableJobError(error: unknown) {
 }
 
 export function retryDescription(attempt: number) {
-  return `第 ${attempt}/${MAX_JOB_ATTEMPTS} 次失败，将在 ${Math.round(retryDelayMs(attempt) / 1000)} 秒后自动重试`;
+  const label = attempt === 1 ? '约 30 秒' : '约 2 分钟';
+  return `第 ${attempt}/${MAX_JOB_ATTEMPTS} 次失败，将在${label}后自动重试`;
 }

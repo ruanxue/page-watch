@@ -3,7 +3,7 @@ import type { ServerResponse } from 'node:http';
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
 import { assertSafeUrl, previewCapture } from './capture.js';
-import { appendRuntimeLog, db, getJellyfinSettings, getOutboundProxyUrl, getQbittorrentSettings, getSetting, getSubscription, queueDownloadJob, queueJob, queueMagnetJob, queueReleaseJob, reportWorkerHeartbeat, setSetting, type Subscription } from './db.js';
+import { appendRuntimeLog, db, getJellyfinSettings, getOutboundProxyUrl, getQbittorrentSettings, getSetting, getSubscription, JOB_PRIORITY, queueDownloadJob, queueJob, queueMagnetJob, queueReleaseJob, reportWorkerHeartbeat, setSetting, type Subscription } from './db.js';
 import { assertQbittorrentConfig, normalizeQbittorrentUrl, testQbittorrentConnection } from './qbittorrent.js';
 import { assertJellyfinConfig, listJellyfinLibraries, normalizeJellyfinUrl, testJellyfinConnection } from './jellyfin.js';
 import { syncJellyfinLibrary } from './jellyfin-sync.js';
@@ -15,10 +15,11 @@ const port = Number(process.env.PORT ?? 3030);
 const loginFailures = new Map<string, { count: number; firstAt: number; lockedUntil: number }>();
 const loginWindowMs = 10 * 60_000;
 const loginLimit = 7;
-type LiveChannel = 'archive' | 'logs';
+type LiveChannel = 'archive' | 'logs' | 'subscriptions';
 type LiveClient = { response: ServerResponse; channel: LiveChannel; subscriptionId: number | null; needsSnapshot: boolean };
 const liveClients = new Set<LiveClient>();
 const archiveVersions = new Map<number, string>();
+let subscriptionsVersion = '';
 let liveInitialized = false;
 let latestLogId = 0;
 let lastSseKeepAliveAt = 0;
@@ -54,10 +55,12 @@ async function pollLiveChanges() {
   if (!liveClients.size) return;
   const watchesLogs = [...liveClients].some((client) => client.channel === 'logs');
   const watchesArchive = [...liveClients].some((client) => client.channel === 'archive');
-  const [latestLog, versions] = await Promise.all([
+  const watchesSubscriptions = [...liveClients].some((client) => client.channel === 'subscriptions');
+  const [latestLog, versions, subscriptionVersion] = await Promise.all([
     watchesLogs ? db.get<{ id: number }>('SELECT COALESCE(MAX(id), 0) AS id FROM runtime_logs') : Promise.resolve(undefined),
     watchesArchive ? db.all<{ subscription_id: number; version: string }>(`SELECT subscription_id, MAX(updated_at) AS version
-      FROM archive_entries GROUP BY subscription_id`) : Promise.resolve([])
+      FROM archive_entries GROUP BY subscription_id`) : Promise.resolve([]),
+    watchesSubscriptions ? db.get<{ version: string }>(`SELECT SHA2(CONCAT(COALESCE((SELECT MAX(updated_at) FROM subscriptions), ''), ':', COALESCE((SELECT MAX(updated_at) FROM archive_entries), ''), ':', COALESCE((SELECT MAX(requested_at) FROM jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM release_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM magnet_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM library_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM download_jobs WHERE status IN ('queued','running')), '')), 256) AS version`) : Promise.resolve(undefined)
   ]);
   const nextLogId = Number(latestLog?.id ?? 0);
   const nextVersions = new Map(versions.map((row) => [row.subscription_id, row.version]));
@@ -66,12 +69,13 @@ async function pollLiveChanges() {
     latestLogId = nextLogId;
     archiveVersions.clear();
     for (const [subscriptionId, version] of nextVersions) archiveVersions.set(subscriptionId, version);
+    subscriptionsVersion = subscriptionVersion?.version ?? '';
     liveInitialized = true;
   }
   for (const client of liveClients) {
     if (!client.needsSnapshot) continue;
     client.needsSnapshot = false;
-    writeSse(client, client.channel, client.channel === 'archive' ? { subscriptionId: client.subscriptionId } : { latestId: nextLogId });
+    writeSse(client, client.channel, client.channel === 'archive' ? { subscriptionId: client.subscriptionId } : client.channel === 'logs' ? { latestId: nextLogId } : { version: subscriptionsVersion });
   }
   if (hadPreviousSnapshot) {
     if (nextLogId > latestLogId) {
@@ -84,6 +88,10 @@ async function pollLiveChanges() {
       for (const client of liveClients) {
         if (client.channel === 'archive' && client.subscriptionId === subscriptionId) writeSse(client, 'archive', { subscriptionId, version });
       }
+    }
+    if (subscriptionVersion && subscriptionVersion.version !== subscriptionsVersion) {
+      subscriptionsVersion = subscriptionVersion.version;
+      for (const client of liveClients) if (client.channel === 'subscriptions') writeSse(client, 'subscriptions', { version: subscriptionsVersion });
     }
   }
   if (Date.now() - lastSseKeepAliveAt >= 20_000) {
@@ -153,6 +161,7 @@ type JellyfinSettingsPayload = {
   clearApiKey?: boolean;
   libraryIds?: string[];
   syncIntervalMinutes?: number;
+  skipMagnetWhenAvailable?: boolean;
 };
 
 function normalizePaginationPayload(payload: Pick<SubscriptionPayload, 'paginationSelector' | 'paginationParameter' | 'paginationMatchPattern'>) {
@@ -250,10 +259,17 @@ async function normalizePayload(payload: SubscriptionPayload) {
 async function listSubscriptions() {
   return db.all(`SELECT s.*,
     (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id) AS archive_count,
+    JSON_OBJECT(
+      'check', JSON_OBJECT('done', 0, 'total', (SELECT COUNT(*) FROM jobs j WHERE j.subscription_id = s.id AND j.status IN ('queued','running'))),
+      'release', JSON_OBJECT('done', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.release_status IN ('found','unavailable','failed','unsearched')), 'total', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.release_status <> 'unsearched')),
+      'magnet', JSON_OBJECT('done', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.magnet_status IN ('found','not_found','failed','skipped')), 'total', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.magnet_status <> 'unsearched')),
+      'library', JSON_OBJECT('done', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.jellyfin_status IN ('available','not_found','failed')), 'total', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.jellyfin_status <> 'unconfigured')),
+      'download', JSON_OBJECT('done', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.download_status IN ('completed','removed','failed','not_queued')), 'total', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.download_status <> 'not_queued'))
+    ) AS queue_summary,
     CASE
       WHEN s.pagination_selector IS NOT NULL
         AND s.initial_scan_completed = 0
-        AND EXISTS(SELECT 1 FROM jobs j WHERE j.subscription_id = s.id AND j.status IN ('queued', 'running'))
+        AND (s.initial_scan_run_id IS NOT NULL OR EXISTS(SELECT 1 FROM jobs j WHERE j.subscription_id = s.id AND j.status IN ('queued', 'running')))
       THEN 1 ELSE NULL
     END AS full_scan_active
     FROM subscriptions s ORDER BY s.updated_at DESC, s.id DESC`);
@@ -262,7 +278,7 @@ async function listSubscriptions() {
 app.get('/api/health', async () => ({ ok: true }));
 app.get('/api/events', async (request, reply) => {
   const query = request.query as { channel?: string; subscriptionId?: string };
-  const channel: LiveChannel | null = query.channel === 'archive' || query.channel === 'logs' ? query.channel : null;
+  const channel: LiveChannel | null = query.channel === 'archive' || query.channel === 'logs' || query.channel === 'subscriptions' ? query.channel : null;
   const subscriptionId = Number(query.subscriptionId);
   if (!channel || (channel === 'archive' && (!Number.isInteger(subscriptionId) || subscriptionId < 1))) {
     return reply.code(400).send({ error: '实时订阅参数无效。' });
@@ -411,13 +427,13 @@ app.post('/api/subscriptions/:id/magnet-backfill', async (request, reply) => {
   if (!subscription) return reply.code(404).send({ error: '订阅不存在。' });
   if (!getInspectionRules().magnet.enabled) return reply.code(400).send({ error: '磁力检索规则当前已停用，请先在“检查规则”中启用。' });
   const candidates = await db.all<{ id: number }>(`SELECT id FROM archive_entries
-    WHERE subscription_id = ? AND magnet_status IN ('unsearched', 'failed') ORDER BY id ASC`, [id]);
+    WHERE subscription_id = ? AND magnet_status IN ('unsearched', 'failed', 'skipped') ORDER BY id ASC`, [id]);
   let queued = 0;
   await db.transaction(async (tx) => {
     for (const entry of candidates) {
       await tx.run(`UPDATE archive_entries
         SET magnet_status = 'pending', magnet_value = NULL, magnet_checked_at = NULL, magnet_error = NULL, updated_at = ? WHERE id = ?`, [new Date().toISOString(), entry.id]);
-      if ((await queueMagnetJob(entry.id, tx)).queued) queued += 1;
+      if ((await queueMagnetJob(entry.id, tx, JOB_PRIORITY.manual)).queued) queued += 1;
     }
   });
   if (queued) {
@@ -439,7 +455,7 @@ app.post('/api/subscriptions/:id/release-backfill', async (request, reply) => {
       const now = new Date().toISOString();
       await tx.run(`UPDATE archive_entries
         SET release_date = NULL, release_status = 'pending', release_checked_at = NULL, release_error = NULL, updated_at = ? WHERE id = ?`, [now, entry.id]);
-      if ((await queueReleaseJob(entry.id, tx)).queued) queued += 1;
+      if ((await queueReleaseJob(entry.id, tx, JOB_PRIORITY.manual)).queued) queued += 1;
     }
   });
   if (queued) {
@@ -461,7 +477,7 @@ app.post('/api/archive/:id/magnet-retry', async (request, reply) => {
   await db.transaction(async (tx) => {
     await tx.run(`UPDATE archive_entries SET magnet_status = 'pending', magnet_value = NULL, magnet_checked_at = NULL, magnet_error = NULL, updated_at = ?
       WHERE id = ?`, [new Date().toISOString(), entry.id]);
-    const result = await queueMagnetJob(entry.id, tx);
+    const result = await queueMagnetJob(entry.id, tx, JOB_PRIORITY.manual);
     queued = result.queued;
     jobId = result.id;
   });
@@ -494,6 +510,7 @@ function publicJellyfinSettings() {
     apiKeyConfigured: Boolean(settings.apiKey),
     libraryIds: settings.libraryIds,
     syncIntervalMinutes: settings.syncIntervalMinutes,
+    skipMagnetWhenAvailable: settings.skipMagnetWhenAvailable,
     lastSyncedAt: getSetting('jellyfin_last_synced_at') || null
   };
 }
@@ -516,7 +533,8 @@ function normalizeJellyfinSettings(payload: JellyfinSettingsPayload) {
   const libraryIds = normalizeJellyfinLibraryIds(payload.libraryIds, current.libraryIds);
   const interval = payload.syncIntervalMinutes === undefined ? current.syncIntervalMinutes : Number(payload.syncIntervalMinutes);
   if (!Number.isInteger(interval) || interval < 5 || interval > 1440) throw new Error('Jellyfin 同步间隔需在 5 到 1440 分钟之间。');
-  const settings = { enabled, url, apiKey, libraryIds, syncIntervalMinutes: interval };
+  const skipMagnetWhenAvailable = typeof payload.skipMagnetWhenAvailable === 'boolean' ? payload.skipMagnetWhenAvailable : current.skipMagnetWhenAvailable;
+  const settings = { enabled, url, apiKey, libraryIds, syncIntervalMinutes: interval, skipMagnetWhenAvailable };
   if (enabled) assertJellyfinConfig(settings);
   return settings;
 }
@@ -573,7 +591,7 @@ app.post('/api/subscriptions/:id/download-backfill', async (request, reply) => {
   let queued = 0;
   await db.transaction(async (tx) => {
     for (const entry of candidates) {
-      const result = await queueDownloadJob(entry.id, tx);
+      const result = await queueDownloadJob(entry.id, tx, JOB_PRIORITY.manual);
       if (result.queued) {
         queued += 1;
         const now = new Date().toISOString();
@@ -596,7 +614,7 @@ app.post('/api/archive/:id/download', async (request, reply) => {
   let queued = false;
   let jobId = 0;
   await db.transaction(async (tx) => {
-    const result = await queueDownloadJob(entry.id, tx);
+    const result = await queueDownloadJob(entry.id, tx, JOB_PRIORITY.manual);
     queued = result.queued;
     jobId = result.id;
     if (queued) {
@@ -707,6 +725,7 @@ app.put('/api/settings/jellyfin', async (request, reply) => {
       setSetting('jellyfin_api_key', settings.apiKey),
       setSetting('jellyfin_library_ids', JSON.stringify(settings.libraryIds)),
       setSetting('jellyfin_sync_interval_minutes', String(settings.syncIntervalMinutes)),
+      setSetting('jellyfin_skip_magnet_when_available', settings.skipMagnetWhenAvailable ? '1' : '0'),
       setSetting('jellyfin_last_synced_at', '')
     ]);
     await db.run(`UPDATE archive_entries SET jellyfin_status = ?, jellyfin_item_id = NULL, jellyfin_item_name = NULL,
@@ -785,6 +804,8 @@ app.delete('/api/subscriptions/:id', async (request, reply) => {
     await tx.run('DELETE d FROM download_jobs d JOIN archive_entries a ON a.id = d.archive_entry_id WHERE a.subscription_id = ?', [id]);
     await tx.run('DELETE r FROM release_jobs r JOIN archive_entries a ON a.id = r.archive_entry_id WHERE a.subscription_id = ?', [id]);
     await tx.run('DELETE m FROM magnet_jobs m JOIN archive_entries a ON a.id = m.archive_entry_id WHERE a.subscription_id = ?', [id]);
+    await tx.run('DELETE l FROM library_jobs l JOIN archive_entries a ON a.id = l.archive_entry_id WHERE a.subscription_id = ?', [id]);
+    await tx.run('DELETE FROM initial_scan_items WHERE subscription_id = ?', [id]);
     await tx.run('DELETE FROM archive_entries WHERE subscription_id = ?', [id]);
     await tx.run('DELETE FROM jobs WHERE subscription_id = ?', [id]);
     await tx.run('UPDATE runtime_logs SET subscription_id = NULL WHERE subscription_id = ?', [id]);
@@ -801,12 +822,14 @@ app.delete('/api/subscriptions/:id/archive', async (request, reply) => {
     await tx.run('DELETE d FROM download_jobs d JOIN archive_entries a ON a.id = d.archive_entry_id WHERE a.subscription_id = ?', [id]);
     await tx.run('DELETE r FROM release_jobs r JOIN archive_entries a ON a.id = r.archive_entry_id WHERE a.subscription_id = ?', [id]);
     await tx.run('DELETE m FROM magnet_jobs m JOIN archive_entries a ON a.id = m.archive_entry_id WHERE a.subscription_id = ?', [id]);
+    await tx.run('DELETE l FROM library_jobs l JOIN archive_entries a ON a.id = l.archive_entry_id WHERE a.subscription_id = ?', [id]);
+    await tx.run('DELETE FROM initial_scan_items WHERE subscription_id = ?', [id]);
     await tx.run('DELETE FROM archive_entries WHERE subscription_id = ?', [id]);
     await tx.run("DELETE FROM jobs WHERE subscription_id = ? AND status = 'queued'", [id]);
     await tx.run(`UPDATE subscriptions
       SET last_checked_at = NULL, last_hash = NULL, last_content = NULL, last_error = NULL,
         initial_scan_completed = CASE WHEN pagination_selector IS NULL THEN 1 ELSE 0 END,
-        initial_scan_total = NULL, initial_scan_pages_completed = 0, updated_at = ?
+        initial_scan_total = NULL, initial_scan_pages_completed = 0, initial_scan_run_id = NULL, initial_scan_next_page = 1, updated_at = ?
       WHERE id = ?`, [now, id]);
   });
   return reply.code(204).send();
@@ -825,7 +848,7 @@ app.post('/api/subscriptions/:id/run', async (request, reply) => {
   const id = Number((request.params as { id: string }).id);
   const subscription = await getSubscription(id);
   if (!subscription) return reply.code(404).send({ error: '订阅不存在。' });
-  const queued = await queueJob(id);
+  const queued = await queueJob(id, JOB_PRIORITY.manual);
   await appendRuntimeLog({ level: 'info', source: 'queue', subscriptionId: id, jobId: queued.id, message: queued.queued ? '已加入立即检查队列。' : '检查已在队列中或正在执行。' });
   return reply.code(202).send({ queued: queued.queued, jobId: queued.id });
 });
@@ -835,8 +858,13 @@ app.post('/api/subscriptions/:id/full-scan', async (request, reply) => {
   const subscription = await getSubscription(id);
   if (!subscription) return reply.code(404).send({ error: '订阅不存在。' });
   if (!subscription.pagination_selector) return reply.code(400).send({ error: '当前订阅没有配置全量分页检查。' });
-  await db.run(`UPDATE subscriptions SET initial_scan_completed = 0, initial_scan_total = NULL, initial_scan_pages_completed = 0, last_error = NULL, updated_at = ? WHERE id = ?`, [new Date().toISOString(), id]);
-  const queued = await queueJob(id);
+  const active = await db.get<{ id: number }>("SELECT id FROM jobs WHERE subscription_id = ? AND status IN ('queued','running')", [id]);
+  if (active) return reply.code(409).send({ error: '该订阅已有检查正在执行或排队；请等待其结束后再开始新的全量检查。' });
+  await db.transaction(async (tx) => {
+    await tx.run('DELETE FROM initial_scan_items WHERE subscription_id = ?', [id]);
+    await tx.run(`UPDATE subscriptions SET initial_scan_completed = 0, initial_scan_total = NULL, initial_scan_pages_completed = 0, initial_scan_run_id = NULL, initial_scan_next_page = 1, last_error = NULL, updated_at = ? WHERE id = ?`, [new Date().toISOString(), id]);
+  });
+  const queued = await queueJob(id, JOB_PRIORITY.manual);
   await appendRuntimeLog({ level: 'info', source: 'queue', subscriptionId: id, jobId: queued.id, message: queued.queued ? '已加入全量检查队列。' : '全量检查设置已更新，当前检查结束后可再次确认日志。' });
   return reply.code(202).send({ queued: queued.queued, jobId: queued.id });
 });

@@ -147,3 +147,21 @@ export async function listJellyfinMedia(config: JellyfinConfig) {
   }
   return all;
 }
+
+/** Search selected libraries before applying strict local code matching. */
+export async function findJellyfinMedia(config: JellyfinConfig, content: string) {
+  const checked = assertJellyfinConfig(config);
+  const libraryIds = [...new Set((checked.libraryIds ?? []).map((id) => id.trim()).filter(Boolean))];
+  if (!libraryIds.length) throw new Error('请至少选择一个 Jellyfin 媒体库。');
+  const matches: JellyfinMedia[] = [];
+  for (const libraryId of libraryIds) {
+    const query = new URLSearchParams({ ParentId: libraryId, Recursive: 'true', IncludeItemTypes: 'Movie', Fields: 'Path,OriginalTitle', SearchTerm: content, Limit: '25', EnableTotalRecordCount: 'true' });
+    const result = await jellyfinRequest(checked, 'Items', query) as JellyfinItemsResponse;
+    if (!Array.isArray(result.Items)) throw new Error('Jellyfin 单条查询结果格式无效。');
+    matches.push(...result.Items.flatMap((item) => {
+      const media = normalizeMedia(item);
+      return media ? [media] : [];
+    }));
+  }
+  return matches;
+}
