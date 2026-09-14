@@ -23,6 +23,7 @@ export type MagnetRule = {
   itemSelector: string;
   filenameSelector: string;
   filenamePrefix: string;
+  fallbackFilenamePrefixes: string[];
   detailLinkSelector: string;
   detailPathPrefix: string;
   valueSelector: string;
@@ -62,6 +63,7 @@ export const defaultInspectionRules: InspectionRules = {
     itemSelector: 'li.item',
     filenameSelector: '.filename',
     filenamePrefix: 'hhd800.com@',
+    fallbackFilenamePrefixes: ['4k688.com@'],
     detailLinkSelector: 'a.link',
     detailPathPrefix: '/magnet/',
     valueSelector: 'input#input-magnet',
@@ -104,6 +106,15 @@ function origins(value: unknown, fallback: string[]) {
   return parsed.length ? parsed : fallback;
 }
 
+function filenameMarkers(value: unknown, fallback: string[]) {
+  if (!Array.isArray(value)) return fallback;
+  return value
+    .filter((entry): entry is string => typeof entry === 'string')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
 /** Returns a safe, complete config even when a database value was written by an older release. */
 export function coerceInspectionRules(value: unknown): InspectionRules {
   const defaults = cloneDefaults();
@@ -133,6 +144,7 @@ export function coerceInspectionRules(value: unknown): InspectionRules {
       itemSelector: nonEmptyString(magnet.itemSelector, defaults.magnet.itemSelector),
       filenameSelector: nonEmptyString(magnet.filenameSelector, defaults.magnet.filenameSelector),
       filenamePrefix: nonEmptyString(magnet.filenamePrefix, defaults.magnet.filenamePrefix, 240),
+      fallbackFilenamePrefixes: filenameMarkers(magnet.fallbackFilenamePrefixes, defaults.magnet.fallbackFilenamePrefixes),
       detailLinkSelector: nonEmptyString(magnet.detailLinkSelector, defaults.magnet.detailLinkSelector),
       detailPathPrefix: nonEmptyString(magnet.detailPathPrefix, defaults.magnet.detailPathPrefix, 240),
       valueSelector: nonEmptyString(magnet.valueSelector, defaults.magnet.valueSelector),

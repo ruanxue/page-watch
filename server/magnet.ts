@@ -1,4 +1,5 @@
 import * as cheerio from 'cheerio';
+import type { AnyNode } from 'domhandler';
 import { ProxyAgent } from 'undici';
 import { getOutboundProxyUrl } from './db.js';
 import { describeError } from './error-details.js';
@@ -17,6 +18,29 @@ let originHealthSignature = '';
 export type MagnetLookupResult =
   | { status: 'found'; value: string; origin: SearchOrigin }
   | { status: 'not_found'; reason: string; origin: SearchOrigin };
+
+function fallbackFilenamePrefixes(rule: MagnetRule) {
+  const primary = rule.filenamePrefix.trim().toLowerCase();
+  return [...new Set(rule.fallbackFilenamePrefixes
+    .map((prefix) => prefix.trim())
+    .filter(Boolean)
+    .filter((prefix) => prefix.toLowerCase() !== primary))];
+}
+
+/** Decode Cloudflare's client-side email-protection payload in raw search HTML. */
+export function decodeCloudflareEmail(encoded: string) {
+  const value = encoded.trim();
+  if (!/^[\da-f]+$/i.test(value) || value.length < 4 || value.length % 2 !== 0) return null;
+  const key = Number.parseInt(value.slice(0, 2), 16);
+  const bytes = new Uint8Array((value.length - 2) / 2);
+  for (let index = 2; index < value.length; index += 2) {
+    const byte = Number.parseInt(value.slice(index, index + 2), 16);
+    if (!Number.isInteger(byte)) return null;
+    bytes[(index - 2) / 2] = byte ^ key;
+  }
+  try { return new TextDecoder().decode(bytes); }
+  catch { return null; }
+}
 
 async function waitForRequestSlot(requestGapMs: number) {
   const delay = Math.max(0, lastRequestStartedAt + requestGapMs - Date.now());
@@ -55,10 +79,32 @@ async function fetchTarget(url: URL, stage: '节点测速' | '搜索页' | '详�
   }
 }
 
-/** Return the first matching details path in DOM order, or null when no result uses the configured filename prefix. */
+/**
+ * Return the matching detail path. The primary prefix must start the filename;
+ * only when no primary result exists on the whole page do we consider the
+ * ordered fallback markers (which can occur after the code and a slash).
+ */
 export function findMagnetDetailPath(html: string, origin: SearchOrigin = defaultInspectionRules.magnet.origins[0], rule: MagnetRule = defaultInspectionRules.magnet) {
   const $ = cheerio.load(html);
-  const item = $(rule.itemSelector).toArray().find((element) => $(element).find(rule.filenameSelector).first().text().trim().toLowerCase().startsWith(rule.filenamePrefix.toLowerCase()));
+  const items = $(rule.itemSelector).toArray();
+  const filenameFor = (element: AnyNode) => {
+    const filename = $(element).find(rule.filenameSelector).first().clone();
+    // The site represents e.g. "4k688.com@ATID-799.mp4" with Cloudflare's
+    // __cf_email__ markup. Browsers execute Cloudflare's decoder script, but
+    // the worker intentionally parses the original response without scripts.
+    filename.find('a.__cf_email__[data-cfemail]').each((_, protectedLink) => {
+      const decoded = decodeCloudflareEmail($(protectedLink).attr('data-cfemail') ?? '');
+      if (decoded) $(protectedLink).text(decoded);
+    });
+    return filename.text().trim().toLowerCase();
+  };
+  const primaryPrefix = rule.filenamePrefix.trim().toLowerCase();
+  const primary = items.find((element) => filenameFor(element).startsWith(primaryPrefix));
+  const fallback = primary ? undefined : fallbackFilenamePrefixes(rule)
+    .map((prefix) => prefix.toLowerCase())
+    .map((prefix) => items.find((element) => filenameFor(element).includes(prefix)))
+    .find((item): item is AnyNode => Boolean(item));
+  const item = primary ?? fallback;
   if (!item) return null;
   const href = $(item).find(rule.detailLinkSelector).first().attr('href')?.trim();
   if (!href) throw new Error('搜索结果缺少详情链接，无法解析。');
@@ -67,6 +113,12 @@ export function findMagnetDetailPath(html: string, origin: SearchOrigin = defaul
     throw new Error('搜索结果详情链接格式无效。');
   }
   return `${detail.pathname}${detail.search}`;
+}
+
+function noMagnetResultReason(rule: MagnetRule) {
+  const fallbacks = fallbackFilenamePrefixes(rule);
+  if (!fallbacks.length) return `未找到文件名以 ${rule.filenamePrefix} 开头的搜索结果。`;
+  return `未找到文件名以 ${rule.filenamePrefix} 开头的搜索结果，也未匹配后备标记 ${fallbacks.join('、')}。`;
 }
 
 /**
@@ -156,7 +208,7 @@ export async function lookupMagnet(content: string, rule: MagnetRule = defaultIn
       const search = await fetchTarget(searchUrl, '搜索页', rule.requestIntervalMs);
       const detailPath = findMagnetDetailPath(search.html, origin, rule);
       if (!detailPath) {
-        notFoundReason = `未找到文件名以 ${rule.filenamePrefix} 开头的搜索结果。`;
+        notFoundReason = noMagnetResultReason(rule);
         notFoundOrigin = origin;
         continue;
       }

@@ -1,4 +1,4 @@
-import { appendRuntimeLog, db, getJellyfinSettings, queueMagnetJob, setSetting } from './db.js';
+import { appendRuntimeLog, db, getJellyfinSettings, setSetting } from './db.js';
 import { listJellyfinMedia, type JellyfinMedia } from './jellyfin.js';
 import { archiveKey, mediaKeys } from './jellyfin-match.js';
 
@@ -36,10 +36,10 @@ export async function syncJellyfinLibrary(trigger: 'manual' | 'scheduled' = 'sch
         notFound += 1;
         await tx.run(`UPDATE archive_entries SET jellyfin_status = 'not_found', jellyfin_item_id = NULL, jellyfin_item_name = NULL,
           jellyfin_matched_at = ?, jellyfin_error = NULL, updated_at = ? WHERE id = ?`, [now, now, entry.id]);
-        if (settings.skipMagnetWhenAvailable && entry.magnet_status === 'skipped') {
-          await tx.run(`UPDATE archive_entries SET magnet_status = 'pending', magnet_error = NULL, updated_at = ? WHERE id = ?`, [now, entry.id]);
-          await queueMagnetJob(entry.id, tx);
-        }
+        // A full sync can temporarily see fewer items while Jellyfin performs
+        // an upgrade migration or library scan. Treat "not found" as library
+        // information only: never revive a previously skipped magnet task
+        // without an explicit user action.
       }
     }
   });

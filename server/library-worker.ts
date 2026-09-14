@@ -10,10 +10,10 @@ let working = false;
 let syncing = false;
 let lastErrorLogAt = 0;
 
-type LibraryJob = { id: number; archive_entry_id: number; attempt_count: number; subscription_id: number; content: string };
+type LibraryJob = { id: number; archive_entry_id: number; attempt_count: number; subscription_id: number; content: string; jellyfin_status: string };
 
 async function runNextLibraryJob() {
-  const job = await db.get<LibraryJob>(`SELECT j.id, j.archive_entry_id, j.attempt_count, a.subscription_id, a.content
+  const job = await db.get<LibraryJob>(`SELECT j.id, j.archive_entry_id, j.attempt_count, a.subscription_id, a.content, a.jellyfin_status
     FROM library_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id
     WHERE j.status = 'queued' AND (j.retry_after IS NULL OR j.retry_after <= ?)
     ORDER BY j.priority DESC, j.requested_at ASC, j.id ASC LIMIT 1`, [new Date().toISOString()]);
@@ -35,9 +35,15 @@ async function runNextLibraryJob() {
         if (settings.skipMagnetWhenAvailable) await appendRuntimeLog({ level: 'info', source: 'library', subscriptionId: job.subscription_id, message: `Jellyfin 已入库“${job.content}”，自动跳过磁力检索。` });
         else await queueMagnetJob(job.archive_entry_id, tx);
       } else {
-        await tx.run(`UPDATE archive_entries SET jellyfin_status = 'not_found', jellyfin_item_id = NULL, jellyfin_item_name = NULL, jellyfin_matched_at = ?, jellyfin_error = NULL,
-          magnet_status = 'pending', magnet_error = NULL, updated_at = ? WHERE id = ?`, [finishedAt, finishedAt, job.archive_entry_id]);
-        await queueMagnetJob(job.archive_entry_id, tx);
+        // A one-off JF search is intentionally narrower than the scheduled
+        // full-library snapshot. Do not let a transient/mixed result overwrite
+        // an already confirmed library item; the next full sync can still mark
+        // it missing if the file was genuinely removed.
+        if (job.jellyfin_status !== 'available') {
+          await tx.run(`UPDATE archive_entries SET jellyfin_status = 'not_found', jellyfin_item_id = NULL, jellyfin_item_name = NULL, jellyfin_matched_at = ?, jellyfin_error = NULL,
+            magnet_status = 'pending', magnet_error = NULL, updated_at = ? WHERE id = ?`, [finishedAt, finishedAt, job.archive_entry_id]);
+          await queueMagnetJob(job.archive_entry_id, tx);
+        }
       }
       await tx.run("UPDATE library_jobs SET status = 'completed', finished_at = ?, error = NULL, retry_after = NULL WHERE id = ?", [finishedAt, job.id]);
     });
@@ -47,12 +53,12 @@ async function runNextLibraryJob() {
     const retry = attempt < MAX_JOB_ATTEMPTS && isRetryableJobError(error);
     const finishedAt = new Date().toISOString();
     await db.transaction(async (tx) => {
-      await tx.run(`UPDATE archive_entries SET jellyfin_status = 'failed', jellyfin_error = ?, jellyfin_matched_at = ?, magnet_status = 'pending', magnet_error = NULL, updated_at = ? WHERE id = ?`,
+      if (job.jellyfin_status !== 'available') await tx.run(`UPDATE archive_entries SET jellyfin_status = 'failed', jellyfin_error = ?, jellyfin_matched_at = ?, magnet_status = 'pending', magnet_error = NULL, updated_at = ? WHERE id = ?`,
         [retry ? `${retryDescription(attempt)}：${message}` : message, finishedAt, finishedAt, job.archive_entry_id]);
       if (retry) await tx.run("UPDATE library_jobs SET status = 'queued', started_at = NULL, error = ?, attempt_count = ?, retry_after = ? WHERE id = ?", [message, attempt, new Date(Date.now() + retryDelayMs(attempt)).toISOString(), job.id]);
       else {
         await tx.run("UPDATE library_jobs SET status = 'failed', finished_at = ?, error = ?, attempt_count = ?, retry_after = NULL WHERE id = ?", [finishedAt, message, attempt, job.id]);
-        await queueMagnetJob(job.archive_entry_id, tx);
+        if (job.jellyfin_status !== 'available') await queueMagnetJob(job.archive_entry_id, tx);
       }
     });
     await appendRuntimeLog({ level: retry ? 'info' : 'error', source: 'library', subscriptionId: job.subscription_id, message: `Jellyfin 查询“${job.content}”${retry ? `暂时失败，${retryDescription(attempt)}：` : '失败，已继续磁力补全：'}${message}` });

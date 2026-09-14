@@ -22,9 +22,11 @@ export type JellyfinMedia = {
 
 type JellyfinItemsResponse = { Items?: unknown; TotalRecordCount?: unknown };
 type JellyfinLibraryResponse = { ItemId?: unknown; Name?: unknown; CollectionType?: unknown };
+type JellyfinUserResponse = { Id?: unknown; Name?: unknown; Policy?: { IsDisabled?: unknown; IsAdministrator?: unknown } };
 
 const REQUEST_TIMEOUT_MS = 20_000;
 const PAGE_SIZE = 500;
+const INDEXED_VIDEO_TYPES = new Set(['Movie', 'Video']);
 
 export function normalizeJellyfinUrl(raw: string) {
   const value = raw.trim();
@@ -110,16 +112,50 @@ export async function listJellyfinLibraries(config: JellyfinConfig) {
   });
 }
 
+/**
+ * Jellyfin 12 returns a partial, server-scoped result from /Items for some
+ * library layouts. Queries made through an enabled user's view return the
+ * same items shown in the Jellyfin web client, including recursive folders.
+ * Prefer an administrator for API-key access; fall back to the first enabled
+ * user when a server has no administrator in the response.
+ */
+async function jellyfinLibraryUserId(config: JellyfinConfig) {
+  const result = await jellyfinRequest(config, 'Users');
+  if (!Array.isArray(result)) throw new Error('Jellyfin 用户列表格式无效。');
+  const users = result.flatMap((value) => {
+    const user = value as JellyfinUserResponse;
+    const id = typeof user.Id === 'string' ? user.Id.trim() : '';
+    if (!id || user.Policy?.IsDisabled === true) return [];
+    return [{ id, administrator: user.Policy?.IsAdministrator === true }];
+  });
+  const selected = users.find((user) => user.administrator) ?? users[0];
+  if (!selected) throw new Error('Jellyfin 中没有可用于读取媒体库的启用用户。');
+  return selected.id;
+}
+
+function userItemsPath(userId: string) {
+  return `Users/${encodeURIComponent(userId)}/Items`;
+}
+
+export function isIndexedJellyfinVideoType(type: string) {
+  return INDEXED_VIDEO_TYPES.has(type);
+}
+
 function normalizeMedia(value: unknown) {
   const item = value as { Id?: unknown; Name?: unknown; OriginalTitle?: unknown; Path?: unknown; Type?: unknown };
   const id = typeof item.Id === 'string' ? item.Id.trim() : '';
   const name = typeof item.Name === 'string' ? item.Name.trim() : '';
+  const type = typeof item.Type === 'string' ? item.Type : 'Unknown';
+  // Jellyfin 12 can return BoxSet and Folder records even when GetItems has
+  // IncludeItemTypes=Movie. Those records do not represent a playable item
+  // and should never count as an inspected library video.
+  if (!isIndexedJellyfinVideoType(type)) return null;
   return id && name ? {
     id,
     name,
     originalTitle: typeof item.OriginalTitle === 'string' && item.OriginalTitle.trim() ? item.OriginalTitle.trim() : null,
     path: typeof item.Path === 'string' && item.Path.trim() ? item.Path.trim() : null,
-    type: typeof item.Type === 'string' ? item.Type : 'Unknown'
+    type
   } satisfies JellyfinMedia : null;
 }
 
@@ -128,6 +164,7 @@ export async function listJellyfinMedia(config: JellyfinConfig) {
   const checked = assertJellyfinConfig(config);
   const libraryIds = [...new Set((checked.libraryIds ?? []).map((id) => id.trim()).filter(Boolean))];
   if (!libraryIds.length) throw new Error('请至少选择一个 Jellyfin 媒体库。');
+  const userId = await jellyfinLibraryUserId(checked);
   const all: JellyfinMedia[] = [];
   for (const libraryId of libraryIds) {
     let startIndex = 0;
@@ -136,26 +173,30 @@ export async function listJellyfinMedia(config: JellyfinConfig) {
       const query = new URLSearchParams({
         ParentId: libraryId,
         Recursive: 'true',
-        IncludeItemTypes: 'Movie',
+        IncludeItemTypes: 'Movie,Video',
         Fields: 'Path,OriginalTitle',
         StartIndex: String(startIndex),
         Limit: String(PAGE_SIZE),
         EnableTotalRecordCount: 'true'
       });
-      const result = await jellyfinRequest(checked, 'Items', query) as JellyfinItemsResponse;
+      const result = await jellyfinRequest(checked, userItemsPath(userId), query) as JellyfinItemsResponse;
       if (!Array.isArray(result.Items)) throw new Error('Jellyfin 媒体项目列表格式无效。');
+      // Use the raw result count for the next offset. Jellyfin 12 can cap a
+      // requested page and can return non-video records that we filter out;
+      // advancing by PAGE_SIZE or by filtered rows would skip real movies.
+      const received = result.Items.length;
       const page = result.Items.flatMap((item) => {
         const media = normalizeMedia(item);
         return media ? [media] : [];
       });
       all.push(...page);
       const parsedTotal = Number(result.TotalRecordCount);
-      total = Number.isInteger(parsedTotal) && parsedTotal >= 0 ? parsedTotal : startIndex + page.length;
-      startIndex += PAGE_SIZE;
-      if (!page.length) break;
+      total = Number.isInteger(parsedTotal) && parsedTotal >= 0 ? parsedTotal : startIndex + received;
+      if (!received) break;
+      startIndex += received;
     }
   }
-  return all;
+  return [...new Map(all.map((item) => [item.id, item])).values()];
 }
 
 /** Search selected libraries before applying strict local code matching. */
@@ -163,10 +204,11 @@ export async function findJellyfinMedia(config: JellyfinConfig, content: string)
   const checked = assertJellyfinConfig(config);
   const libraryIds = [...new Set((checked.libraryIds ?? []).map((id) => id.trim()).filter(Boolean))];
   if (!libraryIds.length) throw new Error('请至少选择一个 Jellyfin 媒体库。');
+  const userId = await jellyfinLibraryUserId(checked);
   const matches: JellyfinMedia[] = [];
   for (const libraryId of libraryIds) {
-    const query = new URLSearchParams({ ParentId: libraryId, Recursive: 'true', IncludeItemTypes: 'Movie', Fields: 'Path,OriginalTitle', SearchTerm: content, Limit: '25', EnableTotalRecordCount: 'true' });
-    const result = await jellyfinRequest(checked, 'Items', query) as JellyfinItemsResponse;
+    const query = new URLSearchParams({ ParentId: libraryId, Recursive: 'true', IncludeItemTypes: 'Movie,Video', Fields: 'Path,OriginalTitle', SearchTerm: content, Limit: '25', EnableTotalRecordCount: 'true' });
+    const result = await jellyfinRequest(checked, userItemsPath(userId), query) as JellyfinItemsResponse;
     if (!Array.isArray(result.Items)) throw new Error('Jellyfin 单条查询结果格式无效。');
     matches.push(...result.Items.flatMap((item) => {
       const media = normalizeMedia(item);
