@@ -2,6 +2,7 @@ import { appendRuntimeLog, db, queueReleaseJob, refreshSettings, reportWorkerHea
 import { lookupReleaseDate, ReleaseDateBrowserSession } from './release-date.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription } from './retry.js';
 import { expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
+import { notifyLive } from './live-events.js';
 
 const POLL_MS = 1_000;
 const BACKFILL_BATCH_SIZE = 100;
@@ -92,6 +93,8 @@ async function runNextReleaseJob() {
       await tx.run("UPDATE release_jobs SET status = 'completed', finished_at = ?, error = NULL, retry_after = NULL WHERE id = ?", [finishedAt, job.id]);
     });
     await logProgress(job.subscription_id);
+    notifyLive('archive', job.subscription_id);
+    notifyLive('subscriptions');
   } catch (error) {
     const message = error instanceof Error ? error.message : '未知发行日期读取错误';
     const finishedAt = new Date().toISOString();
@@ -109,6 +112,8 @@ async function runNextReleaseJob() {
     await appendRuntimeLog({ level: shouldRetry ? 'info' : 'error', source: 'worker', subscriptionId: job.subscription_id, message: shouldRetry ? `发行日期读取“${job.content}”暂时失败，${retryDescription(attempt)}：${message}` : `发行日期读取“${job.content}”失败：${message}` });
     await logProgress(job.subscription_id);
     console.error(`Release-date job ${job.id} failed: ${message}`);
+    notifyLive('archive', job.subscription_id);
+    notifyLive('subscriptions');
   }
 }
 

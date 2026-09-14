@@ -3,6 +3,7 @@ import { findJellyfinMedia } from './jellyfin.js';
 import { exactJellyfinMatch } from './jellyfin-match.js';
 import { syncJellyfinLibrary } from './jellyfin-sync.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription } from './retry.js';
+import { notifyLive } from './live-events.js';
 
 const POLL_MS = 15_000;
 let working = false;
@@ -56,6 +57,8 @@ async function runNextLibraryJob() {
     });
     await appendRuntimeLog({ level: retry ? 'info' : 'error', source: 'library', subscriptionId: job.subscription_id, message: `Jellyfin 查询“${job.content}”${retry ? `暂时失败，${retryDescription(attempt)}：` : '失败，已继续磁力补全：'}${message}` });
   }
+  notifyLive('archive', job.subscription_id);
+  notifyLive('subscriptions');
   return true;
 }
 

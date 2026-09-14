@@ -2,14 +2,16 @@ import 'dotenv/config';
 import mysql, { type Pool, type PoolConnection, type ResultSetHeader } from 'mysql2/promise';
 import { ensureMySqlSchema } from './mysql-schema.js';
 import { defaultInspectionRules, inspectionRulesJson } from './inspection-rules.js';
+import { notifyLive } from './live-events.js';
 
 const host = process.env.MYSQL_HOST?.trim();
 const user = process.env.MYSQL_USER?.trim();
 const password = process.env.MYSQL_PASSWORD;
 const database = process.env.MYSQL_DATABASE?.trim();
 const port = Number(process.env.MYSQL_PORT ?? 3306);
+const connectionLimit = Number(process.env.MYSQL_CONNECTION_LIMIT ?? 3);
 
-if (!host || !user || password === undefined || !database || !Number.isInteger(port) || port < 1 || port > 65535) {
+if (!host || !user || password === undefined || !database || !Number.isInteger(port) || port < 1 || port > 65535 || !Number.isInteger(connectionLimit) || connectionLimit < 1 || connectionLimit > 16) {
   throw new Error('MySQL 配置不完整。请设置 MYSQL_HOST、MYSQL_PORT、MYSQL_DATABASE、MYSQL_USER 和 MYSQL_PASSWORD。');
 }
 
@@ -20,7 +22,9 @@ export const pool: Pool = mysql.createPool({
   password,
   database,
   waitForConnections: true,
-  connectionLimit: 8,
+  // Six workers live in one container. A small per-process pool avoids each
+  // of them reserving eight connections on the NAS MySQL server.
+  connectionLimit,
   queueLimit: 0,
   charset: 'utf8mb4_unicode_ci',
   timezone: 'Z'
@@ -191,6 +195,7 @@ export async function appendRuntimeLog(input: RuntimeLogInput) {
     (level, source, subscription_id, job_id, message, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
   [input.level, input.source, input.subscriptionId ?? null, input.jobId ?? null, input.message, new Date().toISOString()]);
   await db.run('DELETE FROM runtime_logs WHERE id <= (SELECT cutoff.id FROM (SELECT COALESCE(MAX(id), 0) - 1000 AS id FROM runtime_logs) AS cutoff)');
+  notifyLive('logs');
   return result.lastInsertRowid;
 }
 

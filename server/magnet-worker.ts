@@ -2,6 +2,7 @@ import { appendRuntimeLog, db, getQbittorrentSettings, queueDownloadJob, refresh
 import { lookupMagnet } from './magnet.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription } from './retry.js';
 import { getInspectionRules } from './inspection-rules.js';
+import { notifyLive } from './live-events.js';
 
 const POLL_MS = 1_000;
 
@@ -74,6 +75,8 @@ async function runNextMagnetJob() {
       await appendRuntimeLog({ level: 'info', source: 'queue', subscriptionId: job.subscription_id, message: `已将“${job.content}”加入 qBittorrent 下载队列。` });
     }
     await logProgress(job.subscription_id);
+    notifyLive('archive', job.subscription_id);
+    notifyLive('subscriptions');
   } catch (error) {
     const message = error instanceof Error ? error.message : '未知磁力检索错误';
     const finishedAt = new Date().toISOString();
@@ -91,6 +94,8 @@ async function runNextMagnetJob() {
     await appendRuntimeLog({ level: shouldRetry ? 'info' : 'error', source: 'worker', subscriptionId: job.subscription_id, message: shouldRetry ? `磁力检索“${job.content}”暂时失败，${retryDescription(attempt)}：${message}` : `磁力检索“${job.content}”失败：${message}` });
     await logProgress(job.subscription_id);
     console.error(`Magnet job ${job.id} failed: ${message}`);
+    notifyLive('archive', job.subscription_id);
+    notifyLive('subscriptions');
   }
 }
 

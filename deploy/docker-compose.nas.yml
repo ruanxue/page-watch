@@ -7,6 +7,7 @@ x-page-watch-environment: &page-watch-environment
   MYSQL_DATABASE: ${MYSQL_DATABASE:?请在 deploy/.env 配置 MYSQL_DATABASE}
   MYSQL_USER: ${MYSQL_USER:?请在 deploy/.env 配置 MYSQL_USER}
   MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请在 deploy/.env 配置 MYSQL_PASSWORD}
+  MYSQL_CONNECTION_LIMIT: ${MYSQL_CONNECTION_LIMIT:-3}
 
 x-page-watch-service: &page-watch-service
   image: ${PAGE_WATCH_IMAGE:?请在 deploy/.env 配置 PAGE_WATCH_IMAGE}

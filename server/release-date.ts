@@ -6,6 +6,7 @@ import { assertSafeUrl } from './capture.js';
 import { getOutboundProxyUrl } from './db.js';
 import { describeError } from './error-details.js';
 import type { ReleaseDateRule } from './inspection-rules.js';
+import { missavBackupUrl, missavFallbackFailure, shouldTryMissavBackup } from './site-fallback.js';
 
 const REQUEST_TIMEOUT_MS = 25_000;
 let lastRequestStartedAt = 0;
@@ -265,9 +266,25 @@ async function fetchDetailInBrowser(url: URL, rule: ReleaseDateRule, session?: R
 
 export async function lookupReleaseDate(rawUrl: string, rule: ReleaseDateRule, session?: ReleaseDateBrowserSession): Promise<ReleaseDateLookupResult> {
   const url = await assertSafeUrl(rawUrl);
-  const html = rule.renderMode === 'dynamic' ? await fetchDetailInBrowser(url, rule, session) : await fetchDetail(url, rule.requestIntervalMs);
-  const result = inspectReleaseDate(html, rule);
-  return result.releaseDate
-    ? { status: 'found', releaseDate: result.releaseDate }
-    : { status: 'unavailable', reason: result.reason };
+  const read = async (target: URL) => {
+    const html = rule.renderMode === 'dynamic' ? await fetchDetailInBrowser(target, rule, session) : await fetchDetail(target, rule.requestIntervalMs);
+    const result = inspectReleaseDate(html, rule);
+    return result.releaseDate ? { status: 'found', releaseDate: result.releaseDate } as const : { status: 'unavailable', reason: result.reason } as const;
+  };
+  let primaryResult: ReleaseDateLookupResult | null = null;
+  let primaryError: unknown = null;
+  try { primaryResult = await read(url); }
+  catch (error) { primaryError = error; }
+  const availabilityFailure = primaryError ?? (primaryResult?.status === 'unavailable' ? new Error(primaryResult.reason) : null);
+  if (!availabilityFailure || !shouldTryMissavBackup(availabilityFailure)) {
+    if (primaryError) throw primaryError;
+    return primaryResult!;
+  }
+  const backup = missavBackupUrl(url);
+  if (!backup) {
+    if (primaryError) throw primaryError;
+    return primaryResult!;
+  }
+  try { return await read(await assertSafeUrl(backup.toString())); }
+  catch (backupError) { throw missavFallbackFailure(url, backup, availabilityFailure, backupError); }
 }

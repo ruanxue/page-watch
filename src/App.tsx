@@ -97,6 +97,13 @@ type ArchiveEntry = {
   subscription_url: string;
 };
 
+type ArchivePageResult = {
+  items: ArchiveEntry[];
+  total: number;
+  page: number;
+  pageSize: number;
+};
+
 type RuntimeLog = {
   id: number;
   level: 'info' | 'success' | 'error';
@@ -471,6 +478,12 @@ function ReleaseDateCell({ entry }: { entry: ArchiveEntry }) {
 function ArchivePage({ subscriptions, onNotice }: { subscriptions: Subscription[]; onNotice: (message: string) => void }) {
   const [selected, setSelected] = useState<Subscription | null>(null);
   const [entries, setEntries] = useState<ArchiveEntry[]>([]);
+  const [archivePage, setArchivePage] = useState(1);
+  const [archivePageSize, setArchivePageSize] = useState(50);
+  const [archiveTotal, setArchiveTotal] = useState(0);
+  const [archiveQuery, setArchiveQuery] = useState('');
+  const [releaseFrom, setReleaseFrom] = useState('');
+  const [releaseTo, setReleaseTo] = useState('');
   const [inspectionRules, setInspectionRules] = useState<InspectionRules | null>(null);
   const [jellyfinBaseUrl, setJellyfinBaseUrl] = useState('');
   useEffect(() => {
@@ -487,23 +500,38 @@ function ArchivePage({ subscriptions, onNotice }: { subscriptions: Subscription[
     void request<InspectionRules>('/api/inspection-rules').then(setInspectionRules).catch(() => setInspectionRules(null));
     void request<Pick<JellyfinSettings, 'url'>>('/api/settings/jellyfin').then((settings) => setJellyfinBaseUrl(settings.url)).catch(() => setJellyfinBaseUrl(''));
   }, []);
-  const loadArchive = async (subscription: Subscription, silent = false) => {
+  const loadArchive = async (subscription: Subscription, silent = false, requestedPage = archivePage) => {
     if (!silent) { setLoading(true); setError(''); }
-    try { setEntries(await request<ArchiveEntry[]>(`/api/archive?subscriptionId=${subscription.id}`)); }
+    try {
+      const params = new URLSearchParams({ subscriptionId: String(subscription.id), page: String(requestedPage), pageSize: String(archivePageSize) });
+      if (archiveQuery.trim()) params.set('q', archiveQuery.trim());
+      if (releaseFrom) params.set('releaseFrom', releaseFrom);
+      if (releaseTo) params.set('releaseTo', releaseTo);
+      const result = await request<ArchivePageResult>(`/api/archive?${params.toString()}`);
+      setEntries(result.items);
+      setArchiveTotal(result.total);
+      setArchivePage(result.page);
+    }
     catch (reason) { if (!silent) setError(reason instanceof Error ? reason.message : '无法读取内容档案。'); }
     finally { if (!silent) setLoading(false); }
   };
   const openArchive = async (subscription: Subscription) => {
+    setArchivePage(1);
     setSelected(subscription);
-    await loadArchive(subscription);
+    await loadArchive(subscription, false, 1);
   };
+  useEffect(() => {
+    if (!selected) return;
+    const timer = window.setTimeout(() => void loadArchive(selected, true), 220);
+    return () => window.clearTimeout(timer);
+  }, [selected?.id, archivePage, archivePageSize, archiveQuery, releaseFrom, releaseTo]);
   useEffect(() => {
     if (!selected) return;
     const stream = new EventSource(`/api/events?channel=archive&subscriptionId=${selected.id}`);
     const refresh = () => void loadArchive(selected, true);
     stream.addEventListener('archive', refresh);
     return () => stream.close();
-  }, [selected?.id]);
+  }, [selected?.id, archivePage, archivePageSize, archiveQuery, releaseFrom, releaseTo]);
   const backfillReleaseDates = async () => {
     if (!selected) return;
     setReleaseBackfillBusy(true);
@@ -572,9 +600,13 @@ function ArchivePage({ subscriptions, onNotice }: { subscriptions: Subscription[
   const selectedProgress = selectedSummary ? [['check', '检查'], ['release', '发行日期'], ['magnet', '磁力'], ['library', '影视库'], ['download', '下载']].flatMap(([key, label]) => {
     const value = selectedSummary[key]; return value?.total ? [`${label} ${value.done}/${value.total}`] : [];
   }) : [];
+  const archiveTotalPages = Math.max(1, Math.ceil(archiveTotal / archivePageSize));
+  const clearArchiveFilters = () => { setArchiveQuery(''); setReleaseFrom(''); setReleaseTo(''); setArchivePage(1); };
   if (selected) return <section id="archive" className="archive-section">
     <div className="section-head"><div><button className="back-button" onClick={() => setSelected(null)}>← 内容档案</button><h2>{selected.name}</h2><p>{shortUrl(selected.url)} · 共 {selected.archive_count} 条归档内容{selected.full_scan_active ? ` · 全量 ${selected.initial_scan_pages_completed}/${selected.initial_scan_total ?? '?'}` : ''}</p>{selectedProgress.length > 0 && <p className="archive-queue-progress">{selectedProgress.join(' · ')}</p>}</div><div className="archive-actions"><button className="secondary" disabled={releaseBackfillBusy} onClick={() => void backfillReleaseDates()}>{releaseBackfillBusy ? '正在排队…' : '检索发行日期'}</button><button className="secondary" disabled={backfillBusy} onClick={() => void backfillMagnets()}>{backfillBusy ? '正在排队…' : '补全磁力链接'}</button><button className="secondary" disabled={downloadBackfillBusy} onClick={() => void backfillDownloads()}>{downloadBackfillBusy ? '正在排队…' : '提交可下载项'}</button><button className="quiet" onClick={() => void loadArchive(selected)}>↻ 刷新</button></div></div>
+    <div className="archive-filter-bar"><input value={archiveQuery} onChange={(event) => { setArchiveQuery(event.target.value); setArchivePage(1); }} placeholder="筛选番号或标题" aria-label="筛选番号或标题" /><label>发行日期从<input type="date" value={releaseFrom} onChange={(event) => { setReleaseFrom(event.target.value); setArchivePage(1); }} /></label><label>至<input type="date" value={releaseTo} onChange={(event) => { setReleaseTo(event.target.value); setArchivePage(1); }} /></label>{(archiveQuery || releaseFrom || releaseTo) && <button className="quiet archive-filter-clear" type="button" onClick={clearArchiveFilters}>清除筛选</button>}</div>
     {loading ? <div className="empty">正在读取内容…</div> : error ? <div className="form-error">{error}</div> : entries.length === 0 ? <div className="empty-card archive-empty"><h3>尚无归档内容</h3><p>完成一次检查后，提取结果会出现在这里。</p></div> : <div className="archive-table-wrap"><table className="archive-table"><thead><tr><th className="archive-index">序号</th><th>番号</th><th>标题</th><th>发行日期</th><th>磁力链接</th><th>影视库</th><th>操作</th></tr></thead><tbody>{entries.map((entry, index) => { const detailUrl = archiveContentUrl(entry); const searchUrl = magnetSearchUrl(inspectionRules, entry.content); return <tr key={entry.id}><td className="archive-index">{index + 1}</td><td>{detailUrl ? <a className="archive-content-link" href={detailUrl} target="_blank" rel="noreferrer" title="打开所属网站的详情页"><code>{entry.content}</code></a> : <code>{entry.content}</code>}</td><td className="archive-title">{entry.title || '—'}</td><td><ReleaseDateCell entry={entry} /></td><td className="magnet-cell">{entry.magnet_status === 'found' ? <button className="magnet-action magnet-copy" type="button" onClick={() => void copyMagnet(entry)}>复制</button> : entry.magnet_status === 'skipped' ? <span className="magnet-action magnet-skipped" title="Jellyfin 已入库，自动跳过磁力检索">已跳过</span> : entry.magnet_status === 'pending' ? <span className="magnet-action magnet-pending">检索中</span> : entry.magnet_status === 'not_found' ? <button className="magnet-action magnet-retry" type="button" disabled={retryingId === entry.id} aria-busy={retryingId === entry.id} aria-label={retryingId === entry.id ? '正在加入磁力检索队列' : '未找到磁力链接，重新检索'} title={retryingId === entry.id ? '正在加入队列' : '未找到，点击重新检索'} onClick={() => void retryMagnet(entry)}>重试</button> : entry.magnet_status === 'failed' ? <button className="magnet-action magnet-retry magnet-failed" type="button" disabled={retryingId === entry.id} aria-busy={retryingId === entry.id} aria-label={retryingId === entry.id ? '正在加入磁力检索队列' : '磁力检索失败，重新检索'} title={retryingId === entry.id ? '正在加入队列' : '检索失败，点击重新检索'} onClick={() => void retryMagnet(entry)}>重试</button> : <span className="magnet-action">待补全</span>}</td><td className="jellyfin-cell"><JellyfinCell entry={entry} baseUrl={jellyfinBaseUrl} /></td><td className="download-cell">{entry.magnet_status === 'found' ? <DownloadCell entry={entry} downloadingId={downloadingId} onSubmit={submitDownload} /> : searchUrl ? <a className="download-action magnet-search-link" href={searchUrl} target="_blank" rel="noreferrer" title={`前往磁力搜索页面检索 ${entry.content}`}>搜索</a> : '—'}</td></tr>; })}</tbody></table></div>}
+    {!loading && !error && <div className="archive-pagination"><span>共 {archiveTotal} 条 · 第 {archivePage} / {archiveTotalPages} 页</span><label>每页<select value={archivePageSize} onChange={(event) => { setArchivePageSize(Number(event.target.value)); setArchivePage(1); }}><option value={50}>50 条</option><option value={100}>100 条</option><option value={200}>200 条</option></select></label><button className="quiet" type="button" disabled={archivePage <= 1} onClick={() => setArchivePage((page) => page - 1)}>上一页</button><button className="quiet" type="button" disabled={archivePage >= archiveTotalPages} onClick={() => setArchivePage((page) => page + 1)}>下一页</button></div>}
   </section>;
   return <section id="archive" className="archive-section">
     <div className="section-head"><div><h2>内容档案</h2><p>按订阅查看首次获取到的内容。</p></div></div>

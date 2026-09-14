@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -20,6 +21,7 @@ const managedProcesses: ManagedProcess[] = [
 
 const children = new Map<string, ChildProcess>();
 let stopping = false;
+const workerEventToken = process.env.WORKER_EVENT_TOKEN || crypto.randomBytes(32).toString('hex');
 
 function startProcess(spec: ManagedProcess) {
   if (stopping) return;
@@ -29,7 +31,9 @@ function startProcess(spec: ManagedProcess) {
       ...process.env,
       // 浏览器渲染仅由网页检查任务使用；设为全局变量不会影响其他任务，
       // 但可确保单容器部署时始终使用容器内的无头 Chromium。
-      PLAYWRIGHT_HEADLESS: process.env.PLAYWRIGHT_HEADLESS ?? 'true'
+      PLAYWRIGHT_HEADLESS: process.env.PLAYWRIGHT_HEADLESS ?? 'true',
+      WORKER_EVENT_TOKEN: workerEventToken,
+      WORKER_EVENT_URL: process.env.WORKER_EVENT_URL || 'http://127.0.0.1:3030'
     },
     stdio: 'inherit'
   });

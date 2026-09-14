@@ -45,7 +45,17 @@ export function assertJellyfinConfig(input: JellyfinConfig) {
   const apiKey = input.apiKey.trim();
   if (!apiKey) throw new Error('请填写 Jellyfin API 密钥。');
   if (apiKey.length > 512) throw new Error('Jellyfin API 密钥不能超过 512 个字符。');
+  if (/[\r\n]/.test(apiKey)) throw new Error('Jellyfin API 密钥格式无效。');
   return { ...input, url, apiKey };
+}
+
+/**
+ * Jellyfin 12 disables the old X-Emby-Token header by default. The standard
+ * MediaBrowser Authorization scheme works with Jellyfin 12 and remains
+ * compatible with supported older servers.
+ */
+export function jellyfinAuthorizationHeader(apiKey: string) {
+  return `MediaBrowser Token="${apiKey.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
 }
 
 function endpoint(baseUrl: string, pathname: string) {
@@ -60,7 +70,7 @@ async function jellyfinRequest(config: JellyfinConfig, pathname: string, search?
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
     const response = await fetch(url, {
-      headers: { 'X-Emby-Token': checked.apiKey, accept: 'application/json' },
+      headers: { authorization: jellyfinAuthorizationHeader(checked.apiKey), accept: 'application/json' },
       signal: controller.signal
     });
     const body = await response.text();

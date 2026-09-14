@@ -1,6 +1,7 @@
 import { appendRuntimeLog, db, getQbittorrentSettings, refreshSettings, reportWorkerHeartbeat } from './db.js';
 import { addMagnetToQbittorrent, getQbittorrentTorrentStates, stopQbittorrentTorrents, torrentHashFromMagnet, type QbittorrentTorrentState } from './qbittorrent.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription } from './retry.js';
+import { notifyLive } from './live-events.js';
 
 const POLL_MS = 1_000;
 const STATUS_SYNC_MS = 5_000;
@@ -69,6 +70,8 @@ async function runNextDownloadJob() {
     await appendRuntimeLog({ level: shouldRetry ? 'info' : 'error', source: 'download', subscriptionId: job.subscription_id, jobId: job.id, message: shouldRetry ? `qBittorrent 提交“${job.content}”暂时失败，${retryDescription(attempt)}：${message}` : `qBittorrent 提交“${job.content}”失败：${message}` });
     console.error(`Download job ${job.id} failed: ${message}`);
   }
+  notifyLive('archive', job.subscription_id);
+  notifyLive('subscriptions');
 }
 
 let working = false;
@@ -215,6 +218,8 @@ async function syncDownloadStates() {
   for (const entry of removed) {
     await appendRuntimeLog({ level: 'info', source: 'download', subscriptionId: entry.subscription_id, message: `qBittorrent 中已找不到“${entry.content}”，已标记为已从 qB 删除。` });
   }
+  for (const subscriptionId of new Set(tracked.map((entry) => entry.subscription_id))) notifyLive('archive', subscriptionId);
+  notifyLive('subscriptions');
 }
 
 async function tick() {

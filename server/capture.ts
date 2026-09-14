@@ -4,11 +4,12 @@ import dns from 'node:dns/promises';
 import fs from 'node:fs';
 import net from 'node:net';
 import * as cheerio from 'cheerio';
-import { chromium } from 'playwright';
+import { chromium, type Browser } from 'playwright';
 import { ProxyAgent } from 'undici';
 import { db, getJellyfinSettings, getOutboundProxyUrl, queueLibraryJob, queueMagnetJob, queueReleaseJob, type DatabaseClient, type Subscription } from './db.js';
 import { describeError } from './error-details.js';
 import { expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
+import { missavBackupUrl, missavFallbackFailure, shouldTryMissavBackup } from './site-fallback.js';
 
 // Some DNS forwarders return an unusable ::1 AAAA record together with a valid
 // public A record.  Prefer the valid IPv4 address for Node's outbound requests.
@@ -195,16 +196,42 @@ async function getStatic(url: URL, selector: string, contentSource: Subscription
   }
 }
 
+class CaptureBrowserSession {
+  private browser: Browser | null = null;
+  private proxyUrl: string | null = null;
+  private openedAt = 0;
+  private pages = 0;
+
+  async close() {
+    const browser = this.browser;
+    this.browser = null; this.proxyUrl = null; this.openedAt = 0; this.pages = 0;
+    await browser?.close().catch(() => undefined);
+  }
+
+  async getBrowser() {
+    const proxyUrl = getOutboundProxyUrl() || null;
+    const renew = !this.browser || !this.browser.isConnected() || this.proxyUrl !== proxyUrl || this.pages >= 25 || Date.now() - this.openedAt >= 15 * 60_000;
+    if (!renew) return this.browser!;
+    await this.close();
+    const executablePath = localBrowserExecutable();
+    this.browser = await chromium.launch({ headless: process.env.PLAYWRIGHT_HEADLESS !== 'false', ...(executablePath ? { executablePath } : {}), ...(proxyUrl ? { proxy: { server: proxyUrl } } : {}) });
+    this.proxyUrl = proxyUrl; this.openedAt = Date.now();
+    return this.browser;
+  }
+
+  used() { this.pages += 1; }
+}
+
+const captureBrowser = new CaptureBrowserSession();
+
 async function getDynamic(url: URL, selector: string, contentSource: Subscription['content_source'], attributeName: string | null, matchPattern: string | null, resultMode: Subscription['result_mode'], pageCountSelector?: string | null, pageCountPattern?: string | null, titleSelector?: string | null, titleContentSource: Subscription['title_content_source'] = 'text', titleAttributeName: string | null = null, titleMatchPattern: string | null = null): Promise<CaptureResult> {
-  const proxyUrl = getOutboundProxyUrl();
-  const executablePath = localBrowserExecutable();
-  const browser = await chromium.launch({
-    headless: process.env.PLAYWRIGHT_HEADLESS !== 'false',
-    ...(executablePath ? { executablePath } : {}),
-    ...(proxyUrl ? { proxy: { server: proxyUrl } } : {})
-  });
+  let context: Awaited<ReturnType<Browser['newContext']>> | null = null;
   try {
-    const page = await browser.newPage({ userAgent: 'PageWatch/0.1 (+self-hosted webpage monitor)' });
+    const browser = await captureBrowser.getBrowser();
+    // Page contexts are disposable even though Chromium is reused: no cookie,
+    // storage or service worker state crosses between subscriptions/pages.
+    context = await browser.newContext({ userAgent: 'PageWatch/0.1 (+self-hosted webpage monitor)' });
+    const page = await context.newPage();
     await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 30_000 });
     const elements = page.locator(selector);
     await elements.first().waitFor({ state: 'attached', timeout: 15_000 });
@@ -219,11 +246,17 @@ async function getDynamic(url: URL, selector: string, contentSource: Subscriptio
     const items = extractItems(rawContent, rawTitles, detailUrls, matchPattern, titleMatchPattern, resultMode);
     const content = contentForItems(items);
     const countText = pageCountSelector ? await page.locator(pageCountSelector).first().textContent().catch(() => '') : '';
+    captureBrowser.used();
     return { title: normalize(await page.title()) || url.hostname, content, hash: hash(content), items, ...(pageCountSelector ? { pageCount: pageCount(countText ?? '', pageCountPattern ?? null) } : {}) };
+  } catch (error) {
+    await captureBrowser.close();
+    throw error;
   } finally {
-    await browser.close();
+    await context?.close().catch(() => undefined);
   }
 }
+
+export async function closeCaptureBrowser() { await captureBrowser.close(); }
 
 function hash(value: string) {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -264,20 +297,30 @@ async function archiveNewItems(subscription: Subscription, items: CapturedItem[]
   return additions.length;
 }
 
+async function captureWithFallback<T>(url: URL, read: (target: URL) => Promise<T>) {
+  try { return await read(url); }
+  catch (error) {
+    const backup = missavBackupUrl(url);
+    if (!backup || !shouldTryMissavBackup(error)) throw error;
+    try { return await read(await assertSafeUrl(backup.toString())); }
+    catch (backupError) { throw missavFallbackFailure(url, backup, error, backupError); }
+  }
+}
+
 export async function previewCapture(input: Pick<Subscription, 'url' | 'selector' | 'render_mode' | 'content_source' | 'attribute_name' | 'match_pattern' | 'title_selector' | 'title_content_source' | 'title_attribute_name' | 'title_match_pattern' | 'result_mode'>) {
   const url = await assertSafeUrl(input.url);
   if (!input.selector.trim()) throw new Error('请填写 CSS 选择器。');
   if (input.content_source === 'attribute' && !input.attribute_name?.trim()) throw new Error('请填写要提取的属性名。');
-  return input.render_mode === 'dynamic'
-    ? getDynamic(url, input.selector, input.content_source, input.attribute_name, input.match_pattern, input.result_mode, undefined, undefined, input.title_selector, input.title_content_source, input.title_attribute_name, input.title_match_pattern)
-    : getStatic(url, input.selector, input.content_source, input.attribute_name, input.match_pattern, input.result_mode, undefined, undefined, input.title_selector, input.title_content_source, input.title_attribute_name, input.title_match_pattern);
+  return captureWithFallback(url, (target) => input.render_mode === 'dynamic'
+    ? getDynamic(target, input.selector, input.content_source, input.attribute_name, input.match_pattern, input.result_mode, undefined, undefined, input.title_selector, input.title_content_source, input.title_attribute_name, input.title_match_pattern)
+    : getStatic(target, input.selector, input.content_source, input.attribute_name, input.match_pattern, input.result_mode, undefined, undefined, input.title_selector, input.title_content_source, input.title_attribute_name, input.title_match_pattern));
 }
 
 async function capturePage(subscription: Subscription, rawUrl: string, includePageCount = false) {
   const url = await assertSafeUrl(rawUrl);
-  return subscription.render_mode === 'dynamic'
-    ? getDynamic(url, subscription.selector, subscription.content_source, subscription.attribute_name, subscription.match_pattern, subscription.result_mode, includePageCount ? subscription.pagination_selector : null, subscription.pagination_match_pattern, subscription.title_selector, subscription.title_content_source, subscription.title_attribute_name, subscription.title_match_pattern)
-    : getStatic(url, subscription.selector, subscription.content_source, subscription.attribute_name, subscription.match_pattern, subscription.result_mode, includePageCount ? subscription.pagination_selector : null, subscription.pagination_match_pattern, subscription.title_selector, subscription.title_content_source, subscription.title_attribute_name, subscription.title_match_pattern);
+  return captureWithFallback(url, (target) => subscription.render_mode === 'dynamic'
+    ? getDynamic(target, subscription.selector, subscription.content_source, subscription.attribute_name, subscription.match_pattern, subscription.result_mode, includePageCount ? subscription.pagination_selector : null, subscription.pagination_match_pattern, subscription.title_selector, subscription.title_content_source, subscription.title_attribute_name, subscription.title_match_pattern)
+    : getStatic(target, subscription.selector, subscription.content_source, subscription.attribute_name, subscription.match_pattern, subscription.result_mode, includePageCount ? subscription.pagination_selector : null, subscription.pagination_match_pattern, subscription.title_selector, subscription.title_content_source, subscription.title_attribute_name, subscription.title_match_pattern));
 }
 
 export async function captureSubscription(subscription: Subscription) {

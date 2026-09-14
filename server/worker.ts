@@ -1,6 +1,7 @@
-import { captureSubscription } from './capture.js';
+import { captureSubscription, closeCaptureBrowser } from './capture.js';
 import { appendRuntimeLog, db, getSubscription, JOB_PRIORITY, queueJob, refreshSettings, reportWorkerHeartbeat, type Subscription } from './db.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription } from './retry.js';
+import { notifyLive } from './live-events.js';
 
 const POLL_MS = 10_000;
 
@@ -78,6 +79,8 @@ async function runNextJob() {
     await db.run("UPDATE jobs SET status = 'completed', finished_at = ? WHERE id = ?", [new Date().toISOString(), job.id]);
     const additions = result.addedCount ? `，新增 ${result.addedCount} 条内容` : '，没有新增内容';
     await appendRuntimeLog({ level: 'success', source: 'worker', subscriptionId: subscription.id, jobId: job.id, message: `${result.totalPages > 1 ? `全量检查完成，共读取 ${result.totalPages} 页` : '检查完成'}，提取 ${result.itemCount} 项${additions}。` });
+    notifyLive('archive', subscription.id);
+    notifyLive('subscriptions');
   } catch (error) {
     const message = error instanceof Error ? error.message : '未知抓取错误';
     const attempt = job.attempt_count + 1;
@@ -94,6 +97,10 @@ async function runNextJob() {
       await appendRuntimeLog({ level: 'error', source: 'worker', subscriptionId: job.subscription_id, jobId: job.id, message: `检查失败：${message}` });
     }
     console.error(`Job ${job.id} failed: ${message}`);
+    if (subscription) {
+      notifyLive('archive', subscription.id);
+      notifyLive('subscriptions');
+    }
   }
 }
 
@@ -147,3 +154,5 @@ void tick();
 setInterval(() => void tick(), POLL_MS);
 const heartbeatTimer = setInterval(() => void heartbeat(), 15_000);
 heartbeatTimer.unref();
+process.once('SIGTERM', () => { void closeCaptureBrowser(); });
+process.once('SIGINT', () => { void closeCaptureBrowser(); });

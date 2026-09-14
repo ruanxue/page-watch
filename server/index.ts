@@ -51,6 +51,14 @@ function writeSse(client: LiveClient, event: string, data?: unknown) {
   client.response.write('\n');
 }
 
+function emitLive(channel: LiveChannel, subscriptionId?: number) {
+  for (const client of liveClients) {
+    if (client.channel !== channel) continue;
+    if (channel === 'archive' && client.subscriptionId !== subscriptionId) continue;
+    writeSse(client, channel, channel === 'archive' ? { subscriptionId } : { at: new Date().toISOString() });
+  }
+}
+
 async function pollLiveChanges() {
   if (!liveClients.size) return;
   const watchesLogs = [...liveClients].some((client) => client.channel === 'logs');
@@ -102,12 +110,14 @@ async function pollLiveChanges() {
   }
 }
 
-const livePollTimer = setInterval(() => void pollLiveChanges().catch((error) => app.log.warn(`Live update poll failed: ${error instanceof Error ? error.message : String(error)}`)), 2_000);
+// Direct worker notifications are the normal path. This low-frequency fallback
+// keeps separately launched development workers compatible without DB churn.
+const livePollTimer = setInterval(() => void pollLiveChanges().catch((error) => app.log.warn(`Live update poll failed: ${error instanceof Error ? error.message : String(error)}`)), 30_000);
 livePollTimer.unref();
 
 app.addHook('onRequest', async (request, reply) => {
   const requestPath = authPath(request.url);
-  if (!requestPath.startsWith('/api/') || requestPath === '/api/health' || requestPath.startsWith('/api/auth/')) return;
+  if (!requestPath.startsWith('/api/') || requestPath === '/api/health' || requestPath.startsWith('/api/auth/') || requestPath === '/api/internal/events') return;
   const status = await statusFor(request.headers.cookie);
   if (!status.configured) return reply.code(503).send({ error: '请先在网页中设置访问密码，再使用 Page Watch。' });
   if (!status.authenticated) return reply.code(401).send({ error: '登录已失效，请重新登录。' });
@@ -276,6 +286,17 @@ async function listSubscriptions() {
 }
 
 app.get('/api/health', async () => ({ ok: true }));
+app.post('/api/internal/events', async (request, reply) => {
+  const token = process.env.WORKER_EVENT_TOKEN;
+  if (!token || request.headers['x-page-watch-worker-token'] !== token) return reply.code(403).send({ error: '内部事件令牌无效。' });
+  const body = request.body as { channel?: unknown; subscriptionId?: unknown };
+  if (body.channel !== 'logs' && body.channel !== 'subscriptions' && body.channel !== 'archive') return reply.code(400).send({ error: '内部事件类型无效。' });
+  const subscriptionId = Number(body.subscriptionId);
+  if (body.channel === 'archive' && (!Number.isInteger(subscriptionId) || subscriptionId < 1)) return reply.code(400).send({ error: '归档事件缺少订阅标识。' });
+  emitLive(body.channel, body.channel === 'archive' ? subscriptionId : undefined);
+  if (body.channel !== 'logs') emitLive('subscriptions');
+  return { ok: true };
+});
 app.get('/api/events', async (request, reply) => {
   const query = request.query as { channel?: string; subscriptionId?: string };
   const channel: LiveChannel | null = query.channel === 'archive' || query.channel === 'logs' || query.channel === 'subscriptions' ? query.channel : null;
@@ -404,21 +425,34 @@ app.put('/api/inspection-rules', async (request, reply) => {
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '检查规则无法保存。' }); }
 });
 app.get('/api/archive', async (request) => {
-  const query = request.query as { limit?: string; subscriptionId?: string };
-  // An archive detail view is intentionally complete: its displayed count must
-  // always match the rows the user can inspect.
-  const limitValue = Number(query.limit ?? 10_000);
-  const limit = Number.isInteger(limitValue) ? Math.min(Math.max(limitValue, 1), 10_000) : 10_000;
+  const query = request.query as { subscriptionId?: string; page?: string; pageSize?: string; q?: string; releaseFrom?: string; releaseTo?: string };
   const subscriptionId = Number(query.subscriptionId);
   const hasSubscriptionId = Number.isInteger(subscriptionId) && subscriptionId > 0;
-  return db.all(`SELECT a.id, a.content, a.title, a.detail_url, a.first_seen_at, a.release_date, a.release_status, a.release_error, a.magnet_status, a.magnet_value, a.magnet_checked_at, a.magnet_error,
+  const pageInput = Number(query.page ?? 1);
+  const page = Number.isInteger(pageInput) ? Math.max(1, pageInput) : 1;
+  const pageSizeInput = Number(query.pageSize ?? 50);
+  const pageSize = Number.isInteger(pageSizeInput) ? Math.min(Math.max(pageSizeInput, 20), 200) : 50;
+  const keyword = (query.q ?? '').trim().slice(0, 120);
+  const releaseFrom = /^\d{4}-\d{2}-\d{2}$/.test(query.releaseFrom ?? '') ? query.releaseFrom! : '';
+  const releaseTo = /^\d{4}-\d{2}-\d{2}$/.test(query.releaseTo ?? '') ? query.releaseTo! : '';
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  if (hasSubscriptionId) { clauses.push('a.subscription_id = ?'); params.push(subscriptionId); }
+  if (keyword) { clauses.push('(a.content LIKE ? OR a.title LIKE ?)'); params.push(`%${keyword}%`, `%${keyword}%`); }
+  if (releaseFrom) { clauses.push('a.release_date >= ?'); params.push(releaseFrom); }
+  if (releaseTo) { clauses.push('a.release_date <= ?'); params.push(releaseTo); }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const totalRow = await db.get<{ total: number }>(`SELECT COUNT(*) AS total FROM archive_entries a ${where}`, params);
+  const total = Number(totalRow?.total ?? 0);
+  const items = await db.all(`SELECT a.id, a.content, a.title, a.detail_url, a.first_seen_at, a.release_date, a.release_status, a.release_error, a.magnet_status, a.magnet_value, a.magnet_checked_at, a.magnet_error,
       a.download_status, a.download_queued_at, a.download_added_at, a.download_torrent_hash, a.download_checked_at, a.download_error,
       a.download_progress, a.download_speed, a.download_size, a.downloaded_bytes, a.download_save_path, a.download_content_path, a.download_removed_at,
       a.jellyfin_status, a.jellyfin_item_id, a.jellyfin_item_name, a.jellyfin_matched_at, a.jellyfin_error,
       s.id AS subscription_id, s.name AS subscription_name, s.url AS subscription_url
     FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
-    ${hasSubscriptionId ? 'WHERE a.subscription_id = ?' : ''}
-    ORDER BY a.id ASC LIMIT ?`, hasSubscriptionId ? [subscriptionId, limit] : [limit]);
+    ${where}
+    ORDER BY a.id ASC LIMIT ? OFFSET ?`, [...params, pageSize, (page - 1) * pageSize]);
+  return { items, total, page, pageSize };
 });
 
 app.post('/api/subscriptions/:id/magnet-backfill', async (request, reply) => {
