@@ -1,6 +1,6 @@
-import { appendRuntimeLog, db, getQbittorrentSettings, refreshSettings, reportWorkerHeartbeat, type WorkerTaskContext } from './db.js';
+import { appendRuntimeLog, db, getQbittorrentSettings, recordPerformanceMetric, refreshSettings, reportIntegrationStatus, reportWorkerHeartbeat, type WorkerTaskContext } from './db.js';
 import { addMagnetToQbittorrent, getQbittorrentTorrentFiles, getQbittorrentTorrentStates, setQbittorrentTorrentFilePriority, startQbittorrentTorrents, stopQbittorrentTorrents, torrentHashFromMagnet, type QbittorrentTorrentFile, type QbittorrentTorrentState } from './qbittorrent.js';
-import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription } from './retry.js';
+import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { notifyLive } from './live-events.js';
 
 const POLL_MS = 1_000;
@@ -50,6 +50,7 @@ async function runNextDownloadJob() {
 
   const claimed = await db.run("UPDATE download_jobs SET status = 'running', started_at = ?, retry_after = NULL WHERE id = ? AND status = 'queued'", [new Date().toISOString(), job.id]);
   if (!claimed.changes) return;
+  const startedAtMs = Date.now();
   activeTask = { kind: 'download', subscriptionId: job.subscription_id, archiveEntryId: job.archive_entry_id, content: job.content, label: '正在提交 qBittorrent 下载' };
   await heartbeat();
 
@@ -107,6 +108,8 @@ async function runNextDownloadJob() {
         : `已将“${job.content}”提交给 qBittorrent。`;
     await appendRuntimeLog({ level: 'success', source: 'download', subscriptionId: job.subscription_id, jobId: job.id, message });
     }
+    await recordPerformanceMetric({ scope: 'download', metric: 'processed', dimension: isFilteredRetry ? 'refiltered' : 'submitted', durationMs: Date.now() - startedAtMs }).catch(() => undefined);
+    await reportIntegrationStatus('qbittorrent', 'healthy', '最近一次下载提交成功').catch(() => undefined);
   } catch (error) {
     const message = error instanceof Error ? error.message : '未知 qBittorrent 下载错误';
     const attempt = job.attempt_count + 1;
@@ -121,6 +124,8 @@ async function runNextDownloadJob() {
       }
     });
     await appendRuntimeLog({ level: shouldRetry ? 'info' : 'error', source: 'download', subscriptionId: job.subscription_id, jobId: job.id, message: shouldRetry ? `qBittorrent 提交“${job.content}”暂时失败，${retryDescription(attempt)}：${message}` : `qBittorrent 提交“${job.content}”失败：${message}` });
+    await recordPerformanceMetric({ scope: 'download', metric: shouldRetry ? 'retry' : 'processed', dimension: shouldRetry ? retryReason(error) : 'failed', durationMs: shouldRetry ? 0 : Date.now() - startedAtMs }).catch(() => undefined);
+    if (!/未启用/.test(message)) await reportIntegrationStatus('qbittorrent', 'degraded', '最近一次下载提交失败').catch(() => undefined);
     console.error(`Download job ${job.id} failed: ${message}`);
   }
   activeTask = null;
@@ -379,7 +384,16 @@ async function tick() {
     await refreshSettings();
     await recoverStalledJobs();
     await runNextDownloadJob();
-    await syncDownloadStates();
+    try {
+      await syncDownloadStates();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '未知 qBittorrent 状态同步错误';
+      console.error(`qBittorrent download state sync failed: ${message}`);
+      await reportIntegrationStatus('qbittorrent', 'degraded', '最近一次下载状态同步失败').catch(() => undefined);
+      // qBittorrent is externally managed. Keep the Worker alive and the
+      // Docker readiness gate focused on Page Watch's own processes.
+      await reportWorkerHeartbeat('download', 'qBittorrent 外部服务降级；稍后会继续同步下载状态').catch(() => undefined);
+    }
   } catch (error) {
     await reportWorkerHeartbeat('download', 'qBittorrent 下载 Worker 遇到基础设施错误', 'error').catch(() => undefined);
     await reportInfrastructureError(error);

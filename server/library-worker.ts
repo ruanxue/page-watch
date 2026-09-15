@@ -1,9 +1,9 @@
-import { appendRuntimeLog, db, getJellyfinSettings, getSetting, queueMagnetJob, refreshSettings, reportWorkerHeartbeat, type WorkerTaskContext } from './db.js';
+import { appendRuntimeLog, db, getJellyfinSettings, getSetting, queueMagnetJob, recordPerformanceMetric, refreshSettings, reportIntegrationStatus, reportWorkerHeartbeat, type WorkerTaskContext } from './db.js';
 import { findJellyfinMedia } from './jellyfin.js';
 import { exactJellyfinMatch } from './jellyfin-match.js';
 import { syncJellyfinLibrary } from './jellyfin-sync.js';
 import { findCachedJellyfinMedia } from './jellyfin-cache.js';
-import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription } from './retry.js';
+import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { notifyLive } from './live-events.js';
 
 // An idle worker only needs a modest polling cadence. Once a complete local
@@ -28,6 +28,8 @@ async function runNextLibraryJob() {
   if (!job) return false;
   const startedAt = new Date().toISOString();
   if (!(await db.run("UPDATE library_jobs SET status = 'running', started_at = ?, retry_after = NULL WHERE id = ? AND status = 'queued'", [startedAt, job.id])).changes) return true;
+  const startedAtMs = Date.now();
+  let usedRemoteLookup = false;
   try {
     const settings = getJellyfinSettings();
     if (!settings.enabled || !settings.libraryIds.length) throw new Error('Jellyfin 未启用或尚未选择媒体库。');
@@ -35,9 +37,11 @@ async function runNextLibraryJob() {
     // lookup. The Jellyfin API fallback exists only while no local snapshot is
     // available yet (for example immediately after configuration changes).
     const indexReady = Boolean(getSetting('jellyfin_media_index_synced_at'));
+    usedRemoteLookup = !indexReady;
     const match = indexReady
       ? await findCachedJellyfinMedia(job.content, settings.libraryIds)
       : exactJellyfinMatch(job.content, await findJellyfinMedia(settings, job.content));
+    if (indexReady) await recordPerformanceMetric({ scope: 'library', metric: 'jellyfin_cache', dimension: match ? 'hit' : 'miss' }).catch(() => undefined);
     const finishedAt = new Date().toISOString();
     await db.transaction(async (tx) => {
       if (match) {
@@ -60,6 +64,7 @@ async function runNextLibraryJob() {
       }
       await tx.run("UPDATE library_jobs SET status = 'completed', finished_at = ?, error = NULL, retry_after = NULL WHERE id = ?", [finishedAt, job.id]);
     });
+    await recordPerformanceMetric({ scope: 'library', metric: 'processed', dimension: match ? 'found' : 'not_found', durationMs: Date.now() - startedAtMs }).catch(() => undefined);
   } catch (error) {
     const message = error instanceof Error ? error.message : '未知 Jellyfin 单条查询错误';
     const attempt = job.attempt_count + 1;
@@ -75,6 +80,8 @@ async function runNextLibraryJob() {
       }
     });
     await appendRuntimeLog({ level: retry ? 'info' : 'error', source: 'library', subscriptionId: job.subscription_id, message: `Jellyfin 查询“${job.content}”${retry ? `暂时失败，${retryDescription(attempt)}：` : '失败，已继续磁力补全：'}${message}` });
+    await recordPerformanceMetric({ scope: 'library', metric: retry ? 'retry' : 'processed', dimension: retry ? retryReason(error) : 'failed', durationMs: retry ? 0 : Date.now() - startedAtMs }).catch(() => undefined);
+    if (usedRemoteLookup) await reportIntegrationStatus('jellyfin', 'degraded', '最近一次 Jellyfin 查询失败').catch(() => undefined);
   }
   notifyLive('archive', job.subscription_id);
   notifyLive('subscriptions');
@@ -109,7 +116,7 @@ async function tick() {
     }
     if (!settings.libraryIds.length) {
       if (await runNextLibraryJob()) return;
-      await reportWorkerHeartbeat('library', '等待选择 Jellyfin 媒体库', 'error');
+      await reportWorkerHeartbeat('library', 'Jellyfin 尚未选择媒体库（外部服务未配置）');
       return;
     }
     // A cache miss after configuration changes must build one complete local
@@ -120,12 +127,15 @@ async function tick() {
       syncing = true;
       syncTask = { kind: 'library_sync', current: 0, total: null, label: '正在读取 Jellyfin 媒体库' };
       await syncHeartbeat();
+      const syncStartedAtMs = Date.now();
       const result = await syncJellyfinLibrary('scheduled', async (progress) => {
         syncTask = { kind: 'library_sync', current: progress.current, total: progress.total, label: progress.label };
         await syncHeartbeat();
       });
       syncing = false;
       syncTask = null;
+      await recordPerformanceMetric({ scope: 'library', metric: 'processed', dimension: 'full_sync', durationMs: Date.now() - syncStartedAtMs }).catch(() => undefined);
+      await reportIntegrationStatus('jellyfin', 'healthy', '最近一次媒体库同步成功').catch(() => undefined);
       await reportWorkerHeartbeat('library', `Jellyfin 已同步 ${result.scanned} 个媒体项目、${result.indexedCodes} 个番号索引，匹配 ${result.matched} 条归档`);
       return;
     }
@@ -143,7 +153,11 @@ async function tick() {
   } catch (error) {
     const message = error instanceof Error ? error.message : '未知 Jellyfin 同步错误';
     console.error(`Jellyfin library sync failed: ${message}`);
-    await reportWorkerHeartbeat('library', `Jellyfin 同步失败：${message}`, 'error').catch(() => undefined);
+    await reportIntegrationStatus('jellyfin', 'degraded', '最近一次媒体库同步失败').catch(() => undefined);
+    // Jellyfin is optional to Page Watch's core service. A remote timeout or
+    // 401 must be visible as degraded without making Docker regard the whole
+    // container as unhealthy and restarting otherwise healthy workers.
+    await reportWorkerHeartbeat('library', 'Jellyfin 外部服务降级；将在下个计划周期重试').catch(() => undefined);
     if (Date.now() - lastErrorLogAt >= 60_000) {
       lastErrorLogAt = Date.now();
       await appendRuntimeLog({ level: 'error', source: 'library', message: `Jellyfin 影视库同步失败：${message}` }).catch(() => undefined);

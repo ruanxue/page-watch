@@ -34,6 +34,7 @@
    - `PAGE_WATCH_IMAGE` 改成实际 GHCR 地址，例如 `ghcr.io/your-name/page-watch:stable`；
    - `MYSQL_HOST` 填 MySQL 的 Docker **服务名**，例如 `mysql`；
    - 填入 MySQL 专用账号密码；
+   - 用 `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"` 生成并填入 `APP_ENCRYPTION_KEY`；此密钥只用于加密数据库中的外部服务凭据，后续升级必须保持不变；
    - NAS 没有代理时保持 `OUTBOUND_PROXY=` 为空。
 
 6. 将 MySQL 与 Jellyfin 服务也加入 `page-watch-backend` 网络。长期方案是在各自 Compose 文件中声明这个 `external` 网络；临时检查可以使用：

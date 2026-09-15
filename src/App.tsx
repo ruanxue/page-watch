@@ -144,8 +144,18 @@ type TasksResponse = {
   generatedAt: string;
   summary: { servicesOnline: number; running: number; queued: number; retrying: number; failed: number };
   services: SystemService[];
+  integrations: Array<{ name: 'jellyfin' | 'qbittorrent'; enabled: boolean; configured: boolean; status: 'healthy' | 'degraded' | 'disabled' | 'unknown'; detail: string | null; checkedAt: string | null }>;
   active: TaskItem[];
   history: TaskItem[];
+};
+type PerformanceMetrics = {
+  range: '24h' | '7d' | '30d' | '180d';
+  generatedAt: string;
+  jellyfinCache: { hit: number; miss: number; hitRate: number | null };
+  workers: Array<{ scope: 'capture' | 'release' | 'magnet' | 'library' | 'download'; processed: number; averageDurationMs: number | null }>;
+  retries: Array<{ scope: string; reason: string; count: number }>;
+  chromiumRebuilds: Array<{ scope: string; reason: string; count: number }>;
+  throughput: Array<{ minute: string; scope: string; count: number }>;
 };
 
 const blankForm: FormData = {
@@ -177,6 +187,23 @@ type PresetForm = Omit<FormData, 'name' | 'url'> & { name: string; description: 
 
 const blankPresetForm: PresetForm = {
   name: '', description: '', selector: '', renderMode: 'static', contentSource: 'text', attributeName: '', matchPattern: '', titleSelector: '', titleContentSource: 'text', titleAttributeName: '', titleMatchPattern: '', resultMode: 'first', intervalMinutes: 60, scheduleType: 'hourly', scheduleIntervalHours: 1, scheduleTime: '09:00', scheduleWeekday: 1, isActive: true, paginationSelector: '', paginationParameter: 'page', paginationMatchPattern: ''
+};
+
+const defaultMissavPresetForm: PresetForm = {
+  ...blankPresetForm,
+  name: 'MissAV 番号列表',
+  description: '适用于列表页，读取影片番号、标题和全部分页内容。',
+  selector: 'a.text-secondary[alt]',
+  renderMode: 'dynamic',
+  contentSource: 'attribute',
+  attributeName: 'alt',
+  titleSelector: 'a.text-secondary[alt]',
+  titleContentSource: 'text',
+  titleMatchPattern: '^[A-Za-z]+-\\d+\\s*(.+)$',
+  resultMode: 'all',
+  paginationSelector: '#price-currency',
+  paginationParameter: 'page',
+  paginationMatchPattern: '/\\s*(\\d+)'
 };
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
@@ -494,6 +521,12 @@ function DownloadCell({ entry, downloadingId, onSubmit }: { entry: ArchiveEntry;
   return <span className={`download-status-button ${entry.download_status}`} title={entry.download_error || status}>{status}</span>;
 }
 
+function formatDuration(value: number | null) {
+  if (value === null) return '—';
+  if (value < 1_000) return `${value} ms`;
+  return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)} 秒`;
+}
+
 function jellyfinItemUrl(baseUrl: string, itemId: string | null) {
   if (!baseUrl || !itemId) return null;
   try {
@@ -784,10 +817,43 @@ function ServiceOperationsPage({ data, error, scope }: { data: TasksResponse | n
   </section>;
 }
 
+const metricWorkerLabel: Record<PerformanceMetrics['workers'][number]['scope'], string> = { capture: '网页检查', release: '发行日期', magnet: '磁力检索', library: '影视库', download: '下载' };
+const retryReasonLabel: Record<string, string> = { rate_limited: '限流', timeout: '超时', dns: 'DNS', proxy: '代理', server_5xx: '服务端 5xx', network: '网络', transient_other: '其他暂时错误' };
+const chromiumReasonLabel: Record<string, string> = { disconnected: '浏览器断连', proxy_changed: '代理变更', page_limit: '页数上限', age_limit: '运行时限', error: '读取异常' };
+
+function PerformanceOverview({ metrics, error, integrations, range, onRange }: { metrics: PerformanceMetrics | null; error: string; integrations: TasksResponse['integrations']; range: PerformanceMetrics['range']; onRange: (range: PerformanceMetrics['range']) => void }) {
+  const minuteTotals = new Map<string, number>();
+  for (const point of metrics?.throughput ?? []) minuteTotals.set(point.minute, (minuteTotals.get(point.minute) ?? 0) + point.count);
+  const trend = [...minuteTotals.entries()].slice(-60);
+  const max = Math.max(1, ...trend.map(([, count]) => count));
+  const retries = (metrics?.retries ?? []).sort((left, right) => right.count - left.count);
+  const rebuilds = (metrics?.chromiumRebuilds ?? []).sort((left, right) => right.count - left.count);
+  return <section className="performance-overview" aria-label="长期性能指标">
+    <div className="operation-section-heading"><div><h2>性能概览</h2><p>指标仅记录聚合计数与耗时；分钟数据保留 30 天，之后按小时汇总至 180 天。</p></div><div className="metric-range" role="group" aria-label="性能指标时间范围">{(['24h', '7d', '30d', '180d'] as const).map((item) => <button type="button" key={item} className={range === item ? 'active' : ''} onClick={() => onRange(item)}>{item}</button>)}</div></div>
+    {!metrics ? <div className={`operation-queue-empty ${error ? 'metric-load-error' : ''}`}>{error || '正在读取长期性能指标…'}</div> : <>
+      <div className="external-integrations" aria-label="外部服务状态">{integrations.map((integration) => {
+        const label = integration.name === 'jellyfin' ? 'Jellyfin' : 'qBittorrent';
+        const status = integration.status === 'healthy' ? '正常' : integration.status === 'degraded' ? '降级' : integration.status === 'disabled' ? '已停用' : integration.configured ? '未检测' : '未配置';
+        return <article className={integration.status} key={integration.name}><strong>{label}</strong><span>{status}</span><small title={integration.detail ?? undefined}>{integration.status === 'degraded' ? (integration.detail ?? '最近连接失败，核心服务仍可使用。') : integration.status === 'disabled' ? '未纳入核心就绪检查' : integration.configured ? '不纳入 Docker 就绪门槛' : '尚未完成连接配置'}</small></article>;
+      })}</div>
+      <div className="performance-cards">
+        <article><span>Jellyfin 缓存命中率</span><strong>{metrics.jellyfinCache.hitRate === null ? '—' : `${Math.round(metrics.jellyfinCache.hitRate * 100)}%`}</strong><small>{metrics.jellyfinCache.hit} 命中 · {metrics.jellyfinCache.miss} 未命中</small></article>
+        <article><span>Chromium 重建</span><strong>{rebuilds.reduce((total, item) => total + item.count, 0)}</strong><small>{rebuilds.length ? rebuilds.map((item) => `${metricWorkerLabel[item.scope as keyof typeof metricWorkerLabel] ?? item.scope} ${chromiumReasonLabel[item.reason] ?? item.reason} ${item.count}`).join(' · ') : '当前范围内没有重建'}</small></article>
+        <article><span>自动重试</span><strong>{retries.reduce((total, item) => total + item.count, 0)}</strong><small>{retries.length ? retries.slice(0, 3).map((item) => `${retryReasonLabel[item.reason] ?? item.reason} ${item.count}`).join(' · ') : '当前范围内没有自动重试'}</small></article>
+      </div>
+      <section className="throughput-chart"><header><strong>每分钟处理量</strong><small>最近 60 分钟</small></header><div className="throughput-bars" aria-label="最近 60 分钟处理量趋势">{trend.length ? trend.map(([minute, count]) => <i key={minute} title={`${formatTime(minute)}：${count} 项`} style={{ height: `${Math.max(4, Math.round(count / max * 100))}%` }} />) : <span>尚无处理记录</span>}</div></section>
+      <div className="worker-performance-list">{metrics.workers.map((worker) => <article key={worker.scope}><strong>{metricWorkerLabel[worker.scope]}</strong><span>{worker.processed} 项</span><small>平均 {formatDuration(worker.averageDurationMs)}</small></article>)}</div>
+    </>}
+  </section>;
+}
+
 function OperationsCenterPage({ onSummary }: { onSummary: (summary: TasksResponse['summary']) => void }) {
   const [data, setData] = useState<TasksResponse | null>(null);
   const [scope, setScope] = useState<OperationScope | null>(null);
   const [error, setError] = useState('');
+  const [metrics, setMetrics] = useState<PerformanceMetrics | null>(null);
+  const [metricsError, setMetricsError] = useState('');
+  const [metricRange, setMetricRange] = useState<PerformanceMetrics['range']>('24h');
   const load = async () => {
     try {
       const next = await request<TasksResponse>('/api/tasks?historyLimit=300');
@@ -800,12 +866,23 @@ function OperationsCenterPage({ onSummary }: { onSummary: (summary: TasksRespons
     stream.addEventListener('tasks', () => void load());
     return () => stream.close();
   }, []);
+  useEffect(() => {
+    const loadMetrics = () => void request<PerformanceMetrics>(`/api/metrics?range=${metricRange}`).then((next) => { setMetrics(next); setMetricsError(''); }).catch(() => {
+      setMetrics(null);
+      setMetricsError('性能指标接口暂不可用。请确认网页服务已更新并重新启动。');
+    });
+    loadMetrics();
+    const stream = new EventSource('/api/events?channel=metrics');
+    stream.addEventListener('metrics', loadMetrics);
+    return () => stream.close();
+  }, [metricRange]);
   const summary = data?.summary;
   return <section id="operations" className="operations-center-page">
     <div className="section-head"><div><h2>运行中心</h2><p>选择一项服务，查看它自己的实时队列、任务进度和运行日志。</p></div><button type="button" className="quiet" onClick={() => void load()}>↻ 刷新</button></div>
     <section className="task-summary operation-summary" aria-label="运行概览">{[
       ['服务在线', summary?.servicesOnline ?? '—'], ['执行中', summary?.running ?? '—'], ['排队中', summary?.queued ?? '—'], ['等待重试', summary?.retrying ?? '—']
     ].map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong></div>)}</section>
+    {!scope && <PerformanceOverview metrics={metrics} error={metricsError} integrations={data?.integrations ?? []} range={metricRange} onRange={setMetricRange} />}
     <section className="operation-service-panel"><div className="task-list-heading"><h3>服务</h3><span>点击查看对应任务与日志</span></div><div className="operation-service-grid">{operationDefinitions.map((definition) => {
       const service = data?.services.find((item) => item.name === definition.service);
       const tasks = (data?.active ?? []).filter((task) => taskMatchesScope(task, definition.scope));
@@ -881,24 +958,24 @@ function RuleFlow({ children }: { children: ReactNode }) {
   return <div className="rule-flow" aria-label="规则执行流程">{children}</div>;
 }
 
-type RuleSave = () => Promise<boolean>;
+type MissavPresetDraft = { presetId: number | null; preset: PresetForm };
 
 function RulesLibrary({ open, onToggle, onNotice }: { open: boolean; onToggle: () => void; onNotice: (message: string) => void }) {
-  const presetSaveRef = useRef<RuleSave | null>(null);
-  const inspectionSaveRef = useRef<RuleSave | null>(null);
+  const presetDraftRef = useRef<MissavPresetDraft | null>(null);
+  const inspectionDraftRef = useRef<InspectionRules | null>(null);
   const [saving, setSaving] = useState(false);
   const saveAll = async () => {
-    if (!presetSaveRef.current || !inspectionSaveRef.current) { onNotice('规则仍在读取，请稍后再保存。'); return; }
+    if (!presetDraftRef.current || !inspectionDraftRef.current) { onNotice('规则仍在读取，请稍后再保存。'); return; }
     setSaving(true);
     try {
-      if (!await presetSaveRef.current()) return;
-      if (!await inspectionSaveRef.current()) return;
+      await request('/api/rules/missav', { method: 'PUT', body: JSON.stringify({ ...presetDraftRef.current, inspectionRules: inspectionDraftRef.current }) });
       onNotice('MissAV 检查规则已保存。');
-    } finally { setSaving(false); }
+    } catch (reason) { onNotice(reason instanceof Error ? reason.message : 'MissAV 检查规则无法保存。'); }
+    finally { setSaving(false); }
   };
   return <section id="rules-library" className={`rules-library ${open ? 'is-open' : ''}`}>
     <div className="section-head rules-library-head"><div><p className="eyebrow">MissAV</p><h2>MissAV 检查规则</h2><p>一条检查流程依次读取列表页内容、补全发行日期，再检索磁力链接。</p></div><button type="button" className="secondary" aria-expanded={open} onClick={onToggle}>{open ? '收起检查规则' : '检查规则'}</button></div>
-    {open && <div className="rules-library-content"><div className="rules-library-workbench"><RuleFlow><code>MissAV 列表页</code><i>→</i><strong>番号与标题</strong><i>→</i><code>详情页</code><i>→</i><strong>发行日期</strong><i>→</i><code>磁力搜索</code><i>→</i><strong>磁力链接</strong></RuleFlow><SubscriptionPresetLibrary registerSave={(save) => { presetSaveRef.current = save; }}><InspectionRulesPage embedded onNotice={onNotice} registerSave={(save) => { inspectionSaveRef.current = save; }} /></SubscriptionPresetLibrary><div className="rule-save-actions"><button type="button" className="primary" disabled={saving} onClick={() => void saveAll()}>{saving ? '保存中…' : '保存规则'}</button></div></div></div>}
+    {open && <div className="rules-library-content"><div className="rules-library-workbench"><RuleFlow><code>MissAV 列表页</code><i>→</i><strong>番号与标题</strong><i>→</i><code>详情页</code><i>→</i><strong>发行日期</strong><i>→</i><code>磁力搜索</code><i>→</i><strong>磁力链接</strong></RuleFlow><SubscriptionPresetLibrary registerDraft={(draft) => { presetDraftRef.current = draft; }}><InspectionRulesPage embedded onNotice={onNotice} registerDraft={(draft) => { inspectionDraftRef.current = draft; }} /></SubscriptionPresetLibrary><div className="rule-save-actions"><button type="button" className="primary" disabled={saving} onClick={() => void saveAll()}>{saving ? '保存中…' : '保存规则'}</button></div></div></div>}
   </section>;
 }
 
@@ -973,7 +1050,7 @@ function SubscriptionReadingRules({ subscriptions, targetSubscriptionId, onSubsc
   </section>;
 }
 
-function SubscriptionPresetLibrary({ children, registerSave }: { children: ReactNode; registerSave: (save: RuleSave) => void }) {
+function SubscriptionPresetLibrary({ children, registerDraft }: { children: ReactNode; registerDraft: (draft: MissavPresetDraft) => void }) {
   const [presets, setPresets] = useState<SubscriptionPreset[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -986,11 +1063,11 @@ function SubscriptionPresetLibrary({ children, registerSave }: { children: React
   return <section className="subscription-preset-library">
     <div className="preset-library-head"><div><span className="rule-kind">流程第 1 步</span><h3>列表读取</h3><p>读取番号、标题和分页；新建 MissAV 订阅时选择一条列表规则即可填入。</p></div></div>
     {loading ? <p className="preset-library-loading">正在读取检查规则…</p> : error ? <p className="form-error">{error}</p> : <div className="preset-library-list">{presets.length ? presets.map((preset) => <span key={preset.id} title={preset.description || preset.selector}>{preset.name}</span>) : <span className="preset-library-empty">还没有检查规则</span>}</div>}
-    <div className="rules-editor-content"><PresetManager embedded presets={presets} onClose={() => undefined} onChanged={loadPresets} registerSave={registerSave} />{children}</div>
+    <div className="rules-editor-content"><PresetManager embedded presets={presets} onClose={() => undefined} onChanged={loadPresets} registerDraft={registerDraft} />{children}</div>
   </section>;
 }
 
-function InspectionRulesPage({ onNotice, embedded = false, registerSave }: { onNotice: (message: string) => void; embedded?: boolean; registerSave?: (save: RuleSave) => void }) {
+function InspectionRulesPage({ onNotice, embedded = false, registerDraft }: { onNotice: (message: string) => void; embedded?: boolean; registerDraft?: (draft: InspectionRules) => void }) {
   const [form, setForm] = useState<InspectionRules>(freshDefaultInspectionRules);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -1011,7 +1088,7 @@ function InspectionRulesPage({ onNotice, embedded = false, registerSave }: { onN
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存检查规则。'); return false; }
     finally { setBusy(false); }
   };
-  useEffect(() => { if (registerSave) registerSave(() => save(form, '', false)); }, [form, registerSave]);
+  useEffect(() => { if (registerDraft) registerDraft(form); }, [form, registerDraft]);
   return <section id={embedded ? undefined : 'rules'} className={`inspection-rules-page ${embedded ? 'embedded' : ''}`}>
     {embedded ? <div className="embedded-rule-toolbar"><div><span className="rule-kind">流程第 2、3 步</span><h3>归档补全</h3><p>同一条 MissAV 检查流程中，先从详情页补全发行日期，再按番号检索磁力链接。</p></div><div className="inspection-rule-actions"><button type="button" className="secondary" disabled={loading || busy} onClick={() => void save(freshDefaultInspectionRules(), '已恢复并保存 MissAV 默认规则。')}>恢复默认值</button><button type="button" className="primary" disabled={loading || busy} onClick={() => void save()}>{busy ? '保存中…' : '保存补全规则'}</button></div></div> : <div className="section-head"><div><h2>MissAV 检查规则</h2><p>网页内容、发行日期与磁力检索均按这里显示的条件执行。</p></div><div className="inspection-rule-actions"><button type="button" className="secondary" disabled={loading || busy} onClick={() => void save(freshDefaultInspectionRules(), '已恢复并保存 MissAV 默认规则。')}>恢复默认值</button><button type="button" className="primary" disabled={loading || busy} onClick={() => void save()}>{busy ? '保存中…' : '保存规则'}</button></div></div>}
     {error && <p className="form-error">{error}</p>}
@@ -1241,15 +1318,15 @@ function presetToForm(preset: SubscriptionPreset): PresetForm {
   return { name: preset.name, description: preset.description, selector: preset.selector, renderMode: preset.render_mode, contentSource: preset.content_source, attributeName: preset.attribute_name ?? '', matchPattern: preset.match_pattern ?? '', titleSelector: preset.title_selector ?? '', titleContentSource: preset.title_content_source ?? 'text', titleAttributeName: preset.title_attribute_name ?? '', titleMatchPattern: preset.title_match_pattern ?? '', resultMode: preset.result_mode, intervalMinutes: preset.interval_minutes, scheduleType: 'hourly', scheduleIntervalHours: Math.max(1, Math.round(preset.interval_minutes / 60)), scheduleTime: '09:00', scheduleWeekday: 1, isActive: Boolean(preset.is_active), paginationSelector: preset.pagination_selector ?? '', paginationParameter: preset.pagination_parameter ?? 'page', paginationMatchPattern: preset.pagination_match_pattern ?? '' };
 }
 
-function PresetManager({ presets, onClose, onChanged, embedded = false, registerSave }: { presets: SubscriptionPreset[]; onClose: () => void; onChanged: () => Promise<void>; embedded?: boolean; registerSave?: (save: RuleSave) => void }) {
+function PresetManager({ presets, onClose, onChanged, embedded = false, registerDraft }: { presets: SubscriptionPreset[]; onClose: () => void; onChanged: () => Promise<void>; embedded?: boolean; registerDraft?: (draft: MissavPresetDraft) => void }) {
   const [editing, setEditing] = useState<SubscriptionPreset | 'new' | null>(null);
   const [form, setForm] = useState<PresetForm>(blankPresetForm);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const update = <K extends keyof PresetForm>(key: K, value: PresetForm[K]) => setForm((old) => ({ ...old, [key]: value }));
-  const startEdit = (preset: SubscriptionPreset | 'new') => { setEditing(preset); setForm(preset === 'new' ? blankPresetForm : presetToForm(preset)); setError(''); };
+  const startEdit = (preset: SubscriptionPreset | 'new') => { setEditing(preset); setForm(preset === 'new' ? { ...(embedded ? defaultMissavPresetForm : blankPresetForm) } : presetToForm(preset)); setError(''); };
   useEffect(() => {
-    if (embedded && !editing && presets.length) startEdit(presets[0]);
+    if (embedded && !editing) startEdit(presets[0] ?? 'new');
   }, [embedded, editing, presets]);
   const save = async (): Promise<boolean> => {
     if (!editing) return false;
@@ -1260,7 +1337,9 @@ function PresetManager({ presets, onClose, onChanged, embedded = false, register
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存规则。'); return false; }
     finally { setBusy(false); }
   };
-  useEffect(() => { if (registerSave) registerSave(save); }, [editing, form, registerSave]);
+  useEffect(() => {
+    if (registerDraft && editing) registerDraft({ presetId: editing === 'new' ? null : editing.id, preset: form });
+  }, [editing, form, registerDraft]);
   const remove = async (preset: SubscriptionPreset) => {
     if (!window.confirm(`删除规则“${preset.name}”？`)) return;
     setBusy(true); setError('');

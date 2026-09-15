@@ -1,6 +1,6 @@
 import { captureSubscription, closeCaptureBrowser } from './capture.js';
-import { appendRuntimeLog, db, getSubscription, JOB_PRIORITY, queueJob, refreshSettings, reportWorkerHeartbeat, type Subscription, type WorkerTaskContext } from './db.js';
-import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription } from './retry.js';
+import { appendRuntimeLog, db, getSubscription, JOB_PRIORITY, queueJob, recordPerformanceMetric, refreshSettings, reportWorkerHeartbeat, type Subscription, type WorkerTaskContext } from './db.js';
+import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { notifyLive } from './live-events.js';
 
 const POLL_MS = 10_000;
@@ -70,6 +70,7 @@ async function runNextJob() {
   const started = await db.run("UPDATE jobs SET status = 'running', started_at = ?, retry_after = NULL WHERE id = ? AND status = 'queued'", [now, job.id]);
   if (!started.changes) return;
   let subscription: Subscription | undefined;
+  const startedAtMs = Date.now();
   try {
     subscription = await getSubscription(job.subscription_id);
     if (!subscription) throw new Error('订阅已删除。');
@@ -81,6 +82,7 @@ async function runNextJob() {
     await db.run("UPDATE jobs SET status = 'completed', finished_at = ? WHERE id = ?", [new Date().toISOString(), job.id]);
     const additions = result.addedCount ? `，新增 ${result.addedCount} 条内容` : '，没有新增内容';
     await appendRuntimeLog({ level: 'success', source: 'worker', subscriptionId: subscription.id, jobId: job.id, message: `${result.totalPages > 1 ? `全量检查完成，共读取 ${result.totalPages} 页` : '检查完成'}，提取 ${result.itemCount} 项${additions}。` });
+    await recordPerformanceMetric({ scope: 'capture', metric: 'processed', dimension: fullScan ? 'full_scan' : 'check', durationMs: Date.now() - startedAtMs }).catch(() => undefined);
     activeTask = null;
     notifyLive('archive', subscription.id);
     notifyLive('subscriptions');
@@ -96,9 +98,11 @@ async function runNextJob() {
     if (shouldRetry) {
       await db.run("UPDATE jobs SET status = 'queued', started_at = NULL, finished_at = NULL, error = ?, attempt_count = ?, retry_after = ? WHERE id = ?", [message, attempt, retryAt, job.id]);
       await appendRuntimeLog({ level: 'info', source: 'worker', subscriptionId: job.subscription_id, jobId: job.id, message: `检查暂时失败，${retryDescription(attempt)}：${message}` });
+      await recordPerformanceMetric({ scope: 'capture', metric: 'retry', dimension: retryReason(error) }).catch(() => undefined);
     } else {
       await db.run("UPDATE jobs SET status = 'failed', finished_at = ?, error = ?, attempt_count = ?, retry_after = NULL WHERE id = ?", [new Date().toISOString(), message, attempt, job.id]);
       await appendRuntimeLog({ level: 'error', source: 'worker', subscriptionId: job.subscription_id, jobId: job.id, message: `检查失败：${message}` });
+      await recordPerformanceMetric({ scope: 'capture', metric: 'processed', dimension: 'failed', durationMs: Date.now() - startedAtMs }).catch(() => undefined);
     }
     console.error(`Job ${job.id} failed: ${message}`);
     if (subscription) {

@@ -3,6 +3,7 @@ import mysql, { type Pool, type PoolConnection, type ResultSetHeader } from 'mys
 import { ensureMySqlSchema } from './mysql-schema.js';
 import { defaultInspectionRules, inspectionRulesJson } from './inspection-rules.js';
 import { notifyLive } from './live-events.js';
+import { decryptSecret, encryptSecret, isEncryptedSecret, readApplicationEncryptionKey } from './secret-storage.js';
 
 const host = process.env.MYSQL_HOST?.trim();
 const user = process.env.MYSQL_USER?.trim();
@@ -10,6 +11,8 @@ const password = process.env.MYSQL_PASSWORD;
 const database = process.env.MYSQL_DATABASE?.trim();
 const port = Number(process.env.MYSQL_PORT ?? 3306);
 const connectionLimit = Number(process.env.MYSQL_CONNECTION_LIMIT ?? 3);
+const applicationEncryptionKey = readApplicationEncryptionKey();
+const sensitiveSettingKeys = new Set(['jellyfin_api_key', 'qbit_api_key', 'qbit_password', 'app_auth_session_secret']);
 
 if (!host || !user || password === undefined || !database || !Number.isInteger(port) || port < 1 || port > 65535 || !Number.isInteger(connectionLimit) || connectionLimit < 1 || connectionLimit > 16) {
   throw new Error('MySQL 配置不完整。请设置 MYSQL_HOST、MYSQL_PORT、MYSQL_DATABASE、MYSQL_USER 和 MYSQL_PASSWORD。');
@@ -218,9 +221,18 @@ export function getSetting(key: string) {
   return settings.get(key) ?? '';
 }
 
+function storedSettingValue(key: string, value: string) {
+  return sensitiveSettingKeys.has(key) ? encryptSecret(value, applicationEncryptionKey) : value;
+}
+
+function readableSettingValue(key: string, value: string) {
+  return sensitiveSettingKeys.has(key) ? decryptSecret(value, applicationEncryptionKey) : value;
+}
+
 export async function setSetting(key: string, value: string) {
+  const stored = storedSettingValue(key, value);
   await db.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, ?, ?)
-    ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`, [key, value, new Date().toISOString()]);
+    ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`, [key, stored, new Date().toISOString()]);
   settings.set(key, value);
 }
 
@@ -232,10 +244,81 @@ export async function setSetting(key: string, value: string) {
 export async function refreshSettings(force = false) {
   if (!force && Date.now() - lastSettingsRefreshAt < SETTINGS_REFRESH_MS) return;
   const rows = await db.all<{ key: string; value: string }>('SELECT `key`, value FROM app_settings');
-  const next = new Map(rows.map((row) => [row.key, row.value]));
+  const next = new Map(rows.map((row) => [row.key, readableSettingValue(row.key, row.value)]));
   settings.clear();
   for (const [key, value] of next) settings.set(key, value);
   lastSettingsRefreshAt = Date.now();
+}
+
+/** Encrypt legacy plaintext credentials once, without changing their plaintext value in memory. */
+async function encryptLegacySensitiveSettings() {
+  const rows = await db.all<{ key: string; value: string }>('SELECT `key`, value FROM app_settings');
+  const legacy = rows.filter((row) => sensitiveSettingKeys.has(row.key) && !isEncryptedSecret(row.value));
+  // Validate ciphertext from prior launches before a worker starts using it.
+  for (const row of rows) if (sensitiveSettingKeys.has(row.key) && isEncryptedSecret(row.value)) readableSettingValue(row.key, row.value);
+  if (!legacy.length) return;
+  const now = new Date().toISOString();
+  await db.transaction(async (tx) => {
+    for (const row of legacy) {
+      const encrypted = storedSettingValue(row.key, row.value);
+      // More than one worker can start at once; this condition makes the
+      // migration idempotent even if each observed the same plaintext row.
+      await tx.run('UPDATE app_settings SET value = ?, updated_at = ? WHERE `key` = ? AND value = ?', [encrypted, now, row.key, row.value]);
+    }
+  });
+}
+
+export type PerformanceMetricInput = {
+  scope: 'capture' | 'release' | 'magnet' | 'library' | 'download';
+  metric: 'processed' | 'retry' | 'jellyfin_cache' | 'chromium_rebuild';
+  dimension?: string;
+  durationMs?: number;
+  count?: number;
+};
+
+function metricBucketStart(date = new Date()) {
+  date.setUTCSeconds(0, 0);
+  return date.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+/** Persist only aggregate operational counters; never call this with user content or raw errors. */
+export async function recordPerformanceMetric(input: PerformanceMetricInput) {
+  const dimension = (input.dimension ?? 'all').slice(0, 64) || 'all';
+  const count = Math.max(1, Math.floor(input.count ?? 1));
+  const duration = Math.max(0, Math.floor(input.durationMs ?? 0));
+  await db.run(`INSERT INTO performance_metrics (granularity, bucket_start, scope, metric, dimension, sample_count, duration_ms)
+    VALUES ('minute', ?, ?, ?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE sample_count = sample_count + VALUES(sample_count), duration_ms = duration_ms + VALUES(duration_ms)`,
+  [metricBucketStart(), input.scope, input.metric, dimension, count, duration]);
+  notifyLive('metrics');
+}
+
+/** Compact old minute buckets to hourly totals, then expire long-lived telemetry. */
+export async function maintainPerformanceMetrics() {
+  // Keep aggregation and source deletion atomic. If the process stops in the
+  // middle, no hourly bucket is double-counted on the next daily maintenance.
+  await db.transaction(async (tx) => {
+    await tx.run(`INSERT INTO performance_metrics (granularity, bucket_start, scope, metric, dimension, sample_count, duration_ms)
+      SELECT 'hour', DATE_FORMAT(bucket_start, '%Y-%m-%d %H:00:00'), scope, metric, dimension, SUM(sample_count), SUM(duration_ms)
+      FROM performance_metrics
+      WHERE granularity = 'minute' AND bucket_start < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 30 DAY)
+      GROUP BY DATE_FORMAT(bucket_start, '%Y-%m-%d %H:00:00'), scope, metric, dimension
+      ON DUPLICATE KEY UPDATE sample_count = sample_count + VALUES(sample_count), duration_ms = duration_ms + VALUES(duration_ms)`);
+    await tx.run("DELETE FROM performance_metrics WHERE granularity = 'minute' AND bucket_start < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 30 DAY)");
+    await tx.run("DELETE FROM performance_metrics WHERE granularity = 'hour' AND bucket_start < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 180 DAY)");
+  });
+}
+
+export type IntegrationService = 'jellyfin' | 'qbittorrent';
+export async function reportIntegrationStatus(service: IntegrationService, status: 'healthy' | 'degraded' | 'disabled', detail: string | null = null) {
+  await db.run(`INSERT INTO integration_status (service_name, status, detail, checked_at) VALUES (?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE status = VALUES(status), detail = VALUES(detail), checked_at = VALUES(checked_at)`,
+  [service, status, detail?.slice(0, 255) ?? null, new Date().toISOString()]);
+  notifyLive('tasks');
+}
+
+export async function getIntegrationStatuses() {
+  return db.all<{ service_name: IntegrationService; status: 'healthy' | 'degraded' | 'disabled'; detail: string | null; checked_at: string }>('SELECT service_name, status, detail, checked_at FROM integration_status');
 }
 
 export function getOutboundProxyUrl() {
@@ -358,6 +441,7 @@ async function seedDefaultInspectionRules() {
 }
 
 await ensureMySqlSchema(pool);
+await encryptLegacySensitiveSettings();
 await preloadSettings();
 await seedDefaultSubscriptionPresets();
 await backfillMissavPaginationDefaults();

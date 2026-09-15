@@ -212,6 +212,32 @@ export async function ensureMySqlSchema(pool: Pool) {
     PRIMARY KEY (worker_name)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 
+  // Compact, aggregate-only operational telemetry. No task payloads, URLs,
+  // credentials or raw external errors are kept in these long-lived rows.
+  await pool.query(`CREATE TABLE IF NOT EXISTS performance_metrics (
+    granularity VARCHAR(8) NOT NULL,
+    bucket_start DATETIME NOT NULL,
+    scope VARCHAR(32) NOT NULL,
+    metric VARCHAR(64) NOT NULL,
+    dimension VARCHAR(64) NOT NULL DEFAULT 'all',
+    sample_count BIGINT NOT NULL DEFAULT 0,
+    duration_ms BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (granularity, bucket_start, scope, metric, dimension),
+    KEY idx_performance_metrics_range (granularity, bucket_start),
+    KEY idx_performance_metrics_metric (metric, bucket_start)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+
+  // External services never determine Docker readiness, but their most recent
+  // safe-to-display status lets the UI distinguish a disabled integration from
+  // a configured service that has recently failed.
+  await pool.query(`CREATE TABLE IF NOT EXISTS integration_status (
+    service_name VARCHAR(32) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    detail VARCHAR(255) NULL,
+    checked_at VARCHAR(40) NOT NULL,
+    PRIMARY KEY (service_name)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+
   // A full scan is deliberately invisible until every page has succeeded.
   // These rows are its durable checkpoint, so a retried job can continue at
   // the next page without re-reading completed pages.

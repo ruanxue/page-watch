@@ -1,6 +1,6 @@
-import { appendRuntimeLog, db, queueReleaseJob, refreshSettings, reportWorkerHeartbeat, type WorkerTaskContext } from './db.js';
+import { appendRuntimeLog, db, queueReleaseJob, recordPerformanceMetric, refreshSettings, reportWorkerHeartbeat, type WorkerTaskContext } from './db.js';
 import { lookupReleaseDate, ReleaseDateBrowserSession } from './release-date.js';
-import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription } from './retry.js';
+import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
 import { notifyLive } from './live-events.js';
 
@@ -67,6 +67,7 @@ async function runNextReleaseJob() {
   if (!job) return;
   const started = await db.run("UPDATE release_jobs SET status = 'running', started_at = ?, retry_after = NULL WHERE id = ? AND status = 'queued'", [new Date().toISOString(), job.id]);
   if (!started.changes) return;
+  const startedAtMs = Date.now();
   activeTask = { kind: 'release', subscriptionId: job.subscription_id, archiveEntryId: job.archive_entry_id, content: job.content, label: '正在读取发行日期详情页' };
   await heartbeat();
 
@@ -96,6 +97,7 @@ async function runNextReleaseJob() {
       await tx.run("UPDATE release_jobs SET status = 'completed', finished_at = ?, error = NULL, retry_after = NULL WHERE id = ?", [finishedAt, job.id]);
     });
     await logProgress(job.subscription_id);
+    await recordPerformanceMetric({ scope: 'release', metric: 'processed', dimension: result.status, durationMs: Date.now() - startedAtMs }).catch(() => undefined);
     activeTask = null;
     notifyLive('archive', job.subscription_id);
     notifyLive('subscriptions');
@@ -115,6 +117,7 @@ async function runNextReleaseJob() {
       }
     });
     await appendRuntimeLog({ level: shouldRetry ? 'info' : 'error', source: 'worker', subscriptionId: job.subscription_id, message: shouldRetry ? `发行日期读取“${job.content}”暂时失败，${retryDescription(attempt)}：${message}` : `发行日期读取“${job.content}”失败：${message}` });
+    await recordPerformanceMetric({ scope: 'release', metric: shouldRetry ? 'retry' : 'processed', dimension: shouldRetry ? retryReason(error) : 'failed', durationMs: shouldRetry ? 0 : Date.now() - startedAtMs }).catch(() => undefined);
     await logProgress(job.subscription_id);
     console.error(`Release-date job ${job.id} failed: ${message}`);
     notifyLive('archive', job.subscription_id);

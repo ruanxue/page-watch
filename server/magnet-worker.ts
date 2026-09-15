@@ -1,6 +1,6 @@
-import { appendRuntimeLog, db, getQbittorrentSettings, queueDownloadJob, refreshSettings, reportWorkerHeartbeat, type WorkerTaskContext } from './db.js';
+import { appendRuntimeLog, db, getQbittorrentSettings, queueDownloadJob, recordPerformanceMetric, refreshSettings, reportWorkerHeartbeat, type WorkerTaskContext } from './db.js';
 import { lookupMagnet } from './magnet.js';
-import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription } from './retry.js';
+import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { getInspectionRules } from './inspection-rules.js';
 import { notifyLive } from './live-events.js';
 
@@ -38,6 +38,7 @@ async function runNextMagnetJob() {
 
   const started = await db.run("UPDATE magnet_jobs SET status = 'running', started_at = ?, retry_after = NULL WHERE id = ? AND status = 'queued'", [new Date().toISOString(), job.id]);
   if (!started.changes) return;
+  const startedAtMs = Date.now();
   activeTask = { kind: 'magnet', subscriptionId: job.subscription_id, archiveEntryId: job.archive_entry_id, content: job.content, label: '正在检索磁力链接' };
   await heartbeat();
 
@@ -79,6 +80,7 @@ async function runNextMagnetJob() {
       await appendRuntimeLog({ level: 'info', source: 'queue', subscriptionId: job.subscription_id, message: `已将“${job.content}”加入 qBittorrent 下载队列。` });
     }
     await logProgress(job.subscription_id);
+    await recordPerformanceMetric({ scope: 'magnet', metric: 'processed', dimension: result.status, durationMs: Date.now() - startedAtMs }).catch(() => undefined);
     activeTask = null;
     notifyLive('archive', job.subscription_id);
     notifyLive('subscriptions');
@@ -98,6 +100,7 @@ async function runNextMagnetJob() {
       }
     });
     await appendRuntimeLog({ level: shouldRetry ? 'info' : 'error', source: 'worker', subscriptionId: job.subscription_id, message: shouldRetry ? `磁力检索“${job.content}”暂时失败，${retryDescription(attempt)}：${message}` : `磁力检索“${job.content}”失败：${message}` });
+    await recordPerformanceMetric({ scope: 'magnet', metric: shouldRetry ? 'retry' : 'processed', dimension: shouldRetry ? retryReason(error) : 'failed', durationMs: shouldRetry ? 0 : Date.now() - startedAtMs }).catch(() => undefined);
     await logProgress(job.subscription_id);
     console.error(`Magnet job ${job.id} failed: ${message}`);
     notifyLive('archive', job.subscription_id);

@@ -3,7 +3,7 @@ import * as cheerio from 'cheerio';
 import { chromium, type Browser } from 'playwright';
 import { ProxyAgent } from 'undici';
 import { assertSafeUrl } from './capture.js';
-import { getOutboundProxyUrl } from './db.js';
+import { getOutboundProxyUrl, recordPerformanceMetric } from './db.js';
 import { describeError } from './error-details.js';
 import type { ReleaseDateRule } from './inspection-rules.js';
 import { missavBackupUrl, missavFallbackFailure, shouldTryMissavBackup } from './site-fallback.js';
@@ -153,8 +153,9 @@ export class ReleaseDateBrowserSession {
   private openedAt = 0;
   private pageCount = 0;
 
-  async close() {
+  async close(reason?: 'disconnected' | 'proxy_changed' | 'page_limit' | 'age_limit' | 'error') {
     const browser = this.browser;
+    if (browser && reason) void recordPerformanceMetric({ scope: 'release', metric: 'chromium_rebuild', dimension: reason }).catch(() => undefined);
     this.browser = null;
     this.proxyUrl = null;
     this.pageCount = 0;
@@ -164,9 +165,10 @@ export class ReleaseDateBrowserSession {
 
   private async ensureBrowser() {
     const proxyUrl = getOutboundProxyUrl() || null;
-    const stale = !this.browser || !this.browser.isConnected() || this.proxyUrl !== proxyUrl || this.pageCount >= 25 || Date.now() - this.openedAt >= 15 * 60_000;
+    const reason = !this.browser ? null : !this.browser.isConnected() ? 'disconnected' : this.proxyUrl !== proxyUrl ? 'proxy_changed' : this.pageCount >= 25 ? 'page_limit' : Date.now() - this.openedAt >= 15 * 60_000 ? 'age_limit' : null;
+    const stale = !this.browser || Boolean(reason);
     if (!stale) return this.browser!;
-    await this.close();
+    await this.close(reason ?? undefined);
     const executablePath = localBrowserExecutable();
     this.browser = await chromium.launch({
       headless: process.env.PLAYWRIGHT_HEADLESS !== 'false',
@@ -209,7 +211,7 @@ export class ReleaseDateBrowserSession {
       return await page.content();
     } catch (error) {
       // A timeout/disconnect must not poison later tasks in the reusable browser.
-      await this.close();
+      await this.close('error');
       if (error instanceof Error && /timeout/i.test(error.message)) throw new Error(describeError(error, { action: '发行日期详情页浏览器读取', target: url.hostname, proxyUrl }));
       throw new Error(describeError(error, { action: '发行日期详情页浏览器读取', target: url.hostname, proxyUrl }));
     } finally { await context?.close().catch(() => undefined); }

@@ -6,7 +6,7 @@ import net from 'node:net';
 import * as cheerio from 'cheerio';
 import { chromium, type Browser } from 'playwright';
 import { ProxyAgent } from 'undici';
-import { db, getJellyfinSettings, getOutboundProxyUrl, queueLibraryJob, queueMagnetJob, queueReleaseJob, type DatabaseClient, type Subscription } from './db.js';
+import { db, getJellyfinSettings, getOutboundProxyUrl, queueLibraryJob, queueMagnetJob, queueReleaseJob, recordPerformanceMetric, type DatabaseClient, type Subscription } from './db.js';
 import { describeError } from './error-details.js';
 import { expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
 import { missavBackupUrl, missavFallbackFailure, shouldTryMissavBackup } from './site-fallback.js';
@@ -202,17 +202,19 @@ class CaptureBrowserSession {
   private openedAt = 0;
   private pages = 0;
 
-  async close() {
+  async close(reason?: 'disconnected' | 'proxy_changed' | 'page_limit' | 'age_limit' | 'error') {
     const browser = this.browser;
+    if (browser && reason) void recordPerformanceMetric({ scope: 'capture', metric: 'chromium_rebuild', dimension: reason }).catch(() => undefined);
     this.browser = null; this.proxyUrl = null; this.openedAt = 0; this.pages = 0;
     await browser?.close().catch(() => undefined);
   }
 
   async getBrowser() {
     const proxyUrl = getOutboundProxyUrl() || null;
-    const renew = !this.browser || !this.browser.isConnected() || this.proxyUrl !== proxyUrl || this.pages >= 25 || Date.now() - this.openedAt >= 15 * 60_000;
+    const reason = !this.browser ? null : !this.browser.isConnected() ? 'disconnected' : this.proxyUrl !== proxyUrl ? 'proxy_changed' : this.pages >= 25 ? 'page_limit' : Date.now() - this.openedAt >= 15 * 60_000 ? 'age_limit' : null;
+    const renew = !this.browser || Boolean(reason);
     if (!renew) return this.browser!;
-    await this.close();
+    await this.close(reason ?? undefined);
     const executablePath = localBrowserExecutable();
     this.browser = await chromium.launch({ headless: process.env.PLAYWRIGHT_HEADLESS !== 'false', ...(executablePath ? { executablePath } : {}), ...(proxyUrl ? { proxy: { server: proxyUrl } } : {}) });
     this.proxyUrl = proxyUrl; this.openedAt = Date.now();
@@ -249,7 +251,7 @@ async function getDynamic(url: URL, selector: string, contentSource: Subscriptio
     captureBrowser.used();
     return { title: normalize(await page.title()) || url.hostname, content, hash: hash(content), items, ...(pageCountSelector ? { pageCount: pageCount(countText ?? '', pageCountPattern ?? null) } : {}) };
   } catch (error) {
-    await captureBrowser.close();
+    await captureBrowser.close('error');
     throw error;
   } finally {
     await context?.close().catch(() => undefined);

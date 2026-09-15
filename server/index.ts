@@ -3,7 +3,7 @@ import type { ServerResponse } from 'node:http';
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
 import { assertSafeUrl, previewCapture } from './capture.js';
-import { appendRuntimeLog, db, getJellyfinSettings, getOutboundProxyUrl, getQbittorrentSettings, getSetting, getSubscription, JOB_PRIORITY, queueDownloadJob, queueJob, queueMagnetJob, queueReleaseJob, reportWorkerHeartbeat, setSetting, type Subscription } from './db.js';
+import { appendRuntimeLog, db, getIntegrationStatuses, getJellyfinSettings, getOutboundProxyUrl, getQbittorrentSettings, getSetting, getSubscription, JOB_PRIORITY, maintainPerformanceMetrics, queueDownloadJob, queueJob, queueMagnetJob, queueReleaseJob, recordPerformanceMetric, refreshSettings, reportIntegrationStatus, reportWorkerHeartbeat, setSetting, type IntegrationService, type Subscription } from './db.js';
 import { assertQbittorrentConfig, normalizeQbittorrentUrl, testQbittorrentConnection } from './qbittorrent.js';
 import { assertJellyfinConfig, listJellyfinLibraries, normalizeJellyfinUrl, testJellyfinConnection } from './jellyfin.js';
 import { syncJellyfinLibrary } from './jellyfin-sync.js';
@@ -16,7 +16,7 @@ const port = Number(process.env.PORT ?? 3030);
 const loginFailures = new Map<string, { count: number; firstAt: number; lockedUntil: number }>();
 const loginWindowMs = 10 * 60_000;
 const loginLimit = 7;
-type LiveChannel = 'archive' | 'logs' | 'subscriptions' | 'tasks';
+type LiveChannel = 'archive' | 'logs' | 'subscriptions' | 'tasks' | 'metrics';
 type LiveClient = { response: ServerResponse; channel: LiveChannel; subscriptionId: number | null; needsSnapshot: boolean };
 const liveClients = new Set<LiveClient>();
 const archiveVersions = new Map<number, string>();
@@ -132,7 +132,7 @@ livePollTimer.unref();
 
 app.addHook('onRequest', async (request, reply) => {
   const requestPath = authPath(request.url);
-  if (!requestPath.startsWith('/api/') || requestPath === '/api/health' || requestPath.startsWith('/api/auth/') || requestPath === '/api/internal/events') return;
+  if (!requestPath.startsWith('/api/') || requestPath === '/api/health' || requestPath === '/api/ready' || requestPath.startsWith('/api/auth/') || requestPath.startsWith('/api/internal/events')) return;
   const status = await statusFor(request.headers.cookie);
   if (!status.configured) return reply.code(503).send({ error: '请先在网页中设置访问密码，再使用 Page Watch。' });
   if (!status.authenticated) return reply.code(401).send({ error: '登录已失效，请重新登录。' });
@@ -163,6 +163,7 @@ type SubscriptionPayload = {
 };
 
 type SubscriptionPresetPayload = Omit<SubscriptionPayload, 'url'> & { description?: string };
+type MissavRulesPayload = { presetId?: number; preset?: SubscriptionPresetPayload; inspectionRules?: unknown };
 type QbittorrentSettingsPayload = {
   enabled?: boolean;
   url?: string;
@@ -307,7 +308,7 @@ app.post('/api/internal/events', async (request, reply) => {
   const token = process.env.WORKER_EVENT_TOKEN;
   if (!token || request.headers['x-page-watch-worker-token'] !== token) return reply.code(403).send({ error: '内部事件令牌无效。' });
   const body = request.body as { channel?: unknown; subscriptionId?: unknown };
-  if (body.channel !== 'logs' && body.channel !== 'subscriptions' && body.channel !== 'archive' && body.channel !== 'tasks') return reply.code(400).send({ error: '内部事件类型无效。' });
+  if (body.channel !== 'logs' && body.channel !== 'subscriptions' && body.channel !== 'archive' && body.channel !== 'tasks' && body.channel !== 'metrics') return reply.code(400).send({ error: '内部事件类型无效。' });
   const subscriptionId = Number(body.subscriptionId);
   if (body.channel === 'archive' && (!Number.isInteger(subscriptionId) || subscriptionId < 1)) return reply.code(400).send({ error: '归档事件缺少订阅标识。' });
   emitLive(body.channel, body.channel === 'archive' ? subscriptionId : undefined);
@@ -316,7 +317,7 @@ app.post('/api/internal/events', async (request, reply) => {
 });
 app.get('/api/events', async (request, reply) => {
   const query = request.query as { channel?: string; subscriptionId?: string };
-  const channel: LiveChannel | null = query.channel === 'archive' || query.channel === 'logs' || query.channel === 'subscriptions' || query.channel === 'tasks' ? query.channel : null;
+  const channel: LiveChannel | null = query.channel === 'archive' || query.channel === 'logs' || query.channel === 'subscriptions' || query.channel === 'tasks' || query.channel === 'metrics' ? query.channel : null;
   const subscriptionId = Number(query.subscriptionId);
   if (!channel || (channel === 'archive' && (!Number.isInteger(subscriptionId) || subscriptionId < 1))) {
     return reply.code(400).send({ error: '实时订阅参数无效。' });
@@ -404,9 +405,54 @@ async function getSystemStatus() {
   return { generatedAt: new Date().toISOString(), services, heartbeats: rows };
 }
 
+type ExternalIntegrationStatus = { name: IntegrationService; enabled: boolean; configured: boolean; status: 'healthy' | 'degraded' | 'disabled' | 'unknown'; detail: string | null; checkedAt: string | null };
+
+function summarizeExternalIntegrations(integrations: Awaited<ReturnType<typeof getIntegrationStatuses>>): ExternalIntegrationStatus[] {
+  const integrationByName = new Map(integrations.map((item) => [item.service_name, item]));
+  const jellyfin = getJellyfinSettings();
+  const qbittorrent = getQbittorrentSettings();
+  const configured = {
+    jellyfin: Boolean(jellyfin.url && jellyfin.apiKey && jellyfin.libraryIds.length),
+    qbittorrent: Boolean(qbittorrent.url && (qbittorrent.authMode === 'api_key' ? qbittorrent.apiKey : qbittorrent.username && qbittorrent.password))
+  };
+  return (['jellyfin', 'qbittorrent'] as const).map((name) => {
+    const latest = integrationByName.get(name);
+    const enabled = name === 'jellyfin' ? jellyfin.enabled : qbittorrent.enabled;
+    return { name, enabled, configured: configured[name], status: !enabled ? 'disabled' : latest?.status ?? 'unknown', detail: latest?.detail ?? null, checkedAt: latest?.checked_at ?? null };
+  });
+}
+
+async function readinessStatus() {
+  // Keep this intentionally local: a NAS must not restart Page Watch merely
+  // because a separately managed Jellyfin/qBittorrent service is offline.
+  await Promise.all([
+    db.get<{ ok: number }>('SELECT 1 AS ok'),
+    db.get<{ ok: number }>('SELECT 1 AS ok FROM app_settings LIMIT 1'),
+    db.get<{ ok: number }>('SELECT 1 AS ok FROM worker_heartbeats LIMIT 1'),
+    db.get<{ ok: number }>('SELECT 1 AS ok FROM performance_metrics LIMIT 1')
+  ]);
+  const [{ generatedAt, services }, integrations] = await Promise.all([getSystemStatus(), getIntegrationStatuses()]);
+  const external = summarizeExternalIntegrations(integrations);
+  const unavailable = services.filter((service) => !service.healthy).map((service) => service.label);
+  // This endpoint is deliberately unauthenticated for Docker. Do not expose
+  // raw worker errors or task context here; the authenticated run centre has
+  // the detailed diagnostics.
+  const safeServices = services.map(({ name, label, status, lastSeenAt, healthy }) => ({ name, label, status, lastSeenAt, healthy }));
+  return { ok: unavailable.length === 0, generatedAt, database: 'ready', services: safeServices, external, unavailable };
+}
+
+app.get('/api/ready', async (_request, reply) => {
+  try {
+    const status = await readinessStatus();
+    return reply.code(status.ok ? 200 : 503).send(status);
+  } catch {
+    return reply.code(503).send({ ok: false, database: 'unavailable', unavailable: ['MySQL'], services: [], external: [] });
+  }
+});
+
 app.get('/api/system/status', async () => {
-  const { generatedAt, services } = await getSystemStatus();
-  return { generatedAt, services };
+  const [{ generatedAt, services }, integrations] = await Promise.all([getSystemStatus(), getIntegrationStatuses()]);
+  return { generatedAt, services, external: summarizeExternalIntegrations(integrations) };
 });
 
 type TaskQueueRow = {
@@ -467,7 +513,7 @@ app.get('/api/tasks', async (request) => {
   // The overview only needs a compact history. The operations drill-down asks
   // for more so each service can retain a useful recent history of its own.
   const historyLimit = Number.isInteger(requestedHistoryLimit) ? Math.min(Math.max(requestedHistoryLimit, 1), 300) : 50;
-  const [{ generatedAt, services, heartbeats }, activeRows, historyRows, progressRows, activeDownloads] = await Promise.all([
+  const [{ generatedAt, services, heartbeats }, activeRows, historyRows, progressRows, activeDownloads, integrations] = await Promise.all([
     getSystemStatus(),
     db.all<TaskQueueRow>(`SELECT * FROM (${taskQueueUnion}) AS queue_tasks WHERE status IN ('queued', 'running')`),
     db.all<TaskQueueRow>(`SELECT * FROM (${taskQueueUnion}) AS queue_tasks WHERE status IN ('completed', 'failed') ORDER BY finished_at DESC, task_id DESC LIMIT ?`, [historyLimit]),
@@ -479,7 +525,8 @@ app.get('/api/tasks', async (request) => {
     db.all<ActiveDownloadRow>(`SELECT a.id, a.subscription_id, s.name AS subscription_name, a.content, a.title, a.download_status, a.download_progress,
       a.download_queued_at, a.download_added_at, a.download_error
       FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
-      WHERE a.download_status IN ('queued', 'running', 'added', 'waiting', 'downloading', 'paused')`)
+      WHERE a.download_status IN ('queued', 'running', 'added', 'waiting', 'downloading', 'paused')`),
+    getIntegrationStatuses()
   ]);
   const progressBySubscription = new Map(progressRows.map((row) => [Number(row.subscription_id), row]));
   const serialize = (row: TaskQueueRow) => {
@@ -535,11 +582,53 @@ app.get('/api/tasks', async (request) => {
       failed: history.filter((task) => task.status === 'failed').length
     },
     services,
+    integrations: summarizeExternalIntegrations(integrations),
     active,
     history
   };
 });
 app.get('/api/subscriptions', async () => await listSubscriptions());
+
+type PerformanceSummaryRow = { scope: string; metric: string; dimension: string; sample_count: number; duration_ms: number };
+type ThroughputRow = { bucket_start: string; scope: string; sample_count: number };
+
+app.get('/api/metrics', async (request, reply) => {
+  const range = (request.query as { range?: string }).range;
+  const hoursByRange: Record<string, number> = { '24h': 24, '7d': 7 * 24, '30d': 30 * 24, '180d': 180 * 24 };
+  if (!range || !(range in hoursByRange)) return reply.code(400).send({ error: '指标时间范围无效。' });
+  const now = Date.now();
+  const rangeStart = new Date(now - hoursByRange[range] * 60 * 60_000).toISOString().slice(0, 19).replace('T', ' ');
+  const minuteStart = new Date(Math.max(now - 30 * 24 * 60 * 60_000, now - hoursByRange[range] * 60 * 60_000)).toISOString().slice(0, 19).replace('T', ' ');
+  const [summaryRows, throughput] = await Promise.all([
+    db.all<PerformanceSummaryRow>(`SELECT scope, metric, dimension, SUM(sample_count) AS sample_count, SUM(duration_ms) AS duration_ms
+      FROM performance_metrics
+      WHERE (granularity = 'hour' AND bucket_start >= ?) OR (granularity = 'minute' AND bucket_start >= ?)
+      GROUP BY scope, metric, dimension`, [rangeStart, minuteStart]),
+    db.all<ThroughputRow>(`SELECT DATE_FORMAT(bucket_start, '%Y-%m-%d %H:%i:00') AS bucket_start, scope, SUM(sample_count) AS sample_count
+      FROM performance_metrics
+      WHERE granularity = 'minute' AND metric = 'processed' AND bucket_start >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 60 MINUTE)
+      GROUP BY DATE_FORMAT(bucket_start, '%Y-%m-%d %H:%i:00'), scope
+      ORDER BY bucket_start ASC, scope ASC`)
+  ]);
+  const metric = (scope: string, name: string, dimension?: string) => summaryRows
+    .filter((row) => row.scope === scope && row.metric === name && (dimension === undefined || row.dimension === dimension))
+    .reduce((total, row) => ({ count: total.count + Number(row.sample_count), durationMs: total.durationMs + Number(row.duration_ms) }), { count: 0, durationMs: 0 });
+  const jellyfinHit = metric('library', 'jellyfin_cache', 'hit').count;
+  const jellyfinMiss = metric('library', 'jellyfin_cache', 'miss').count;
+  const scopes = ['capture', 'release', 'magnet', 'library', 'download'];
+  return {
+    range,
+    generatedAt: new Date().toISOString(),
+    jellyfinCache: { hit: jellyfinHit, miss: jellyfinMiss, hitRate: jellyfinHit + jellyfinMiss ? jellyfinHit / (jellyfinHit + jellyfinMiss) : null },
+    workers: scopes.map((scope) => {
+      const result = metric(scope, 'processed');
+      return { scope, processed: result.count, averageDurationMs: result.count ? Math.round(result.durationMs / result.count) : null };
+    }),
+    retries: summaryRows.filter((row) => row.metric === 'retry').map((row) => ({ scope: row.scope, reason: row.dimension, count: Number(row.sample_count) })),
+    chromiumRebuilds: summaryRows.filter((row) => row.metric === 'chromium_rebuild').map((row) => ({ scope: row.scope, reason: row.dimension, count: Number(row.sample_count) })),
+    throughput: throughput.map((row) => ({ minute: `${row.bucket_start.replace(' ', 'T')}Z`, scope: row.scope, count: Number(row.sample_count) }))
+  };
+});
 
 type RuntimeLogScope = 'system' | 'check' | 'release' | 'magnet' | 'download' | 'library';
 type RuntimeLogRow = {
@@ -632,6 +721,47 @@ app.put('/api/inspection-rules', async (request, reply) => {
     await appendRuntimeLog({ level: 'success', source: 'system', message: '检查规则已更新；后续归档会按新规则执行。' });
     return rules;
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '检查规则无法保存。' }); }
+});
+app.put('/api/rules/missav', async (request, reply) => {
+  try {
+    const payload = request.body as MissavRulesPayload;
+    // Validate both documents before opening the write transaction. This keeps
+    // malformed companion rules from ever partially updating the preset.
+    const preset = normalizePresetPayload(payload.preset ?? {} as SubscriptionPresetPayload);
+    const rules = normalizeInspectionRules(payload.inspectionRules);
+    const requestedId = Number(payload.presetId);
+    const now = new Date().toISOString();
+    const presetId = await db.transaction(async (tx) => {
+      const existing = Number.isInteger(requestedId) && requestedId > 0
+        ? await tx.get<{ id: number }>('SELECT id FROM subscription_presets WHERE id = ?', [requestedId])
+        : await tx.get<{ id: number }>("SELECT id FROM subscription_presets WHERE name = 'MissAV 番号列表' ORDER BY id ASC LIMIT 1");
+      let id: number;
+      if (existing) {
+        id = existing.id;
+        await tx.run(`UPDATE subscription_presets SET name=?, description=?, selector=?, render_mode=?, content_source=?, attribute_name=?, match_pattern=?, title_selector=?, title_content_source=?, title_attribute_name=?, title_match_pattern=?, result_mode=?, interval_minutes=?, pagination_selector=?, pagination_parameter=?, pagination_match_pattern=?, is_active=?, updated_at=? WHERE id=?`,
+          [preset.name, preset.description, preset.selector, preset.renderMode, preset.contentSource, preset.attributeName, preset.matchPattern, preset.titleSelector, preset.titleContentSource, preset.titleAttributeName, preset.titleMatchPattern, preset.resultMode, preset.interval, preset.paginationSelector, preset.paginationParameter, preset.paginationMatchPattern, preset.isActive, now, id]);
+      } else {
+        const inserted = await tx.run(`INSERT INTO subscription_presets (name, description, selector, render_mode, content_source, attribute_name, match_pattern, title_selector, title_content_source, title_attribute_name, title_match_pattern, result_mode, interval_minutes, pagination_selector, pagination_parameter, pagination_match_pattern, is_active, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [preset.name, preset.description, preset.selector, preset.renderMode, preset.contentSource, preset.attributeName, preset.matchPattern, preset.titleSelector, preset.titleContentSource, preset.titleAttributeName, preset.titleMatchPattern, preset.resultMode, preset.interval, preset.paginationSelector, preset.paginationParameter, preset.paginationMatchPattern, preset.isActive, now, now]);
+        id = inserted.lastInsertRowid;
+      }
+      await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES ('inspection_rules', ?, ?)
+        ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`, [inspectionRulesJson(rules), now]);
+      if (!rules.releaseDate.enabled) {
+        await tx.run("UPDATE release_jobs SET status = 'completed', finished_at = ?, error = '发行日期规则已停用' WHERE status = 'queued'", [now]);
+        await tx.run("UPDATE archive_entries SET release_status = 'unsearched', release_error = NULL, updated_at = ? WHERE release_status = 'pending'", [now]);
+      }
+      if (!rules.magnet.enabled) {
+        await tx.run("UPDATE magnet_jobs SET status = 'completed', finished_at = ?, error = '磁力检索规则已停用' WHERE status = 'queued'", [now]);
+        await tx.run("UPDATE archive_entries SET magnet_status = 'unsearched', magnet_error = NULL, updated_at = ? WHERE magnet_status = 'pending'", [now]);
+      }
+      return id;
+    });
+    await refreshSettings(true);
+    await appendRuntimeLog({ level: 'success', source: 'system', message: 'MissAV 检查规则已原子更新；后续任务会按新规则执行。' });
+    return { preset: await db.get('SELECT * FROM subscription_presets WHERE id = ?', [presetId]), inspectionRules: rules };
+  } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : 'MissAV 检查规则无法保存。' }); }
 });
 app.get('/api/archive', async (request) => {
   const query = request.query as { subscriptionId?: string; page?: string; pageSize?: string; q?: string; releaseFrom?: string; releaseTo?: string };
@@ -956,6 +1086,7 @@ app.put('/api/settings/qbittorrent', async (request, reply) => {
       setSetting('qbit_auto_download_min_size_mb', String(settings.autoDownloadMinSizeMb)),
       setSetting('qbit_stop_after_download', settings.stopAfterDownload ? '1' : '0')
     ]);
+    if (!settings.enabled) await reportIntegrationStatus('qbittorrent', 'disabled', 'qBittorrent 已在 Page Watch 中停用');
     return publicQbittorrentSettings();
   } catch (error) {
     return reply.code(400).send({ error: error instanceof Error ? error.message : '无法保存 qBittorrent 设置。' });
@@ -966,10 +1097,12 @@ app.post('/api/settings/qbittorrent/test', async (_request, reply) => {
   try {
     const settings = getQbittorrentSettings();
     await testQbittorrentConnection(settings);
+    await reportIntegrationStatus('qbittorrent', 'healthy', '连接测试成功');
     await appendRuntimeLog({ level: 'success', source: 'download', message: `qBittorrent 连接测试成功（${normalizeQbittorrentUrl(settings.url)}）。` });
     return { ok: true };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'qBittorrent 连接测试失败。';
+    await reportIntegrationStatus('qbittorrent', 'degraded', '最近一次连接测试失败').catch(() => undefined);
     await appendRuntimeLog({ level: 'error', source: 'download', message: `qBittorrent 连接测试失败：${message}` });
     return reply.code(400).send({ error: message });
   }
@@ -993,6 +1126,7 @@ app.put('/api/settings/jellyfin', async (request, reply) => {
     await clearJellyfinMediaIndex();
     await db.run(`UPDATE archive_entries SET jellyfin_status = ?, jellyfin_item_id = NULL, jellyfin_item_name = NULL,
       jellyfin_matched_at = NULL, jellyfin_error = NULL, updated_at = ?`, [settings.enabled && settings.libraryIds.length ? 'pending' : 'unconfigured', now]);
+    if (!settings.enabled) await reportIntegrationStatus('jellyfin', 'disabled', 'Jellyfin 已在 Page Watch 中停用');
     return publicJellyfinSettings();
   } catch (error) {
     return reply.code(400).send({ error: error instanceof Error ? error.message : '无法保存 Jellyfin 设置。' });
@@ -1003,21 +1137,27 @@ app.post('/api/settings/jellyfin/test', async (_request, reply) => {
   try {
     const settings = getJellyfinSettings();
     const [server, libraries] = await Promise.all([testJellyfinConnection(settings), listJellyfinLibraries(settings)]);
+    await reportIntegrationStatus('jellyfin', 'healthy', '连接测试成功');
     await appendRuntimeLog({ level: 'success', source: 'library', message: `Jellyfin 连接测试成功（${server.serverName}${server.version ? ` ${server.version}` : ''}），发现 ${libraries.length} 个媒体库。` });
     return { ok: true, server, libraries };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Jellyfin 连接测试失败。';
+    await reportIntegrationStatus('jellyfin', 'degraded', '最近一次连接测试失败').catch(() => undefined);
     await appendRuntimeLog({ level: 'error', source: 'library', message: `Jellyfin 连接测试失败：${message}` });
     return reply.code(400).send({ error: message });
   }
 });
 
 app.post('/api/settings/jellyfin/sync', async (_request, reply) => {
+  const startedAt = Date.now();
   try {
     const result = await syncJellyfinLibrary('manual');
+    await recordPerformanceMetric({ scope: 'library', metric: 'processed', dimension: 'full_sync', durationMs: Date.now() - startedAt }).catch(() => undefined);
+    await reportIntegrationStatus('jellyfin', 'healthy', '最近一次媒体库同步成功').catch(() => undefined);
     return { ok: true, ...result };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Jellyfin 影视库同步失败。';
+    await reportIntegrationStatus('jellyfin', 'degraded', '最近一次媒体库同步失败').catch(() => undefined);
     await appendRuntimeLog({ level: 'error', source: 'library', message: `Jellyfin 影视库手动同步失败：${message}` });
     return reply.code(400).send({ error: message });
   }
@@ -1144,6 +1284,16 @@ app.listen({ port, host: '0.0.0.0' }).then(() => {
   setInterval(beat, 15_000);
   void appendRuntimeLog({ level: 'info', source: 'system', message: `网页服务已启动，监听端口 ${port}。` })
     .catch((error) => app.log.warn(`Unable to save service startup log: ${error instanceof Error ? error.message : String(error)}`));
+  const maintainMetrics = async () => {
+    try { await maintainPerformanceMetrics(); }
+    catch (error) {
+      const detail = error instanceof Error ? error.message : '未知数据库错误';
+      await appendRuntimeLog({ level: 'error', source: 'system', message: `长期性能指标维护失败：${detail}` }).catch(() => undefined);
+    }
+  };
+  void maintainMetrics();
+  const maintenanceTimer = setInterval(() => void maintainMetrics(), 24 * 60 * 60_000);
+  maintenanceTimer.unref();
 }).catch((error) => {
   app.log.error(error);
   process.exit(1);
