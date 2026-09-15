@@ -35,6 +35,12 @@ jobs:
       - name: Type check
         run: npx tsc --noEmit
 
+      - name: Run test suite
+        run: npm test
+
+      - name: Compile production server
+        run: npm run build:server
+
       - name: Build web application
         run: npm run build
 

@@ -156,7 +156,15 @@ type PerformanceMetrics = {
   retries: Array<{ scope: string; reason: string; count: number }>;
   chromiumRebuilds: Array<{ scope: string; reason: string; count: number }>;
   throughput: Array<{ minute: string; scope: string; count: number }>;
+  runtime: {
+    containerMemoryBytes: number | null;
+    apiRssBytes: number | null;
+    runnerRssBytes: number | null;
+    browser: { state: string; activePages: number | null; queuedPages: number | null; navigationCount: number | null };
+  };
 };
+
+type RuntimeSettings = { profile: 'safe' | 'performance'; browserIdleMinutes: 5 | 10 | 20 };
 
 const blankForm: FormData = {
   name: '', url: '', selector: '', renderMode: 'static', contentSource: 'text', attributeName: '', matchPattern: '', titleSelector: '', titleContentSource: 'text', titleAttributeName: '', titleMatchPattern: '', resultMode: 'first', intervalMinutes: 60, scheduleType: 'hourly', scheduleIntervalHours: 1, scheduleTime: '09:00', scheduleWeekday: 1, isActive: true, paginationSelector: '', paginationParameter: 'page', paginationMatchPattern: ''
@@ -527,6 +535,12 @@ function formatDuration(value: number | null) {
   return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)} 秒`;
 }
 
+function formatBytes(value: number | null) {
+  if (value === null || !Number.isFinite(value)) return '—';
+  if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(value >= 1024 * 1024 * 1024 ? 0 : 1)} MB`;
+}
+
 function jellyfinItemUrl(baseUrl: string, itemId: string | null) {
   if (!baseUrl || !itemId) return null;
   try {
@@ -828,6 +842,7 @@ function PerformanceOverview({ metrics, error, integrations, range, onRange }: {
   const max = Math.max(1, ...trend.map(([, count]) => count));
   const retries = (metrics?.retries ?? []).sort((left, right) => right.count - left.count);
   const rebuilds = (metrics?.chromiumRebuilds ?? []).sort((left, right) => right.count - left.count);
+  const runtime = metrics?.runtime ?? { containerMemoryBytes: null, apiRssBytes: null, runnerRssBytes: null, browser: { state: 'unknown', activePages: null, queuedPages: null, navigationCount: null } };
   return <section className="performance-overview" aria-label="长期性能指标">
     <div className="operation-section-heading"><div><h2>性能概览</h2><p>指标仅记录聚合计数与耗时；分钟数据保留 30 天，之后按小时汇总至 180 天。</p></div><div className="metric-range" role="group" aria-label="性能指标时间范围">{(['24h', '7d', '30d', '180d'] as const).map((item) => <button type="button" key={item} className={range === item ? 'active' : ''} onClick={() => onRange(item)}>{item}</button>)}</div></div>
     {!metrics ? <div className={`operation-queue-empty ${error ? 'metric-load-error' : ''}`}>{error || '正在读取长期性能指标…'}</div> : <>
@@ -837,10 +852,12 @@ function PerformanceOverview({ metrics, error, integrations, range, onRange }: {
         return <article className={integration.status} key={integration.name}><strong>{label}</strong><span>{status}</span><small title={integration.detail ?? undefined}>{integration.status === 'degraded' ? (integration.detail ?? '最近连接失败，核心服务仍可使用。') : integration.status === 'disabled' ? '未纳入核心就绪检查' : integration.configured ? '不纳入 Docker 就绪门槛' : '尚未完成连接配置'}</small></article>;
       })}</div>
       <div className="performance-cards">
+        <article><span>容器内存</span><strong>{formatBytes(runtime.containerMemoryBytes)}</strong><small>API {formatBytes(runtime.apiRssBytes)} · 引擎 {formatBytes(runtime.runnerRssBytes)}</small></article>
         <article><span>Jellyfin 缓存命中率</span><strong>{metrics.jellyfinCache.hitRate === null ? '—' : `${Math.round(metrics.jellyfinCache.hitRate * 100)}%`}</strong><small>{metrics.jellyfinCache.hit} 命中 · {metrics.jellyfinCache.miss} 未命中</small></article>
         <article><span>Chromium 重建</span><strong>{rebuilds.reduce((total, item) => total + item.count, 0)}</strong><small>{rebuilds.length ? rebuilds.map((item) => `${metricWorkerLabel[item.scope as keyof typeof metricWorkerLabel] ?? item.scope} ${chromiumReasonLabel[item.reason] ?? item.reason} ${item.count}`).join(' · ') : '当前范围内没有重建'}</small></article>
         <article><span>自动重试</span><strong>{retries.reduce((total, item) => total + item.count, 0)}</strong><small>{retries.length ? retries.slice(0, 3).map((item) => `${retryReasonLabel[item.reason] ?? item.reason} ${item.count}`).join(' · ') : '当前范围内没有自动重试'}</small></article>
       </div>
+      <p className="browser-runtime-state">浏览器池：{runtime.browser.state === 'active' ? '正在渲染' : runtime.browser.state === 'idle' ? '空闲待命' : runtime.browser.state === 'closed' ? '已回收' : '状态读取中'} · {runtime.browser.activePages ?? 0} 页面执行中 · {runtime.browser.queuedPages ?? 0} 页面排队 · 本轮 {runtime.browser.navigationCount ?? 0} 次导航</p>
       <section className="throughput-chart"><header><strong>每分钟处理量</strong><small>最近 60 分钟</small></header><div className="throughput-bars" aria-label="最近 60 分钟处理量趋势">{trend.length ? trend.map(([minute, count]) => <i key={minute} title={`${formatTime(minute)}：${count} 项`} style={{ height: `${Math.max(4, Math.round(count / max * 100))}%` }} />) : <span>尚无处理记录</span>}</div></section>
       <div className="worker-performance-list">{metrics.workers.map((worker) => <article key={worker.scope}><strong>{metricWorkerLabel[worker.scope]}</strong><span>{worker.processed} 项</span><small>平均 {formatDuration(worker.averageDurationMs)}</small></article>)}</div>
     </>}
@@ -1365,27 +1382,35 @@ function PresetManager({ presets, onClose, onChanged, embedded = false, register
 function NetworkSettings({ onClose, onSaved }: { onClose: () => void; onSaved: (message: string) => void }) {
   const [proxyUrl, setProxyUrl] = useState('');
   const [fromEnvironment, setFromEnvironment] = useState(false);
+  const [runtime, setRuntime] = useState<RuntimeSettings>({ profile: 'safe', browserIdleMinutes: 10 });
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState('');
   useEffect(() => {
-    void request<{ proxyUrl: string; fromEnvironment: boolean }>('/api/settings/network')
-      .then((data) => { setProxyUrl(data.proxyUrl); setFromEnvironment(data.fromEnvironment); })
+    void Promise.all([
+      request<{ proxyUrl: string; fromEnvironment: boolean }>('/api/settings/network'),
+      request<RuntimeSettings>('/api/settings/runtime')
+    ])
+      .then(([network, nextRuntime]) => { setProxyUrl(network.proxyUrl); setFromEnvironment(network.fromEnvironment); setRuntime(nextRuntime); })
       .catch((reason) => setError(reason.message))
       .finally(() => setBusy(false));
   }, []);
   async function save(event: FormEvent) {
     event.preventDefault(); setBusy(true); setError('');
     try {
-      const result = await request<{ active: boolean }>('/api/settings/network', { method: 'PUT', body: JSON.stringify({ proxyUrl }) });
-      onSaved(result.active ? '网络代理已启用。' : '网络代理已关闭。');
+      const [network] = await Promise.all([
+        fromEnvironment ? Promise.resolve<{ active: boolean } | null>(null) : request<{ active: boolean }>('/api/settings/network', { method: 'PUT', body: JSON.stringify({ proxyUrl }) }),
+        request<RuntimeSettings>('/api/settings/runtime', { method: 'PUT', body: JSON.stringify(runtime) })
+      ]);
+      onSaved(network ? (network.active ? '网络代理与运行性能已保存。' : '运行性能已保存，网络代理已关闭。') : '运行性能已保存。');
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存设置。'); }
     finally { setBusy(false); }
   }
   return <div className="overlay" role="dialog" aria-modal="true" aria-labelledby="network-title"><form className="editor network-settings" onSubmit={save}>
-    <header><div><p className="eyebrow">网络连接</p><h2 id="network-title">网络代理</h2></div><button type="button" className="close" onClick={onClose}>×</button></header>
+    <header><div><p className="eyebrow">网络连接与运行性能</p><h2 id="network-title">网络代理</h2></div><button type="button" className="close" onClick={onClose}>×</button></header>
     <p className="network-copy">配置后，普通网页抓取和浏览器渲染都会通过同一个代理连接。</p>
     {fromEnvironment ? <div className="environment-note">当前代理由 Docker 的 <code>OUTBOUND_PROXY</code> 环境变量提供。请在部署配置中修改。</div> : <label>HTTP / HTTPS 代理地址<input disabled={busy} value={proxyUrl} onChange={(event) => setProxyUrl(event.target.value)} placeholder="例如 http://192.168.1.10:7890" /><span className="field-note">留空并保存即可关闭代理。NAS 中请填写代理服务的局域网 IP，不要填写 127.0.0.1。</span></label>}
+    <section className="runtime-settings-card"><div><strong>运行性能</strong><small>MissAV 始终优先浏览器渲染；不会自动切换为高并发 HTTP 抓取。</small></div><div className="two-col"><label>浏览器模式<select disabled={busy} value={runtime.profile} onChange={(event) => setRuntime((current) => ({ ...current, profile: event.target.value as RuntimeSettings['profile'] }))}><option value="safe">稳妥：单页并发</option><option value="performance">性能：最多两页并发</option></select><span className="field-note">性能模式会提高内存占用和站点访问风险。</span></label><label>空闲回收<select disabled={busy} value={runtime.browserIdleMinutes} onChange={(event) => setRuntime((current) => ({ ...current, browserIdleMinutes: Number(event.target.value) as RuntimeSettings['browserIdleMinutes'] }))}><option value={5}>5 分钟</option><option value={10}>10 分钟（默认）</option><option value={20}>20 分钟</option></select><span className="field-note">没有浏览器任务时，Chromium 会自动退出。</span></label></div></section>
     {error && <p className="form-error">{error}</p>}
-    <footer><button type="button" className="secondary" onClick={onClose}>取消</button>{!fromEnvironment && <button className="primary" disabled={busy} type="submit">{busy ? '读取中…' : '保存代理设置'}</button>}</footer>
+    <footer><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" disabled={busy} type="submit">{busy ? '读取中…' : '保存设置'}</button></footer>
   </form></div>;
 }

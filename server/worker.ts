@@ -78,7 +78,7 @@ async function runNextJob() {
     activeTask = { kind: fullScan ? 'full_scan' : 'check', subscriptionId: subscription.id, current: fullScan ? subscription.initial_scan_pages_completed : null, total: fullScan ? subscription.initial_scan_total : null, label: fullScan ? `下一个页面：${subscription.initial_scan_next_page}` : '正在读取网页内容' };
     await heartbeat();
     await appendRuntimeLog({ level: 'info', source: 'worker', subscriptionId: subscription.id, jobId: job.id, message: fullScan ? (subscription.initial_scan_run_id ? `恢复全量检查：从第 ${subscription.initial_scan_next_page} 页继续。` : '开始全量检查。') : '开始检查第一页。' });
-    const result = await captureSubscription(subscription);
+    const result = await captureSubscription(subscription, job.priority);
     await db.run("UPDATE jobs SET status = 'completed', finished_at = ? WHERE id = ?", [new Date().toISOString(), job.id]);
     const additions = result.addedCount ? `，新增 ${result.addedCount} 条内容` : '，没有新增内容';
     await appendRuntimeLog({ level: 'success', source: 'worker', subscriptionId: subscription.id, jobId: job.id, message: `${result.totalPages > 1 ? `全量检查完成，共读取 ${result.totalPages} 页` : '检查完成'}，提取 ${result.itemCount} 项${additions}。` });

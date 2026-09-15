@@ -20,6 +20,7 @@ type ReleaseJob = {
   detail_url: string | null;
   subscription_url: string;
   attempt_count: number;
+  priority: number;
 };
 
 type LegacyEntry = { id: number; subscription_id: number; content: string; detail_url: string | null; subscription_url: string };
@@ -61,7 +62,7 @@ async function logProgress(subscriptionId: number) {
 }
 
 async function runNextReleaseJob() {
-  const job = await db.get<ReleaseJob>(`SELECT j.id, j.archive_entry_id, j.attempt_count, a.subscription_id, a.content, a.detail_url, s.url AS subscription_url
+  const job = await db.get<ReleaseJob>(`SELECT j.id, j.archive_entry_id, j.attempt_count, j.priority, a.subscription_id, a.content, a.detail_url, s.url AS subscription_url
     FROM release_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id
     WHERE j.status = 'queued' AND (j.retry_after IS NULL OR j.retry_after <= ?) ORDER BY j.priority DESC, j.requested_at ASC, j.id ASC LIMIT 1`, [new Date().toISOString()]);
   if (!job) return;
@@ -84,7 +85,7 @@ async function runNextReleaseJob() {
     }
     const detailUrl = expandReleaseUrl(rule.urlTemplate, { detailUrl: job.detail_url, subscriptionUrl: job.subscription_url, content: job.content });
     if (!detailUrl) throw new Error('发行日期规则无法生成详情页地址；请检查详情页地址模板或内容链接。');
-    const result = await lookupReleaseDate(detailUrl, rule, browserSession);
+    const result = await lookupReleaseDate(detailUrl, rule, browserSession, job.priority);
     const finishedAt = new Date().toISOString();
     await db.transaction(async (tx) => {
       if (result.status === 'found') {

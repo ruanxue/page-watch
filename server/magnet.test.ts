@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
-import test, { after } from 'node:test';
-import { pool } from './db.js';
-import { decodeCloudflareEmail, findMagnetDetailPath } from './magnet.js';
+import test from 'node:test';
+import { decodeCloudflareEmail, findMagnetDetailPath } from './magnet-parser.js';
+import type { MagnetRule } from './inspection-rules.js';
+
+const rule: MagnetRule = {
+  enabled: true, origins: ['https://cilisousuo.co'], searchUrlTemplate: '', requestIntervalMs: 0,
+  itemSelector: 'li.item', filenameSelector: '.filename', filenamePrefix: 'hhd800.com@', fallbackFilenamePrefixes: ['4k688.com@'],
+  detailLinkSelector: 'a.link', detailPathPrefix: '/magnet/', valueSelector: '', valueSource: 'text', valueAttribute: '', valueMatchPattern: ''
+};
 
 const searchPage = `
   <ul>
@@ -11,12 +17,12 @@ const searchPage = `
   </ul>`;
 
 test('prefers an hhd800 result even when a 4k688 fallback appears first', () => {
-  assert.equal(findMagnetDetailPath(searchPage), '/magnet/primary');
+  assert.equal(findMagnetDetailPath(searchPage, rule.origins[0], rule), '/magnet/primary');
 });
 
 test('uses the first 4k688 fallback only when the primary prefix is absent', () => {
   const withoutPrimary = searchPage.replace('<li class="item"><div class="filename">hhd800.com@ATID-799.mp4</div><a class="link" href="/magnet/primary"></a></li>', '');
-  assert.equal(findMagnetDetailPath(withoutPrimary), '/magnet/fallback-first');
+  assert.equal(findMagnetDetailPath(withoutPrimary, rule.origins[0], rule), '/magnet/fallback-first');
 });
 
 test('decodes Cloudflare-protected fallback filenames before matching', () => {
@@ -25,9 +31,5 @@ test('decodes Cloudflare-protected fallback filenames before matching', () => {
   const encoded = [key, ...[...Buffer.from(email)].map((byte) => byte ^ key)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
   const protectedSearch = `<li class="item"><div class="filename"><b>ATID-799</b>/<a class="__cf_email__" data-cfemail="${encoded}">[email protected]</a></div><a class="link" href="/magnet/cloudflare-fallback"></a></li>`;
   assert.equal(decodeCloudflareEmail(encoded), email);
-  assert.equal(findMagnetDetailPath(protectedSearch), '/magnet/cloudflare-fallback');
-});
-
-after(async () => {
-  await pool.end();
+  assert.equal(findMagnetDetailPath(protectedSearch, rule.origins[0], rule), '/magnet/cloudflare-fallback');
 });

@@ -1,14 +1,14 @@
 import crypto from 'node:crypto';
 import { setDefaultResultOrder } from 'node:dns';
 import dns from 'node:dns/promises';
-import fs from 'node:fs';
 import net from 'node:net';
 import * as cheerio from 'cheerio';
-import { chromium, type Browser } from 'playwright';
 import { ProxyAgent } from 'undici';
 import { db, getJellyfinSettings, getOutboundProxyUrl, queueLibraryJob, queueMagnetJob, queueReleaseJob, recordPerformanceMetric, type DatabaseClient, type Subscription } from './db.js';
+import { browserPool } from './browser-pool.js';
 import { describeError } from './error-details.js';
 import { expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
+import { archiveKey } from './jellyfin-match.js';
 import { missavBackupUrl, missavFallbackFailure, shouldTryMissavBackup } from './site-fallback.js';
 
 // Some DNS forwarders return an unusable ::1 AAAA record together with a valid
@@ -97,19 +97,6 @@ function contentForItems(items: CapturedItem[]) {
 }
 
 const blockedHosts = new Set(['localhost', 'localhost.localdomain', 'metadata.google.internal']);
-const localBrowserCandidates = [
-  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-  'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-  'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
-];
-
-function localBrowserExecutable() {
-  if (process.env.PLAYWRIGHT_EXECUTABLE_PATH) return process.env.PLAYWRIGHT_EXECUTABLE_PATH;
-  if (process.platform !== 'win32') return undefined;
-  return localBrowserCandidates.find((candidate) => fs.existsSync(candidate));
-}
-
 function isPrivateIp(value: string) {
   const hostname = value.replace(/^\[|\]$/g, '').toLowerCase();
   if (!net.isIP(hostname)) return false;
@@ -196,44 +183,8 @@ async function getStatic(url: URL, selector: string, contentSource: Subscription
   }
 }
 
-class CaptureBrowserSession {
-  private browser: Browser | null = null;
-  private proxyUrl: string | null = null;
-  private openedAt = 0;
-  private pages = 0;
-
-  async close(reason?: 'disconnected' | 'proxy_changed' | 'page_limit' | 'age_limit' | 'error') {
-    const browser = this.browser;
-    if (browser && reason) void recordPerformanceMetric({ scope: 'capture', metric: 'chromium_rebuild', dimension: reason }).catch(() => undefined);
-    this.browser = null; this.proxyUrl = null; this.openedAt = 0; this.pages = 0;
-    await browser?.close().catch(() => undefined);
-  }
-
-  async getBrowser() {
-    const proxyUrl = getOutboundProxyUrl() || null;
-    const reason = !this.browser ? null : !this.browser.isConnected() ? 'disconnected' : this.proxyUrl !== proxyUrl ? 'proxy_changed' : this.pages >= 25 ? 'page_limit' : Date.now() - this.openedAt >= 15 * 60_000 ? 'age_limit' : null;
-    const renew = !this.browser || Boolean(reason);
-    if (!renew) return this.browser!;
-    await this.close(reason ?? undefined);
-    const executablePath = localBrowserExecutable();
-    this.browser = await chromium.launch({ headless: process.env.PLAYWRIGHT_HEADLESS !== 'false', ...(executablePath ? { executablePath } : {}), ...(proxyUrl ? { proxy: { server: proxyUrl } } : {}) });
-    this.proxyUrl = proxyUrl; this.openedAt = Date.now();
-    return this.browser;
-  }
-
-  used() { this.pages += 1; }
-}
-
-const captureBrowser = new CaptureBrowserSession();
-
-async function getDynamic(url: URL, selector: string, contentSource: Subscription['content_source'], attributeName: string | null, matchPattern: string | null, resultMode: Subscription['result_mode'], pageCountSelector?: string | null, pageCountPattern?: string | null, titleSelector?: string | null, titleContentSource: Subscription['title_content_source'] = 'text', titleAttributeName: string | null = null, titleMatchPattern: string | null = null): Promise<CaptureResult> {
-  let context: Awaited<ReturnType<Browser['newContext']>> | null = null;
-  try {
-    const browser = await captureBrowser.getBrowser();
-    // Page contexts are disposable even though Chromium is reused: no cookie,
-    // storage or service worker state crosses between subscriptions/pages.
-    context = await browser.newContext({ userAgent: 'PageWatch/0.1 (+self-hosted webpage monitor)' });
-    const page = await context.newPage();
+async function getDynamic(url: URL, selector: string, contentSource: Subscription['content_source'], attributeName: string | null, matchPattern: string | null, resultMode: Subscription['result_mode'], pageCountSelector?: string | null, pageCountPattern?: string | null, titleSelector?: string | null, titleContentSource: Subscription['title_content_source'] = 'text', titleAttributeName: string | null = null, titleMatchPattern: string | null = null, browserPriority = 0): Promise<CaptureResult> {
+  return browserPool.use('capture', async (page) => {
     await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 30_000 });
     const elements = page.locator(selector);
     await elements.first().waitFor({ state: 'attached', timeout: 15_000 });
@@ -248,17 +199,11 @@ async function getDynamic(url: URL, selector: string, contentSource: Subscriptio
     const items = extractItems(rawContent, rawTitles, detailUrls, matchPattern, titleMatchPattern, resultMode);
     const content = contentForItems(items);
     const countText = pageCountSelector ? await page.locator(pageCountSelector).first().textContent().catch(() => '') : '';
-    captureBrowser.used();
     return { title: normalize(await page.title()) || url.hostname, content, hash: hash(content), items, ...(pageCountSelector ? { pageCount: pageCount(countText ?? '', pageCountPattern ?? null) } : {}) };
-  } catch (error) {
-    await captureBrowser.close('error');
-    throw error;
-  } finally {
-    await context?.close().catch(() => undefined);
-  }
+  }, browserPriority);
 }
 
-export async function closeCaptureBrowser() { await captureBrowser.close(); }
+export async function closeCaptureBrowser() { await browserPool.close(); }
 
 function hash(value: string) {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -280,8 +225,8 @@ async function archiveNewItems(subscription: Subscription, items: CapturedItem[]
     const releaseUrl = rules.releaseDate.enabled ? expandReleaseUrl(rules.releaseDate.urlTemplate, { detailUrl, subscriptionUrl: subscription.url, content: item.content }) : null;
     const shouldCheckLibraryFirst = rules.magnet.enabled && jellyfin.enabled && jellyfin.libraryIds.length > 0 && jellyfin.skipMagnetWhenAvailable;
     const result = await client.run(`INSERT IGNORE INTO archive_entries
-      (subscription_id, content, title, content_hash, first_seen_at, detail_url, release_status, magnet_status, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [subscription.id, item.content, item.title, hash(item.content), capturedAt, detailUrl, releaseUrl ? 'pending' : 'unsearched', rules.magnet.enabled && !shouldCheckLibraryFirst ? 'pending' : 'unsearched', capturedAt]);
+      (subscription_id, content, title, archive_code, content_hash, first_seen_at, detail_url, release_status, magnet_status, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [subscription.id, item.content, item.title, archiveKey(item.content), hash(item.content), capturedAt, detailUrl, releaseUrl ? 'pending' : 'unsearched', rules.magnet.enabled && !shouldCheckLibraryFirst ? 'pending' : 'unsearched', capturedAt]);
     if (result.changes) {
       if (rules.magnet.enabled) {
         if (shouldCheckLibraryFirst) {
@@ -314,23 +259,23 @@ export async function previewCapture(input: Pick<Subscription, 'url' | 'selector
   if (!input.selector.trim()) throw new Error('请填写 CSS 选择器。');
   if (input.content_source === 'attribute' && !input.attribute_name?.trim()) throw new Error('请填写要提取的属性名。');
   return captureWithFallback(url, (target) => input.render_mode === 'dynamic'
-    ? getDynamic(target, input.selector, input.content_source, input.attribute_name, input.match_pattern, input.result_mode, undefined, undefined, input.title_selector, input.title_content_source, input.title_attribute_name, input.title_match_pattern)
+    ? getDynamic(target, input.selector, input.content_source, input.attribute_name, input.match_pattern, input.result_mode, undefined, undefined, input.title_selector, input.title_content_source, input.title_attribute_name, input.title_match_pattern, 100)
     : getStatic(target, input.selector, input.content_source, input.attribute_name, input.match_pattern, input.result_mode, undefined, undefined, input.title_selector, input.title_content_source, input.title_attribute_name, input.title_match_pattern));
 }
 
-async function capturePage(subscription: Subscription, rawUrl: string, includePageCount = false) {
+async function capturePage(subscription: Subscription, rawUrl: string, includePageCount = false, browserPriority = 0) {
   const url = await assertSafeUrl(rawUrl);
   return captureWithFallback(url, (target) => subscription.render_mode === 'dynamic'
-    ? getDynamic(target, subscription.selector, subscription.content_source, subscription.attribute_name, subscription.match_pattern, subscription.result_mode, includePageCount ? subscription.pagination_selector : null, subscription.pagination_match_pattern, subscription.title_selector, subscription.title_content_source, subscription.title_attribute_name, subscription.title_match_pattern)
+    ? getDynamic(target, subscription.selector, subscription.content_source, subscription.attribute_name, subscription.match_pattern, subscription.result_mode, includePageCount ? subscription.pagination_selector : null, subscription.pagination_match_pattern, subscription.title_selector, subscription.title_content_source, subscription.title_attribute_name, subscription.title_match_pattern, browserPriority)
     : getStatic(target, subscription.selector, subscription.content_source, subscription.attribute_name, subscription.match_pattern, subscription.result_mode, includePageCount ? subscription.pagination_selector : null, subscription.pagination_match_pattern, subscription.title_selector, subscription.title_content_source, subscription.title_attribute_name, subscription.title_match_pattern));
 }
 
-export async function captureSubscription(subscription: Subscription) {
+export async function captureSubscription(subscription: Subscription, browserPriority = 0) {
   const isFullScan = Boolean(!subscription.initial_scan_completed && subscription.pagination_selector);
-  if (isFullScan) return captureInitialFullScan(subscription);
+  if (isFullScan) return captureInitialFullScan(subscription, browserPriority);
 
   let first: CaptureResult;
-  try { first = await capturePage(subscription, subscription.url); }
+  try { first = await capturePage(subscription, subscription.url, false, browserPriority); }
   catch (error) { throw new Error(describeError(error, { action: '第 1 页读取', target: new URL(subscription.url).hostname, proxyUrl: getOutboundProxyUrl() }), { cause: error }); }
   const items = uniqueItems(first.items);
   const content = contentForItems(items);
@@ -361,13 +306,13 @@ async function stagePage(subscription: Subscription, scanId: string, page: numbe
   });
 }
 
-async function captureInitialFullScan(subscription: Subscription) {
+async function captureInitialFullScan(subscription: Subscription, browserPriority = 0) {
   let scanId = subscription.initial_scan_run_id;
   let total = subscription.initial_scan_total ?? 0;
   let first: CaptureResult | null = null;
   let nextPage = Math.max(1, subscription.initial_scan_next_page || 1);
   if (!scanId) {
-    try { first = await capturePage(subscription, subscription.url, true); }
+    try { first = await capturePage(subscription, subscription.url, true, browserPriority); }
     catch (error) { throw new Error(describeError(error, { action: '第 1 页读取', target: new URL(subscription.url).hostname, proxyUrl: getOutboundProxyUrl() }), { cause: error }); }
     scanId = crypto.randomUUID();
     total = first.pageCount ?? 1;
@@ -383,7 +328,7 @@ async function captureInitialFullScan(subscription: Subscription) {
     const url = new URL(subscription.url);
     url.searchParams.set(subscription.pagination_parameter || 'page', String(page));
     let result: CaptureResult;
-    try { result = await capturePage(subscription, url.toString()); }
+    try { result = await capturePage(subscription, url.toString(), false, browserPriority); }
     catch (error) { throw new Error(describeError(error, { action: `第 ${page}/${total} 页读取`, target: url.hostname, proxyUrl: getOutboundProxyUrl() }), { cause: error }); }
     await stagePage(subscription, scanId, page, result.items);
   }

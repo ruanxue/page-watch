@@ -75,6 +75,7 @@ export async function ensureMySqlSchema(pool: Pool) {
     subscription_id INT NOT NULL,
     content TEXT NOT NULL,
     title TEXT NULL,
+    archive_code VARCHAR(32) NULL,
     content_hash CHAR(64) NOT NULL,
     first_seen_at VARCHAR(40) NOT NULL,
     detail_url TEXT NULL,
@@ -227,6 +228,17 @@ export async function ensureMySqlSchema(pool: Pool) {
     KEY idx_performance_metrics_metric (metric, bucket_start)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 
+  // Latest process/container gauges are intentionally separate from the
+  // long-lived aggregate table above: they describe *current* memory use and
+  // never contain URLs, credentials or task payloads.
+  await pool.query(`CREATE TABLE IF NOT EXISTS runtime_metrics (
+    metric_key VARCHAR(64) NOT NULL,
+    numeric_value BIGINT NULL,
+    text_value VARCHAR(64) NULL,
+    updated_at VARCHAR(40) NOT NULL,
+    PRIMARY KEY (metric_key)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+
   // External services never determine Docker readiness, but their most recent
   // safe-to-display status lets the UI distinguish a disabled integration from
   // a configured service that has recently failed.
@@ -301,6 +313,7 @@ export async function ensureMySqlSchema(pool: Pool) {
   // CREATE TABLE IF NOT EXISTS does not amend an existing table, so add newer
   // archive fields safely for installations created by earlier releases.
   await addColumnIfMissing(pool, 'archive_entries', 'detail_url', 'TEXT NULL');
+  await addColumnIfMissing(pool, 'archive_entries', 'archive_code', 'VARCHAR(32) NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'release_date', 'VARCHAR(10) NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'release_status', "VARCHAR(16) NOT NULL DEFAULT 'unsearched'");
   await addColumnIfMissing(pool, 'archive_entries', 'release_checked_at', 'VARCHAR(40) NULL');
@@ -359,6 +372,7 @@ export async function ensureMySqlSchema(pool: Pool) {
   await addIndexIfMissing(pool, 'release_jobs', 'idx_release_jobs_priority', 'KEY idx_release_jobs_priority (status, priority, requested_at)');
   await addIndexIfMissing(pool, 'magnet_jobs', 'idx_magnet_jobs_priority', 'KEY idx_magnet_jobs_priority (status, priority, requested_at)');
   await addIndexIfMissing(pool, 'download_jobs', 'idx_download_jobs_priority', 'KEY idx_download_jobs_priority (status, priority, requested_at)');
+  await addIndexIfMissing(pool, 'archive_entries', 'idx_archive_entries_code', 'KEY idx_archive_entries_code (archive_code)');
 }
 
 async function addColumnIfMissing(pool: Pool, table: string, column: string, definition: string) {

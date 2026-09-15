@@ -22,7 +22,7 @@ services:
   app:
     <<: *page-watch-service
     container_name: pagewatch
-    command: npm run all-in-one
+    command: node build/server/all-in-one.js
     shm_size: 1gb
     ports:
       - "${PAGE_WATCH_PORT:-3030}:3030"

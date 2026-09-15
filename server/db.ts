@@ -4,6 +4,7 @@ import { ensureMySqlSchema } from './mysql-schema.js';
 import { defaultInspectionRules, inspectionRulesJson } from './inspection-rules.js';
 import { notifyLive } from './live-events.js';
 import { decryptSecret, encryptSecret, isEncryptedSecret, readApplicationEncryptionKey } from './secret-storage.js';
+import { defaultRuntimeSettings, normalizeRuntimeSettings, type RuntimeSettings } from './runtime-settings.js';
 
 const host = process.env.MYSQL_HOST?.trim();
 const user = process.env.MYSQL_USER?.trim();
@@ -309,6 +310,25 @@ export async function maintainPerformanceMetrics() {
   });
 }
 
+export type RuntimeMetric = { key: string; value?: number | null; text?: string | null };
+
+/** Persist current, safe-to-display process gauges. These are snapshots, not logs. */
+export async function reportRuntimeMetrics(metrics: RuntimeMetric[]) {
+  if (!metrics.length) return;
+  const now = new Date().toISOString();
+  const values = metrics.flatMap((metric) => [metric.key.slice(0, 64), metric.value ?? null, metric.text?.slice(0, 64) ?? null, now]);
+  const placeholders = metrics.map(() => '(?, ?, ?, ?)').join(', ');
+  await db.run(`INSERT INTO runtime_metrics (metric_key, numeric_value, text_value, updated_at) VALUES ${placeholders}
+    ON DUPLICATE KEY UPDATE numeric_value = VALUES(numeric_value), text_value = VALUES(text_value), updated_at = VALUES(updated_at)`, values);
+  notifyLive('metrics');
+}
+
+export async function getRuntimeMetrics() {
+  return db.all<{ metric_key: string; numeric_value: number | null; text_value: string | null; updated_at: string }>(
+    'SELECT metric_key, numeric_value, text_value, updated_at FROM runtime_metrics'
+  );
+}
+
 export type IntegrationService = 'jellyfin' | 'qbittorrent';
 export async function reportIntegrationStatus(service: IntegrationService, status: 'healthy' | 'degraded' | 'disabled', detail: string | null = null) {
   await db.run(`INSERT INTO integration_status (service_name, status, detail, checked_at) VALUES (?, ?, ?, ?)
@@ -323,6 +343,22 @@ export async function getIntegrationStatuses() {
 
 export function getOutboundProxyUrl() {
   return process.env.OUTBOUND_PROXY?.trim() || getSetting('outbound_proxy').trim();
+}
+
+export function getRuntimeSettings(): RuntimeSettings {
+  return normalizeRuntimeSettings({
+    profile: getSetting('runtime_profile') as RuntimeSettings['profile'] || defaultRuntimeSettings.profile,
+    browserIdleMinutes: (Number(getSetting('runtime_browser_idle_minutes')) || defaultRuntimeSettings.browserIdleMinutes) as RuntimeSettings['browserIdleMinutes']
+  });
+}
+
+export async function setRuntimeSettings(input: RuntimeSettings) {
+  const settings = normalizeRuntimeSettings(input);
+  await Promise.all([
+    setSetting('runtime_profile', settings.profile),
+    setSetting('runtime_browser_idle_minutes', String(settings.browserIdleMinutes))
+  ]);
+  return settings;
 }
 
 export type QbittorrentSettings = {

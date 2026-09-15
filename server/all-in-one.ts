@@ -9,14 +9,12 @@ type ManagedProcess = {
 };
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const tsxCli = path.join(projectRoot, 'node_modules', 'tsx', 'dist', 'cli.mjs');
+const production = process.env.NODE_ENV === 'production';
+const resolvedProjectRoot = production ? path.resolve(projectRoot, '..') : projectRoot;
+const tsxCli = path.join(resolvedProjectRoot, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 const managedProcesses: ManagedProcess[] = [
   { name: '网页服务', entry: 'server/index.ts' },
-  { name: '网页检查', entry: 'server/worker.ts' },
-  { name: '发行日期', entry: 'server/release-worker.ts' },
-  { name: '磁力检索', entry: 'server/magnet-worker.ts' },
-  { name: 'qBittorrent 下载', entry: 'server/download-worker.ts' },
-  { name: 'Jellyfin 同步', entry: 'server/library-worker.ts' }
+  { name: '统一执行引擎', entry: 'server/runner.ts' }
 ];
 
 const children = new Map<string, ChildProcess>();
@@ -25,15 +23,17 @@ const workerEventToken = process.env.WORKER_EVENT_TOKEN || crypto.randomBytes(32
 
 function startProcess(spec: ManagedProcess) {
   if (stopping) return;
-  const child = spawn(process.execPath, [tsxCli, spec.entry], {
-    cwd: projectRoot,
+  const entry = production ? path.join(resolvedProjectRoot, 'build', spec.entry.replace(/^server\//, 'server/').replace(/\.ts$/, '.js')) : spec.entry;
+  const child = spawn(process.execPath, production ? [entry] : [tsxCli, entry], {
+    cwd: resolvedProjectRoot,
     env: {
       ...process.env,
       // 浏览器渲染仅由网页检查任务使用；设为全局变量不会影响其他任务，
       // 但可确保单容器部署时始终使用容器内的无头 Chromium。
       PLAYWRIGHT_HEADLESS: process.env.PLAYWRIGHT_HEADLESS ?? 'true',
       WORKER_EVENT_TOKEN: workerEventToken,
-      WORKER_EVENT_URL: process.env.WORKER_EVENT_URL || 'http://127.0.0.1:3030'
+      WORKER_EVENT_URL: process.env.WORKER_EVENT_URL || 'http://127.0.0.1:3030',
+      RUNNER_INTERNAL_PORT: process.env.RUNNER_INTERNAL_PORT || '3031'
     },
     stdio: 'inherit'
   });

@@ -19,7 +19,7 @@ npm run dev
 docker compose up -d --build
 ```
 
-打开 `http://NAS_IP:3030`。Compose 只启动一个 Page Watch 容器；容器内主管理器统一托管网页服务、网页检查、发行日期、单线程磁力检索、qBittorrent 下载和 Jellyfin 影视库同步任务。订阅、档案、发行日期、磁力检索、下载与影视库状态、运行日志保存在 MySQL；请按你的 NAS 备份策略备份 `page_watch` 数据库。
+打开 `http://NAS_IP:3030`。Compose 只启动一个 Page Watch 容器；容器内只保留网页 API/SSE 进程与统一执行引擎。任务中心仍展示网页检查、发行日期、磁力检索、qBittorrent 下载和 Jellyfin 影视库同步这五项独立逻辑服务，但它们共享 MySQL 连接池和一个 Chromium 浏览器池。订阅、档案、发行日期、磁力检索、下载与影视库状态、运行日志保存在 MySQL；请按你的 NAS 备份策略备份 `page_watch` 数据库。
 
 部署前请复制 `.env.example` 为 `.env`，填写 `MYSQL_HOST`、`MYSQL_DATABASE`、`MYSQL_USER`、`MYSQL_PASSWORD` 和独立的 `APP_ENCRYPTION_KEY`。用 `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"` 生成主密钥并长期妥善保存；它用于 AES-256-GCM 加密 MySQL 中的 Jellyfin/qBittorrent 凭据和会话签名密钥，遗失后需在网页重新配置外部服务。Docker 容器会通过这些变量连接 NAS 上已有的 MySQL，而不会自行创建数据库容器。网页服务带有 Docker 健康检查；单容器主管理器会在内部重启异常退出的任务，容器本身异常退出时由 Docker 自动重启。
 
@@ -63,7 +63,7 @@ npm run migrate:mysql
 
 也可在 NAS 的 `.env` 中设置 `OUTBOUND_PROXY=http://代理地址:端口`，它会覆盖网页内的设置。若代理运行在 NAS 外的另一台设备，请使用其局域网 IP；容器中的 `127.0.0.1` 指向容器自身。
 
-本机开发时会自动使用已安装的 Chrome 或 Edge；NAS 的 Docker 镜像已自带 Chromium。若需指定其他浏览器，可设置 `PLAYWRIGHT_EXECUTABLE_PATH`。
+本机开发时会自动使用已安装的 Chrome 或 Edge；NAS 的 Docker 镜像已自带 Chromium。若需指定其他浏览器，可设置 `PLAYWRIGHT_EXECUTABLE_PATH`。网页中的“网络代理”设置同时提供“运行性能”：默认“稳妥”模式只运行一个 MissAV 页面，浏览器空闲 10 分钟自动回收；“性能”模式最多两页并发，会增加内存和站点访问风险。运行中心的性能概览会显示容器/API/执行引擎内存与浏览器池状态。
 
 ### 推荐的 NAS 持续部署
 
@@ -85,6 +85,6 @@ npm run migrate:mysql
 
 ## Jellyfin 影视库
 
-在“下载与影视库”页面填写 Jellyfin Web 地址和 API 密钥，点击“保存并检测媒体库”后选择需要同步的库，再保存并点击“立即同步影视库”。密钥只保存于服务端，网页不会回显。同步 Worker 会按配置的间隔（默认 60 分钟）拉取所选媒体库的影片名称、原始标题和路径，在本地按 `前缀-数字` 番号匹配；内容档案会显示“已入库”“未入库”“待同步”或“同步失败”。Jellyfin 只用于判断媒体是否已经扫描入库，不会修改 Jellyfin 内的影片、元数据或文件。
+在“下载与影视库”页面填写 Jellyfin Web 地址和 API 密钥，点击“保存并检测媒体库”后选择需要同步的库，再保存并点击“立即同步影视库”。密钥只保存于服务端，网页不会回显。同步 Worker 会按配置的间隔（默认 60 分钟）拉取所选媒体库的完整快照，以批量写入方式更新 MySQL 媒体索引；新归档及后续匹配都只查询本地索引，不会逐条访问 Jellyfin。内容档案会显示“已入库”“未入库”“待同步”或“同步失败”。Jellyfin 只用于判断媒体是否已经扫描入库，不会修改 Jellyfin 内的影片、元数据或文件。
 
 初版把自动化边界控制在“订阅、提取、比较、记录”。`server/capture.ts` 是后续扩展页面登录、点击、填写、条件与通知动作的入口。

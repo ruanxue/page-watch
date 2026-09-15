@@ -2,11 +2,12 @@ import path from 'node:path';
 import type { ServerResponse } from 'node:http';
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
-import { assertSafeUrl, previewCapture } from './capture.js';
-import { appendRuntimeLog, db, getIntegrationStatuses, getJellyfinSettings, getOutboundProxyUrl, getQbittorrentSettings, getSetting, getSubscription, JOB_PRIORITY, maintainPerformanceMetrics, queueDownloadJob, queueJob, queueMagnetJob, queueReleaseJob, recordPerformanceMetric, refreshSettings, reportIntegrationStatus, reportWorkerHeartbeat, setSetting, type IntegrationService, type Subscription } from './db.js';
+import { assertSafeUrl } from './capture.js';
+import { appendRuntimeLog, db, getIntegrationStatuses, getJellyfinSettings, getOutboundProxyUrl, getQbittorrentSettings, getRuntimeMetrics, getRuntimeSettings, getSetting, getSubscription, JOB_PRIORITY, maintainPerformanceMetrics, queueDownloadJob, queueJob, queueMagnetJob, queueReleaseJob, recordPerformanceMetric, refreshSettings, reportIntegrationStatus, reportWorkerHeartbeat, setRuntimeSettings, setSetting, type IntegrationService, type Subscription } from './db.js';
 import { assertQbittorrentConfig, normalizeQbittorrentUrl, testQbittorrentConnection } from './qbittorrent.js';
 import { assertJellyfinConfig, listJellyfinLibraries, normalizeJellyfinUrl, testJellyfinConnection } from './jellyfin.js';
 import { syncJellyfinLibrary } from './jellyfin-sync.js';
+import { startRuntimeMemoryReporter } from './runtime-observability.js';
 import { clearJellyfinMediaIndex } from './jellyfin-cache.js';
 import { authenticate, clearSessionCookie, configurePassword, createSession, sessionCookie, statusFor, validatePassword } from './auth.js';
 import { getInspectionRules, inspectionRulesJson, normalizeInspectionRules } from './inspection-rules.js';
@@ -599,7 +600,7 @@ app.get('/api/metrics', async (request, reply) => {
   const now = Date.now();
   const rangeStart = new Date(now - hoursByRange[range] * 60 * 60_000).toISOString().slice(0, 19).replace('T', ' ');
   const minuteStart = new Date(Math.max(now - 30 * 24 * 60 * 60_000, now - hoursByRange[range] * 60 * 60_000)).toISOString().slice(0, 19).replace('T', ' ');
-  const [summaryRows, throughput] = await Promise.all([
+  const [summaryRows, throughput, runtimeRows] = await Promise.all([
     db.all<PerformanceSummaryRow>(`SELECT scope, metric, dimension, SUM(sample_count) AS sample_count, SUM(duration_ms) AS duration_ms
       FROM performance_metrics
       WHERE (granularity = 'hour' AND bucket_start >= ?) OR (granularity = 'minute' AND bucket_start >= ?)
@@ -608,7 +609,8 @@ app.get('/api/metrics', async (request, reply) => {
       FROM performance_metrics
       WHERE granularity = 'minute' AND metric = 'processed' AND bucket_start >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 60 MINUTE)
       GROUP BY DATE_FORMAT(bucket_start, '%Y-%m-%d %H:%i:00'), scope
-      ORDER BY bucket_start ASC, scope ASC`)
+      ORDER BY bucket_start ASC, scope ASC`),
+    getRuntimeMetrics()
   ]);
   const metric = (scope: string, name: string, dimension?: string) => summaryRows
     .filter((row) => row.scope === scope && row.metric === name && (dimension === undefined || row.dimension === dimension))
@@ -616,6 +618,11 @@ app.get('/api/metrics', async (request, reply) => {
   const jellyfinHit = metric('library', 'jellyfin_cache', 'hit').count;
   const jellyfinMiss = metric('library', 'jellyfin_cache', 'miss').count;
   const scopes = ['capture', 'release', 'magnet', 'library', 'download'];
+  const runtime = new Map(runtimeRows.map((row) => [row.metric_key, row]));
+  const numberMetric = (key: string) => {
+    const value = runtime.get(key)?.numeric_value;
+    return value === null || value === undefined ? null : Number(value);
+  };
   return {
     range,
     generatedAt: new Date().toISOString(),
@@ -626,7 +633,18 @@ app.get('/api/metrics', async (request, reply) => {
     }),
     retries: summaryRows.filter((row) => row.metric === 'retry').map((row) => ({ scope: row.scope, reason: row.dimension, count: Number(row.sample_count) })),
     chromiumRebuilds: summaryRows.filter((row) => row.metric === 'chromium_rebuild').map((row) => ({ scope: row.scope, reason: row.dimension, count: Number(row.sample_count) })),
-    throughput: throughput.map((row) => ({ minute: `${row.bucket_start.replace(' ', 'T')}Z`, scope: row.scope, count: Number(row.sample_count) }))
+    throughput: throughput.map((row) => ({ minute: `${row.bucket_start.replace(' ', 'T')}Z`, scope: row.scope, count: Number(row.sample_count) })),
+    runtime: {
+      containerMemoryBytes: numberMetric('container_memory_bytes'),
+      apiRssBytes: numberMetric('api_rss_bytes'),
+      runnerRssBytes: numberMetric('runner_rss_bytes'),
+      browser: {
+        state: runtime.get('browser_state')?.text_value ?? 'unknown',
+        activePages: numberMetric('browser_active_pages'),
+        queuedPages: numberMetric('browser_queued_pages'),
+        navigationCount: numberMetric('browser_navigation_count')
+      }
+    }
   };
 });
 
@@ -1068,6 +1086,16 @@ app.put('/api/settings/network', async (request, reply) => {
   }
 });
 
+app.get('/api/settings/runtime', async () => getRuntimeSettings());
+app.put('/api/settings/runtime', async (request, reply) => {
+  const body = request.body as { profile?: unknown; browserIdleMinutes?: unknown };
+  if (body.profile !== 'safe' && body.profile !== 'performance') return reply.code(400).send({ error: '运行模式无效。' });
+  if (![5, 10, 20].includes(Number(body.browserIdleMinutes))) return reply.code(400).send({ error: '浏览器空闲回收时间只能是 5、10 或 20 分钟。' });
+  const settings = await setRuntimeSettings({ profile: body.profile, browserIdleMinutes: Number(body.browserIdleMinutes) as 5 | 10 | 20 });
+  await appendRuntimeLog({ level: 'info', source: 'system', message: `运行性能设置已更新：${settings.profile === 'performance' ? '性能模式' : '稳妥模式'}，浏览器空闲 ${settings.browserIdleMinutes} 分钟后回收。` });
+  return settings;
+});
+
 app.get('/api/settings/qbittorrent', async () => publicQbittorrentSettings());
 app.put('/api/settings/qbittorrent', async (request, reply) => {
   try {
@@ -1241,7 +1269,21 @@ app.delete('/api/subscriptions/:id/archive', async (request, reply) => {
 app.post('/api/subscriptions/preview', async (request, reply) => {
   try {
     const values = await normalizePayload(request.body as SubscriptionPayload);
-    return await previewCapture({ url: values.url, selector: values.selector, render_mode: values.renderMode as Subscription['render_mode'], content_source: values.contentSource as Subscription['content_source'], attribute_name: values.attributeName, match_pattern: values.matchPattern, title_selector: values.titleSelector, title_content_source: values.titleContentSource as Subscription['title_content_source'], title_attribute_name: values.titleAttributeName, title_match_pattern: values.titleMatchPattern, result_mode: values.resultMode as Subscription['result_mode'] });
+    const token = process.env.WORKER_EVENT_TOKEN || (process.env.NODE_ENV === 'production' ? '' : 'page-watch-dev-runner');
+    if (!token) throw new Error('统一执行引擎尚未就绪，请稍后重试。');
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60_000);
+    try {
+      const response = await fetch(`http://127.0.0.1:${process.env.RUNNER_INTERNAL_PORT || '3031'}/preview`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-page-watch-worker-token': token },
+        body: JSON.stringify({ url: values.url, selector: values.selector, render_mode: values.renderMode as Subscription['render_mode'], content_source: values.contentSource as Subscription['content_source'], attribute_name: values.attributeName, match_pattern: values.matchPattern, title_selector: values.titleSelector, title_content_source: values.titleContentSource as Subscription['title_content_source'], title_attribute_name: values.titleAttributeName, title_match_pattern: values.titleMatchPattern, result_mode: values.resultMode as Subscription['result_mode'] }),
+        signal: controller.signal
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(typeof result.error === 'string' ? result.error : '预览抽取失败。');
+      return result;
+    } finally { clearTimeout(timeout); }
   } catch (error) {
     return reply.code(400).send({ error: error instanceof Error ? error.message : '预览失败。' });
   }
@@ -1282,6 +1324,7 @@ app.listen({ port, host: '0.0.0.0' }).then(() => {
   const beat = () => void reportWorkerHeartbeat('api', `网页服务监听端口 ${port}`).catch((error) => app.log.warn(`Unable to save API heartbeat: ${error instanceof Error ? error.message : String(error)}`));
   beat();
   setInterval(beat, 15_000);
+  startRuntimeMemoryReporter('api');
   void appendRuntimeLog({ level: 'info', source: 'system', message: `网页服务已启动，监听端口 ${port}。` })
     .catch((error) => app.log.warn(`Unable to save service startup log: ${error instanceof Error ? error.message : String(error)}`));
   const maintainMetrics = async () => {
