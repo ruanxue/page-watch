@@ -29,7 +29,8 @@ export function encryptSecret(value: string, key: Buffer) {
 export function decryptSecret(value: string, key: Buffer) {
   if (!isEncryptedSecret(value)) return value;
   const [, , encodedIv, encodedCiphertext, encodedTag, extra] = value.split(':');
-  if (!encodedIv || !encodedCiphertext || !encodedTag || extra) throw new Error('保存的敏感配置格式无效。请重新配置对应服务。');
+  // AES-GCM 对空字符串会产生合法的空密文段；IV 与认证标签仍必须存在。
+  if (!encodedIv || encodedCiphertext === undefined || !encodedTag || extra) throw new Error('保存的敏感配置格式无效。请重新配置对应服务。');
   try {
     const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(encodedIv, 'base64url'));
     decipher.setAuthTag(Buffer.from(encodedTag, 'base64url'));

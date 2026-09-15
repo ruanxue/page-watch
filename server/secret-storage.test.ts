@@ -11,6 +11,12 @@ test('encrypts and decrypts a versioned AES-GCM secret', () => {
   assert.equal(decryptSecret(ciphertext, readApplicationEncryptionKey(testKey)), 'private-token');
 });
 
+test('encrypts and decrypts an empty secret', () => {
+  const ciphertext = encryptSecret('', readApplicationEncryptionKey(testKey));
+  assert.equal(isEncryptedSecret(ciphertext), true);
+  assert.equal(decryptSecret(ciphertext, readApplicationEncryptionKey(testKey)), '');
+});
+
 test('rejects malformed keys and tampered ciphertext without returning a secret', () => {
   assert.throws(() => readApplicationEncryptionKey('short'), /32 字节/);
   assert.throws(() => readApplicationEncryptionKey('not a base64url key'), /Base64URL/);
