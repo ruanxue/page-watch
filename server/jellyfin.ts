@@ -14,6 +14,7 @@ export type JellyfinLibrary = {
 
 export type JellyfinMedia = {
   id: string;
+  libraryId: string;
   name: string;
   originalTitle: string | null;
   path: string | null;
@@ -141,7 +142,7 @@ export function isIndexedJellyfinVideoType(type: string) {
   return INDEXED_VIDEO_TYPES.has(type);
 }
 
-function normalizeMedia(value: unknown) {
+function normalizeMedia(value: unknown, libraryId: string) {
   const item = value as { Id?: unknown; Name?: unknown; OriginalTitle?: unknown; Path?: unknown; Type?: unknown };
   const id = typeof item.Id === 'string' ? item.Id.trim() : '';
   const name = typeof item.Name === 'string' ? item.Name.trim() : '';
@@ -152,6 +153,7 @@ function normalizeMedia(value: unknown) {
   if (!isIndexedJellyfinVideoType(type)) return null;
   return id && name ? {
     id,
+    libraryId,
     name,
     originalTitle: typeof item.OriginalTitle === 'string' && item.OriginalTitle.trim() ? item.OriginalTitle.trim() : null,
     path: typeof item.Path === 'string' && item.Path.trim() ? item.Path.trim() : null,
@@ -186,7 +188,7 @@ export async function listJellyfinMedia(config: JellyfinConfig) {
       // advancing by PAGE_SIZE or by filtered rows would skip real movies.
       const received = result.Items.length;
       const page = result.Items.flatMap((item) => {
-        const media = normalizeMedia(item);
+        const media = normalizeMedia(item, libraryId);
         return media ? [media] : [];
       });
       all.push(...page);
@@ -211,7 +213,7 @@ export async function findJellyfinMedia(config: JellyfinConfig, content: string)
     const result = await jellyfinRequest(checked, userItemsPath(userId), query) as JellyfinItemsResponse;
     if (!Array.isArray(result.Items)) throw new Error('Jellyfin 单条查询结果格式无效。');
     matches.push(...result.Items.flatMap((item) => {
-      const media = normalizeMedia(item);
+      const media = normalizeMedia(item, libraryId);
       return media ? [media] : [];
     }));
   }

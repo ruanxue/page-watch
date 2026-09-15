@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { FormEvent, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
 type Subscription = {
   id: number;
@@ -34,6 +34,7 @@ type Subscription = {
   next_scheduled_at: string | null;
   full_scan_active: number;
   archive_count: number;
+  jellyfin_available_count: number;
   queue_summary: Record<string, { done: number; total: number }> | string;
 };
 
@@ -74,7 +75,7 @@ type ArchiveEntry = {
   magnet_value: string | null;
   magnet_checked_at: string | null;
   magnet_error: string | null;
-  download_status: 'not_queued' | 'queued' | 'running' | 'added' | 'waiting' | 'downloading' | 'paused' | 'completed' | 'removed' | 'failed';
+  download_status: 'not_queued' | 'queued' | 'running' | 'added' | 'waiting' | 'downloading' | 'paused' | 'completed' | 'removed' | 'filtered' | 'failed';
   download_queued_at: string | null;
   download_added_at: string | null;
   download_torrent_hash: string | null;
@@ -87,6 +88,7 @@ type ArchiveEntry = {
   download_save_path: string | null;
   download_content_path: string | null;
   download_removed_at: string | null;
+  download_filter_min_size_bytes: number | string | null;
   jellyfin_status: 'unconfigured' | 'pending' | 'available' | 'not_found' | 'failed';
   jellyfin_item_id: string | null;
   jellyfin_item_name: string | null;
@@ -114,11 +116,37 @@ type RuntimeLog = {
   job_id: number | null;
   message: string;
   created_at: string;
+  scope: 'system' | 'check' | 'release' | 'magnet' | 'download' | 'library';
 };
 
 type AuthStatus = { setupRequired: boolean; authenticated: boolean };
 type SystemService = { name: string; label: string; status: 'ready' | 'busy' | 'error' | 'missing'; detail: string; lastSeenAt: string | null; healthy: boolean };
 type SystemStatus = { generatedAt: string; services: SystemService[] };
+type TaskStatus = 'queued' | 'running' | 'retrying' | 'completed' | 'failed';
+type TaskItem = {
+  id: string;
+  kind: 'check' | 'full_scan' | 'release' | 'magnet' | 'library' | 'download' | 'library_sync';
+  status: TaskStatus;
+  priority: number;
+  subscriptionId: number | null;
+  subscriptionName: string | null;
+  content: string | null;
+  title: string | null;
+  requestedAt: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  retryAfter: string | null;
+  attemptCount: number;
+  error: string | null;
+  progress: { current: number | null; total: number | null; label: string | null } | null;
+};
+type TasksResponse = {
+  generatedAt: string;
+  summary: { servicesOnline: number; running: number; queued: number; retrying: number; failed: number };
+  services: SystemService[];
+  active: TaskItem[];
+  history: TaskItem[];
+};
 
 const blankForm: FormData = {
   name: '', url: '', selector: '', renderMode: 'static', contentSource: 'text', attributeName: '', matchPattern: '', titleSelector: '', titleContentSource: 'text', titleAttributeName: '', titleMatchPattern: '', resultMode: 'first', intervalMinutes: 60, scheduleType: 'hourly', scheduleIntervalHours: 1, scheduleTime: '09:00', scheduleWeekday: 1, isActive: true, paginationSelector: '', paginationParameter: 'page', paginationMatchPattern: ''
@@ -175,10 +203,10 @@ function shortUrl(value: string) {
 
 const weekdayLabels = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
 
-type View = 'subscriptions' | 'archive' | 'logs' | 'downloads';
+type View = 'subscriptions' | 'archive' | 'downloads' | 'operations';
 
 function viewFromHash(): View {
-  if (window.location.hash === '#logs') return 'logs';
+  if (window.location.hash === '#logs' || window.location.hash === '#tasks' || window.location.hash === '#operations') return 'operations';
   if (window.location.hash === '#archive' || window.location.hash === '#activity') return 'archive';
   if (window.location.hash === '#downloads') return 'downloads';
   return 'subscriptions';
@@ -207,6 +235,7 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const [view, setView] = useState<View>(viewFromHash);
   const [rulesOpen, setRulesOpen] = useState(() => window.location.hash === '#rules');
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
+  const [taskSummary, setTaskSummary] = useState<TasksResponse['summary'] | null>(null);
 
   const load = async () => {
     try { setSubscriptions(await request<Subscription[]>('/api/subscriptions')); }
@@ -233,6 +262,19 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
     return () => stream.close();
   }, []);
   useEffect(() => {
+    let alive = true;
+    const loadTasks = async () => {
+      try {
+        const tasks = await request<TasksResponse>('/api/tasks');
+        if (alive) setTaskSummary(tasks.summary);
+      } catch { if (alive) setTaskSummary(null); }
+    };
+    void loadTasks();
+    const stream = new EventSource('/api/events?channel=tasks');
+    stream.addEventListener('tasks', () => void loadTasks());
+    return () => { alive = false; stream.close(); };
+  }, []);
+  useEffect(() => {
     const syncView = () => {
       setView(viewFromHash());
       setRulesOpen(window.location.hash === '#rules');
@@ -254,11 +296,15 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const stats = useMemo(() => ({
     total: subscriptions.length,
     active: subscriptions.filter((item) => item.is_active).length,
-    archived: subscriptions.reduce((sum, item) => sum + item.archive_count, 0)
+    archived: subscriptions.reduce((sum, item) => sum + item.archive_count, 0),
+    libraryAvailable: subscriptions.reduce((sum, item) => sum + Number(item.jellyfin_available_count ?? 0), 0)
   }), [subscriptions]);
   const unhealthyServices = systemStatus?.services.filter((service) => !service.healthy) ?? [];
+  const busyServiceCount = systemStatus?.services.filter((service) => service.healthy && service.status === 'busy').length ?? 0;
   const servicesHealthy = Boolean(systemStatus && unhealthyServices.length === 0);
   const serviceAttention = unhealthyServices.map((service) => `${service.label}：${service.status === 'missing' ? '尚未启动' : service.detail}`).join('；');
+  const taskCount = taskSummary?.running ?? busyServiceCount;
+  const healthyServiceSummary = systemStatus ? `${systemStatus.services.length} 项服务在线 · ${taskCount} 项任务执行中` : '';
 
   function openRules() {
     setRulesOpen(true);
@@ -309,28 +355,28 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
       <div className="brand"><span className="brand-mark">⌁</span><span>PAGE WATCH</span></div>
       <nav aria-label="主导航">
         <a className={`nav-item ${view === 'subscriptions' ? 'active' : ''}`} href="#subscriptions"><span>◉</span> 订阅中心 <b>{stats.total}</b></a>
+        <a className={`nav-item ${view === 'operations' ? 'active' : ''}`} href="#operations"><span>◫</span> 运行中心 {taskCount ? <b>{taskCount}</b> : null}</a>
         <a className={`nav-item ${view === 'archive' ? 'active' : ''}`} href="#archive"><span>◌</span> 内容档案</a>
         <a className={`nav-item ${view === 'downloads' ? 'active' : ''}`} href="#downloads"><span>⇩</span> 下载与影视库</a>
-        <a className={`nav-item ${view === 'logs' ? 'active' : ''}`} href="#logs"><span>≡</span> 运行日志</a>
         <button className="nav-item nav-button" onClick={() => setNetworkSettingsOpen(true)}><span>⌁</span> 网络代理</button>
       </nav>
       <div className={`sidebar-note ${servicesHealthy ? '' : 'needs-attention'}`} title={serviceAttention}>
         <span className="pulse" /> {servicesHealthy ? '后台服务运行正常' : systemStatus ? `服务需要注意（${unhealthyServices.length}）` : '正在确认服务状态…'}
-        <small>{servicesHealthy ? '网页、检查、磁力、下载与影视库服务均有心跳' : serviceAttention || '正在读取服务状态…'}</small>
+        {servicesHealthy ? <a className="sidebar-task-link" href="#operations">{healthyServiceSummary}</a> : <small>{serviceAttention || '正在读取服务状态…'}</small>}
         <button type="button" className="sign-out" onClick={() => void onLogout()}>退出登录</button>
       </div>
     </aside>
 
     <section className="workspace">
       <header className="topbar">
-        <div><p className="eyebrow">自托管网页监测</p><h1>{view === 'archive' ? '内容档案' : view === 'logs' ? '运行日志' : view === 'downloads' ? '下载与影视库' : '订阅中心'}</h1></div>
+        <div><p className="eyebrow">自托管网页监测</p><h1>{view === 'archive' ? '内容档案' : view === 'downloads' ? '下载与影视库' : view === 'operations' ? '运行中心' : '订阅中心'}</h1></div>
         {view === 'subscriptions' && <div className="topbar-actions"><button type="button" className="secondary" onClick={() => openRules()}>检查规则</button><button className="primary" onClick={() => setEditor('new')}><span>＋</span> 新建订阅</button></div>}
       </header>
 
       {view === 'subscriptions' ? <><section className="summary" aria-label="订阅概览">
         <div><span>全部订阅</span><strong>{stats.total}</strong></div>
         <div><span>正在监测</span><strong>{stats.active}</strong></div>
-        <div><span>收录内容</span><strong>{stats.archived}</strong></div>
+        <div><span>已入库 / 收录内容</span><strong>{stats.libraryAvailable} / {stats.archived}</strong></div>
       </section>
 
       <section id="subscriptions" className="list-section">
@@ -341,7 +387,7 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
           </div>}
       </section>
       <RulesLibrary open={rulesOpen} onToggle={() => setRulesOpen((current) => !current)} onNotice={setNotice} />
-      </> : view === 'archive' ? <ArchivePage subscriptions={subscriptions} onNotice={setNotice} /> : view === 'downloads' ? <QbittorrentSettingsPage onNotice={setNotice} /> : <RuntimeLogsPage />}
+      </> : view === 'archive' ? <ArchivePage subscriptions={subscriptions} onNotice={setNotice} /> : view === 'downloads' ? <QbittorrentSettingsPage onNotice={setNotice} /> : <OperationsCenterPage onSummary={setTaskSummary} />}
       {notice && <div className="toast" role="status">{notice}</div>}
     </section>
     {editor && <Editor item={editor === 'new' ? null : editor} onClose={() => setEditor(null)} onSaved={async () => { setEditor(null); await load(); setNotice('订阅已保存。'); }} onFullScan={async () => { await load(); setNotice('已加入全量检查队列。'); }} onArchiveCleared={async () => { setEditor(null); await load(); setNotice('订阅数据已重置。'); }} />}
@@ -393,14 +439,9 @@ function Empty({ onCreate }: { onCreate: () => void }) {
 }
 
 function SubscriptionCard({ item, onRun, onEdit, onConfigure, onToggle, onDelete }: { item: Subscription; onRun: (item: Subscription) => void; onEdit: (item: Subscription) => void; onConfigure: (item: Subscription) => void; onToggle: (item: Subscription) => void; onDelete: (item: Subscription) => void }) {
-  const summary = typeof item.queue_summary === 'string' ? JSON.parse(item.queue_summary) as Record<string, { done: number; total: number }> : item.queue_summary;
-  const progress = [['check', '检查'], ['release', '发行日期'], ['magnet', '磁力'], ['library', '影视库'], ['download', '下载']].flatMap(([key, label]) => {
-    const value = summary?.[key]; return value?.total ? [`${label} ${value.done}/${value.total}`] : [];
-  });
   return <article className={`subscription-card ${item.last_error ? 'has-error' : ''}`}>
     <div className="card-top"><div className="site-ident">{shortUrl(item.url).slice(0, 1).toUpperCase()}</div><div className="card-title"><h3>{item.name}</h3><a href={item.url} target="_blank" rel="noreferrer">{shortUrl(item.url)} ↗</a></div><button className="icon-button" title="编辑订阅" onClick={() => onEdit(item)}>⋯</button></div>
-    <div className="selector-row"><span>SELECTOR</span><code>{item.selector || '尚未配置'}</code>{item.selector && <>{item.content_source === 'attribute' && <span className="attribute-pill">@{item.attribute_name}</span>}{item.result_mode === 'all' && <span className="attribute-pill">全部</span>}{item.match_pattern && <span className="attribute-pill">匹配</span>}<span className={`mode ${item.render_mode}`}>{item.render_mode === 'dynamic' ? '浏览器渲染' : 'HTML 抓取'}</span></>}</div>
-    {item.last_error && <div className="error-line">上次失败：{item.last_error}</div>}{progress.length > 0 && <div className="queue-progress" title="队列状态会实时更新">{progress.join(' · ')}</div>}
+    {item.last_error && <div className="error-line">上次失败：{item.last_error}</div>}
     <footer className="card-footer"><button type="button" className={`subscription-switch ${item.is_active ? 'on' : ''}`} role="switch" aria-checked={Boolean(item.is_active)} disabled={!item.selector} title={!item.selector ? '请先配置读取规则' : item.is_active ? '暂停订阅' : '启用订阅'} onClick={() => onToggle(item)}><span aria-hidden="true" /><em>{item.is_active ? '已启用' : '已暂停'}</em></button>{item.is_active && <span>{scheduleLabel(item)}</span>}<span>上次：{formatTime(item.last_checked_at)}</span>{Boolean(item.full_scan_active) && <span className="scan-progress"><b>{item.initial_scan_total ? `全量 ${item.initial_scan_pages_completed}/${item.initial_scan_total}` : '全量准备中'}</b><i><em style={{ width: item.initial_scan_total ? `${Math.min(100, item.initial_scan_pages_completed / item.initial_scan_total * 100)}%` : '18%' }} /></i></span>}<div className="card-actions"><button type="button" onClick={() => onConfigure(item)}>{item.selector ? '规则' : '配置规则'}</button><button disabled={!item.selector} title={!item.selector ? '请先配置读取规则' : undefined} onClick={() => onRun(item)}>立即检查</button><button className="danger" onClick={() => onDelete(item)}>删除</button></div></footer>
   </article>;
 }
@@ -434,17 +475,23 @@ function magnetSearchUrl(rules: InspectionRules | null, content: string) {
 
 function DownloadCell({ entry, downloadingId, onSubmit }: { entry: ArchiveEntry; downloadingId: number | null; onSubmit: (entry: ArchiveEntry) => void }) {
   if (entry.magnet_status !== 'found') return <span>—</span>;
-  if (entry.download_status === 'not_queued' || entry.download_status === 'failed') {
-    return <button className={`download-action ${entry.download_status === 'failed' ? 'download-failed' : ''}`} type="button" disabled={downloadingId === entry.id} title={entry.download_status === 'failed' ? (entry.download_error || '提交失败，点击重试') : '提交给 qBittorrent'} onClick={() => void onSubmit(entry)}>{entry.download_status === 'failed' ? '重试' : '下载'}</button>;
+  if (entry.download_status === 'not_queued' || entry.download_status === 'failed' || entry.download_status === 'filtered') {
+    const wasFiltered = entry.download_status === 'filtered';
+    const title = entry.download_status === 'failed'
+      ? (entry.download_error || '提交失败，点击重试')
+      : wasFiltered
+        ? (entry.download_error || '种子内文件均未达到最小单文件大小；点击可按当前设置重新筛选')
+        : '提交给 qBittorrent';
+    return <button className={`download-action ${entry.download_status === 'failed' ? 'download-failed' : wasFiltered ? 'download-filtered' : ''}`} type="button" disabled={downloadingId === entry.id} title={title} onClick={() => void onSubmit(entry)}>{entry.download_status === 'failed' ? '重试' : wasFiltered ? '重新筛选' : '下载'}</button>;
   }
   if (entry.download_status === 'queued' || entry.download_status === 'running') return <span className="download-state pending">提交中</span>;
   const status = entry.download_status === 'completed' ? '完成'
     : entry.download_status === 'downloading' ? `${Math.round(Math.min(1, asNumber(entry.download_progress)) * 100)}%`
       : entry.download_status === 'waiting' ? '等待'
-        : entry.download_status === 'paused' ? '暂停'
+          : entry.download_status === 'paused' ? '暂停'
           : entry.download_status === 'removed' ? '已删除'
             : '已提交';
-  return <span className={`download-status-button ${entry.download_status}`}>{status}</span>;
+  return <span className={`download-status-button ${entry.download_status}`} title={entry.download_error || status}>{status}</span>;
 }
 
 function jellyfinItemUrl(baseUrl: string, itemId: string | null) {
@@ -596,14 +643,10 @@ function ArchivePage({ subscriptions, onNotice }: { subscriptions: Subscription[
       onNotice('磁力链接已复制到剪贴板。');
     } catch { onNotice('浏览器无法复制，请检查剪贴板权限。'); }
   };
-  const selectedSummary = selected ? (typeof selected.queue_summary === 'string' ? JSON.parse(selected.queue_summary) as Record<string, { done: number; total: number }> : selected.queue_summary) : null;
-  const selectedProgress = selectedSummary ? [['check', '检查'], ['release', '发行日期'], ['magnet', '磁力'], ['library', '影视库'], ['download', '下载']].flatMap(([key, label]) => {
-    const value = selectedSummary[key]; return value?.total ? [`${label} ${value.done}/${value.total}`] : [];
-  }) : [];
   const archiveTotalPages = Math.max(1, Math.ceil(archiveTotal / archivePageSize));
   const clearArchiveFilters = () => { setArchiveQuery(''); setReleaseFrom(''); setReleaseTo(''); setArchivePage(1); };
   if (selected) return <section id="archive" className="archive-section">
-    <div className="section-head"><div><button className="back-button" onClick={() => setSelected(null)}>← 内容档案</button><h2>{selected.name}</h2><p>{shortUrl(selected.url)} · 共 {selected.archive_count} 条归档内容{selected.full_scan_active ? ` · 全量 ${selected.initial_scan_pages_completed}/${selected.initial_scan_total ?? '?'}` : ''}</p>{selectedProgress.length > 0 && <p className="archive-queue-progress">{selectedProgress.join(' · ')}</p>}</div><div className="archive-actions"><button className="secondary" disabled={releaseBackfillBusy} onClick={() => void backfillReleaseDates()}>{releaseBackfillBusy ? '正在排队…' : '检索发行日期'}</button><button className="secondary" disabled={backfillBusy} onClick={() => void backfillMagnets()}>{backfillBusy ? '正在排队…' : '补全磁力链接'}</button><button className="secondary" disabled={downloadBackfillBusy} onClick={() => void backfillDownloads()}>{downloadBackfillBusy ? '正在排队…' : '提交可下载项'}</button><button className="quiet" onClick={() => void loadArchive(selected)}>↻ 刷新</button></div></div>
+    <div className="section-head"><div><button className="back-button" onClick={() => setSelected(null)}>← 内容档案</button><h2>{selected.name}</h2><p>{shortUrl(selected.url)} · 共 {selected.archive_count} 条归档内容{selected.full_scan_active ? ` · 全量 ${selected.initial_scan_pages_completed}/${selected.initial_scan_total ?? '?'}` : ''}</p><p className="archive-library-summary">影视库 · 已入库 {selected.jellyfin_available_count ?? 0}/{selected.archive_count}</p></div><div className="archive-actions"><button className="secondary" disabled={releaseBackfillBusy} onClick={() => void backfillReleaseDates()}>{releaseBackfillBusy ? '正在排队…' : '检索发行日期'}</button><button className="secondary" disabled={backfillBusy} onClick={() => void backfillMagnets()}>{backfillBusy ? '正在排队…' : '补全磁力链接'}</button><button className="secondary" disabled={downloadBackfillBusy} onClick={() => void backfillDownloads()}>{downloadBackfillBusy ? '正在排队…' : '提交可下载项'}</button><button className="quiet" onClick={() => void loadArchive(selected)}>↻ 刷新</button></div></div>
     <div className="archive-filter-bar"><input value={archiveQuery} onChange={(event) => { setArchiveQuery(event.target.value); setArchivePage(1); }} placeholder="筛选番号或标题" aria-label="筛选番号或标题" /><label>发行日期从<input type="date" value={releaseFrom} onChange={(event) => { setReleaseFrom(event.target.value); setArchivePage(1); }} /></label><label>至<input type="date" value={releaseTo} onChange={(event) => { setReleaseTo(event.target.value); setArchivePage(1); }} /></label>{(archiveQuery || releaseFrom || releaseTo) && <button className="quiet archive-filter-clear" type="button" onClick={clearArchiveFilters}>清除筛选</button>}</div>
     {loading ? <div className="empty">正在读取内容…</div> : error ? <div className="form-error">{error}</div> : entries.length === 0 ? <div className="empty-card archive-empty"><h3>尚无归档内容</h3><p>完成一次检查后，提取结果会出现在这里。</p></div> : <div className="archive-table-wrap"><table className="archive-table"><thead><tr><th className="archive-index">序号</th><th>番号</th><th>标题</th><th>发行日期</th><th>磁力链接</th><th>影视库</th><th>操作</th></tr></thead><tbody>{entries.map((entry, index) => { const detailUrl = archiveContentUrl(entry); const searchUrl = magnetSearchUrl(inspectionRules, entry.content); return <tr key={entry.id}><td className="archive-index">{index + 1}</td><td>{detailUrl ? <a className="archive-content-link" href={detailUrl} target="_blank" rel="noreferrer" title="打开所属网站的详情页"><code>{entry.content}</code></a> : <code>{entry.content}</code>}</td><td className="archive-title">{entry.title || '—'}</td><td><ReleaseDateCell entry={entry} /></td><td className="magnet-cell">{entry.magnet_status === 'found' ? <button className="magnet-action magnet-copy" type="button" onClick={() => void copyMagnet(entry)}>复制</button> : entry.magnet_status === 'skipped' ? <span className="magnet-action magnet-skipped" title="Jellyfin 已入库，自动跳过磁力检索">已跳过</span> : entry.magnet_status === 'pending' ? <span className="magnet-action magnet-pending">检索中</span> : entry.magnet_status === 'not_found' ? <button className="magnet-action magnet-retry" type="button" disabled={retryingId === entry.id} aria-busy={retryingId === entry.id} aria-label={retryingId === entry.id ? '正在加入磁力检索队列' : '未找到磁力链接，重新检索'} title={retryingId === entry.id ? '正在加入队列' : '未找到，点击重新检索'} onClick={() => void retryMagnet(entry)}>重试</button> : entry.magnet_status === 'failed' ? <button className="magnet-action magnet-retry magnet-failed" type="button" disabled={retryingId === entry.id} aria-busy={retryingId === entry.id} aria-label={retryingId === entry.id ? '正在加入磁力检索队列' : '磁力检索失败，重新检索'} title={retryingId === entry.id ? '正在加入队列' : '检索失败，点击重新检索'} onClick={() => void retryMagnet(entry)}>重试</button> : <span className="magnet-action">待补全</span>}</td><td className="jellyfin-cell"><JellyfinCell entry={entry} baseUrl={jellyfinBaseUrl} /></td><td className="download-cell">{entry.magnet_status === 'found' ? <DownloadCell entry={entry} downloadingId={downloadingId} onSubmit={submitDownload} /> : searchUrl ? <a className="download-action magnet-search-link" href={searchUrl} target="_blank" rel="noreferrer" title={`前往磁力搜索页面检索 ${entry.content}`}>搜索</a> : '—'}</td></tr>; })}</tbody></table></div>}
     {!loading && !error && <div className="archive-pagination"><span>共 {archiveTotal} 条 · 第 {archivePage} / {archiveTotalPages} 页</span><label>每页<select value={archivePageSize} onChange={(event) => { setArchivePageSize(Number(event.target.value)); setArchivePage(1); }}><option value={50}>50 条</option><option value={100}>100 条</option><option value={200}>200 条</option></select></label><button className="quiet" type="button" disabled={archivePage <= 1} onClick={() => setArchivePage((page) => page - 1)}>上一页</button><button className="quiet" type="button" disabled={archivePage >= archiveTotalPages} onClick={() => setArchivePage((page) => page + 1)}>下一页</button></div>}
@@ -614,34 +657,203 @@ function ArchivePage({ subscriptions, onNotice }: { subscriptions: Subscription[
   </section>;
 }
 
-function RuntimeLogsPage() {
+const taskKindLabel: Record<TaskItem['kind'], string> = { check: '网页检查', full_scan: '全量检查', release: '发行日期', magnet: '磁力检索', library: '影视库匹配', download: '下载', library_sync: '影视库同步' };
+const taskStatusLabel: Record<TaskStatus, string> = { queued: '排队中', running: '执行中', retrying: '等待重试', completed: '已完成', failed: '失败' };
+
+type OperationScope = 'system' | 'check' | 'release' | 'magnet' | 'download' | 'library';
+
+const operationDefinitions: Array<{ scope: OperationScope; service: string; label: string; description: string; kinds: TaskItem['kind'][] }> = [
+  { scope: 'system', service: 'api', label: '网页服务', description: '网页接口、认证与系统级事件。', kinds: [] },
+  { scope: 'check', service: 'capture', label: '网页检查', description: '订阅检查、计划任务与全量扫描。', kinds: ['check', 'full_scan'] },
+  { scope: 'release', service: 'release', label: '发行日期', description: '详情页读取与发行日期补全。', kinds: ['release'] },
+  { scope: 'magnet', service: 'magnet', label: '磁力检索', description: '搜索、详情页读取与磁力补全。', kinds: ['magnet'] },
+  { scope: 'download', service: 'download', label: '下载', description: 'qBittorrent 提交、同步与完成状态。', kinds: ['download'] },
+  { scope: 'library', service: 'library', label: '影视库', description: 'Jellyfin 单条匹配与媒体库同步。', kinds: ['library', 'library_sync'] }
+];
+
+const operationDefinition = (scope: OperationScope) => operationDefinitions.find((item) => item.scope === scope)!;
+
+function taskMatchesScope(task: TaskItem, scope: OperationScope) {
+  return operationDefinition(scope).kinds.includes(task.kind);
+}
+
+function TaskCenterPage({ data, error, scope }: { data: TasksResponse | null; error: string; scope: OperationScope }) {
+  const [filter, setFilter] = useState<'all' | 'running' | 'queued' | 'failed' | 'completed'>('all');
+  const definition = operationDefinition(scope);
+  const service = data?.services.find((item) => item.name === definition.service);
+  const scopedActive = (data?.active ?? []).filter((task) => taskMatchesScope(task, scope));
+  const scopedHistory = (data?.history ?? []).filter((task) => taskMatchesScope(task, scope));
+  const active = scopedActive.filter((task) => {
+    if (filter === 'all') return true;
+    if (filter === 'running') return task.status === 'running';
+    if (filter === 'queued') return task.status === 'queued' || task.status === 'retrying';
+    return false;
+  });
+  const history = scopedHistory.filter((task) => filter === 'all' || task.status === filter);
+  const renderTask = (task: TaskItem) => {
+    const progress = task.progress;
+    const percent = progress?.total && progress.current !== null ? Math.max(0, Math.min(100, Math.round(progress.current / progress.total * 100))) : null;
+    const description = progress?.label || (task.kind === 'check' ? task.status === 'running' ? '正在读取网页内容' : '单次检查完成' : null);
+    return <article className={`task-entry ${task.status}`} key={task.id}>
+      <div className="task-entry-head"><span className={`task-state ${task.status}`}>{taskStatusLabel[task.status]}</span><span className="task-kind">{taskKindLabel[task.kind]}</span>{task.priority >= 10 && <span className="task-priority">手动</span>}<time>{formatTime(task.startedAt ?? task.requestedAt ?? task.finishedAt)}</time></div>
+      <div className="task-entry-copy"><strong>{task.subscriptionName ?? (task.kind === 'library_sync' ? 'Jellyfin 影视库' : '系统任务')}</strong>{task.content && <code title={task.content}>{task.content}</code>}{task.title && <span title={task.title}>{task.title}</span>}</div>
+      {description && <p className="task-description">{description}</p>}
+      {percent !== null && <div className="task-progress" aria-label={`${percent}%`}><i style={{ width: `${percent}%` }} /><span>{progress?.current} / {progress?.total}</span></div>}
+      {task.status === 'retrying' && task.retryAfter && <p className="task-meta">将在 {formatTime(task.retryAfter)} 后重试（第 {task.attemptCount} 次）</p>}
+      {task.error && <p className="task-error" title={task.error}>{task.error}</p>}
+    </article>;
+  };
+  const serviceState = !service ? '状态读取中' : service.status === 'busy' ? '正在执行' : service.healthy ? '在线待命' : service.status === 'missing' ? '未启动' : '需要注意';
+  return <section className="task-center-page operation-task-panel">
+    <div className="section-head"><div><p className="eyebrow">{definition.label}</p><h2>{definition.label}任务</h2><p>{definition.description}</p></div></div>
+    <section className={`operation-worker-state ${service?.healthy ? service.status : 'error'}`}><div><strong>{serviceState}</strong><span>{service?.detail ?? '正在读取 Worker 心跳。'}</span></div><small>{service?.lastSeenAt ? `最近心跳 ${formatTime(service.lastSeenAt)}` : '尚未收到心跳'}</small></section>
+    <div className="task-toolbar" role="group" aria-label="任务筛选">{([['all', '全部'], ['running', '执行中'], ['queued', '排队中'], ['failed', '失败'], ['completed', '最近完成']] as const).map(([key, label]) => <button key={key} type="button" className={filter === key ? 'active' : ''} onClick={() => setFilter(key)}>{label}</button>)}</div>
+    {error ? <div className="form-error">{error}</div> : !data ? <div className="empty">正在读取任务状态…</div> : <>
+      {(filter === 'all' || filter === 'running' || filter === 'queued') && <section className="task-list-section"><div className="task-list-heading"><h3>实时任务</h3><span>{active.length} 项</span></div>{active.length ? <div className="task-list">{active.map(renderTask)}</div> : <div className="empty-card task-empty"><h3>暂无匹配的实时任务</h3><p>新任务加入队列后会立即显示在这里。</p></div>}</section>}
+      {(filter === 'all' || filter === 'failed' || filter === 'completed') && <section className="task-list-section"><div className="task-list-heading"><h3>最近记录</h3><span>最近 50 条</span></div>{history.length ? <div className="task-list">{history.map(renderTask)}</div> : <div className="empty-card task-empty"><h3>暂无匹配的历史任务</h3><p>任务完成或失败后会保留在这里。</p></div>}</section>}
+    </>}
+  </section>;
+}
+
+type OperationActivity =
+  | { type: 'task'; id: string; at: string; level: 'success' | 'error'; task: TaskItem }
+  | { type: 'log'; id: string; at: string; level: RuntimeLog['level']; log: RuntimeLog };
+
+/**
+ * A selected service is a small operational workspace, not two pages glued
+ * together. Live queue work stays at the top; settled queue results and the
+ * corresponding worker messages share one chronological activity stream.
+ */
+function ServiceOperationsPage({ data, error, scope }: { data: TasksResponse | null; error: string; scope: OperationScope }) {
+  const definition = operationDefinition(scope);
+  const [logs, setLogs] = useState<RuntimeLog[]>([]);
+  const [logsLoading, setLogsLoading] = useState(true);
+  const [logsError, setLogsError] = useState('');
+  const [filter, setFilter] = useState<'all' | 'tasks' | 'logs' | 'errors'>('all');
+  const loadLogs = async () => {
+    setLogsError('');
+    try { setLogs(await request<RuntimeLog[]>(`/api/logs?limit=300&scope=${scope}`)); }
+    catch (reason) { setLogsError(reason instanceof Error ? reason.message : '无法读取服务执行记录。'); }
+    finally { setLogsLoading(false); }
+  };
+  useEffect(() => {
+    setLogsLoading(true);
+    void loadLogs();
+    const stream = new EventSource('/api/events?channel=logs');
+    stream.addEventListener('logs', () => void loadLogs());
+    return () => stream.close();
+  }, [scope]);
+  const active = (data?.active ?? []).filter((task) => taskMatchesScope(task, scope));
+  const history = (data?.history ?? []).filter((task) => taskMatchesScope(task, scope));
+  const activities: OperationActivity[] = [
+    ...history.map((task) => ({ type: 'task' as const, id: task.id, at: task.finishedAt ?? task.startedAt ?? task.requestedAt ?? '', level: task.status === 'failed' ? 'error' as const : 'success' as const, task })),
+    ...logs.map((log) => ({ type: 'log' as const, id: `log-${log.id}`, at: log.created_at, level: log.level, log }))
+  ].sort((left, right) => right.at.localeCompare(left.at));
+  const visibleActivities = activities.filter((activity) => {
+    if (filter === 'all') return true;
+    if (filter === 'tasks') return activity.type === 'task';
+    if (filter === 'logs') return activity.type === 'log';
+    return activity.level === 'error';
+  }).slice(0, 300);
+  const running = active.filter((task) => task.status === 'running').length;
+  const queued = active.filter((task) => task.status === 'queued' || task.status === 'retrying').length;
+  const renderLiveTask = (task: TaskItem) => {
+    return <article className={`operation-queue-entry ${task.status}`} key={task.id}>
+      <header><span className={`task-state ${task.status}`}>{taskStatusLabel[task.status]}</span>{task.priority >= 10 && <span className="task-priority">手动</span>}<time>{formatTime(task.startedAt ?? task.requestedAt)}</time></header>
+      <strong>{task.subscriptionName ?? (task.kind === 'library_sync' ? 'Jellyfin 影视库' : '系统任务')}</strong>
+      <p>{[task.content, task.title].filter(Boolean).join(' · ') || task.progress?.label || '等待 Worker 开始处理'}</p>
+      {task.status === 'retrying' && task.retryAfter && <small>将在 {formatTime(task.retryAfter)} 后重试</small>}
+      {task.error && <small className="task-error" title={task.error}>{task.error}</small>}
+    </article>;
+  };
+  return <section className="operation-detail-page">
+    <section className="operation-queue-section"><div className="operation-section-heading"><div><h2>当前队列</h2><p>{definition.description}</p></div><span>{running} 执行中 · {queued} 排队</span></div>{error ? <div className="form-error">{error}</div> : !data ? <div className="empty">正在读取队列…</div> : active.length ? <div className="operation-queue-list">{active.map(renderLiveTask)}</div> : <div className="operation-queue-empty">当前没有执行或排队的项目。</div>}</section>
+    <section className="operation-activity-section"><div className="operation-section-heading"><div><h2>执行记录</h2><p>任务完成、失败与 Worker 日志按发生时间汇总显示。</p></div><span>实时更新</span></div><div className="operation-activity-filter" role="group" aria-label="执行记录筛选">{([['all', '全部'], ['tasks', '任务结果'], ['logs', '运行日志'], ['errors', '异常']] as const).map(([key, label]) => <button type="button" key={key} className={filter === key ? 'active' : ''} onClick={() => setFilter(key)}>{label}</button>)}</div>{logsError ? <div className="form-error">{logsError}</div> : logsLoading && !activities.length ? <div className="empty">正在读取执行记录…</div> : visibleActivities.length ? <div className="operation-activity-list">{visibleActivities.map((activity) => {
+      if (activity.type === 'task') {
+        const task = activity.task;
+        const target = [task.subscriptionName, task.content, task.title].filter(Boolean).join(' · ') || '系统任务';
+        const detail = task.error ?? task.progress?.label;
+        return <article className={`operation-activity-entry ${activity.level}`} key={activity.id}><div className="operation-activity-meta"><span className={`task-state ${task.status}`}>{task.status === 'failed' ? '任务失败' : '任务完成'}</span><span>{taskKindLabel[task.kind]}</span><p title={target}>{target}</p>{detail && <small className={task.error ? 'task-error' : undefined} title={detail}>{detail}</small>}<time>{formatTime(activity.at)}</time></div></article>;
+      }
+      const log = activity.log;
+      const isMagnetNotFound = log.level === 'info' && /^磁力检索(?:未找到|完成)/.test(log.message);
+      const displayLevel = isMagnetNotFound ? 'success' : log.level;
+      const source = log.subscription_name ? `${log.subscription_name}${log.subscription_url ? ` · ${shortUrl(log.subscription_url)}` : ''}` : 'Page Watch';
+      return <article className={`operation-activity-entry ${displayLevel}`} key={activity.id}><div className="operation-activity-meta"><span className={`task-state ${displayLevel === 'error' ? 'failed' : displayLevel === 'success' ? 'completed' : 'queued'}`}>{displayLevel === 'error' ? '异常' : displayLevel === 'success' ? '完成' : '日志'}</span><span>Worker 日志</span><p title={log.message}>{log.message}</p><small title={source}>{source}</small><time>{formatTime(log.created_at)}</time></div></article>;
+    })}</div> : <div className="operation-queue-empty">尚无此服务的执行记录。</div>}</section>
+  </section>;
+}
+
+function OperationsCenterPage({ onSummary }: { onSummary: (summary: TasksResponse['summary']) => void }) {
+  const [data, setData] = useState<TasksResponse | null>(null);
+  const [scope, setScope] = useState<OperationScope | null>(null);
+  const [error, setError] = useState('');
+  const load = async () => {
+    try {
+      const next = await request<TasksResponse>('/api/tasks?historyLimit=300');
+      setData(next); onSummary(next.summary); setError('');
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '无法读取运行状态。'); }
+  };
+  useEffect(() => {
+    void load();
+    const stream = new EventSource('/api/events?channel=tasks');
+    stream.addEventListener('tasks', () => void load());
+    return () => stream.close();
+  }, []);
+  const summary = data?.summary;
+  return <section id="operations" className="operations-center-page">
+    <div className="section-head"><div><h2>运行中心</h2><p>选择一项服务，查看它自己的实时队列、任务进度和运行日志。</p></div><button type="button" className="quiet" onClick={() => void load()}>↻ 刷新</button></div>
+    <section className="task-summary operation-summary" aria-label="运行概览">{[
+      ['服务在线', summary?.servicesOnline ?? '—'], ['执行中', summary?.running ?? '—'], ['排队中', summary?.queued ?? '—'], ['等待重试', summary?.retrying ?? '—']
+    ].map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong></div>)}</section>
+    <section className="operation-service-panel"><div className="task-list-heading"><h3>服务</h3><span>点击查看对应任务与日志</span></div><div className="operation-service-grid">{operationDefinitions.map((definition) => {
+      const service = data?.services.find((item) => item.name === definition.service);
+      const tasks = (data?.active ?? []).filter((task) => taskMatchesScope(task, definition.scope));
+      const running = tasks.filter((task) => task.status === 'running').length;
+      const waiting = tasks.filter((task) => task.status === 'queued' || task.status === 'retrying').length;
+      const progress = tasks.find((task) => task.progress?.total && task.progress.current !== null)?.progress ?? null;
+      const percent = progress?.total && progress.current !== null ? Math.max(0, Math.min(100, Math.round(progress.current / progress.total * 100))) : null;
+      return <button type="button" key={definition.scope} className={`operation-service ${scope === definition.scope ? 'selected' : ''} ${service?.healthy ? service.status : 'error'}`} onClick={() => setScope(definition.scope)}>
+        <span className="operation-service-top"><strong>{definition.label}</strong><em>{service?.status === 'busy' ? '执行中' : service?.healthy ? '在线' : service?.status === 'missing' ? '未启动' : '注意'}</em></span>
+        <small title={service?.detail}>{service?.detail ?? '正在读取服务状态。'}</small>
+        {percent !== null && <div className="operation-service-progress" title={progress?.label ?? undefined}><i style={{ width: `${percent}%` }} /><span>{progress?.current} / {progress?.total}</span></div>}
+        <footer>{definition.kinds.length ? <>{running} 执行中 · {waiting} 排队</> : '系统事件与网页接口状态'}<span>→</span></footer>
+      </button>;
+    })}</div></section>
+    {scope ? <><div className="operation-detail-nav"><button type="button" className="quiet" onClick={() => setScope(null)}>← 返回服务概览</button><span>当前查看：{operationDefinition(scope).label}</span></div><ServiceOperationsPage key={scope} data={data} error={error} scope={scope} /></> : <div className="operation-empty"><span>◫</span><strong>选择一项服务查看详情</strong><p>进入后只显示该服务的任务队列、执行进度与执行记录，不再与其他服务混在一起。</p></div>}
+  </section>;
+}
+
+function RuntimeLogsPage({ scope }: { scope: OperationScope }) {
   const [logs, setLogs] = useState<RuntimeLog[]>([]);
   const [filter, setFilter] = useState<'all' | RuntimeLog['level']>('all');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const loadLogs = async () => {
     setError('');
-    try { setLogs(await request<RuntimeLog[]>('/api/logs?limit=300')); }
+    try { setLogs(await request<RuntimeLog[]>(`/api/logs?limit=300&scope=${scope}`)); }
     catch (reason) { setError(reason instanceof Error ? reason.message : '无法读取运行日志。'); }
     finally { setLoading(false); }
   };
   useEffect(() => {
+    setLoading(true);
     void loadLogs();
     const stream = new EventSource('/api/events?channel=logs');
     const refresh = () => void loadLogs();
     stream.addEventListener('logs', refresh);
     return () => stream.close();
-  }, []);
+  }, [scope]);
   const visibleLogs = filter === 'all' ? logs : logs.filter((entry) => entry.level === filter);
   const levelLabel: Record<RuntimeLog['level'], string> = { info: '信息', success: '完成', error: '失败' };
-  const sourceLabel: Record<RuntimeLog['source'], string> = { system: '系统', queue: '队列', worker: '检查', download: '下载', library: '影视库' };
-  return <section id="logs" className="runtime-log-section">
-    <div className="section-head"><div><h2>运行日志</h2><p>实时更新；保留最近 1,000 条检查、队列与错误记录。</p></div><button className="quiet" onClick={() => void loadLogs()}>↻ 刷新</button></div>
+  const sourceLabel: Record<RuntimeLog['source'], string> = { system: '系统', queue: '队列', worker: 'Worker', download: '下载', library: '影视库' };
+  const definition = operationDefinition(scope);
+  return <section id="logs" className="runtime-log-section operation-log-section">
+    <div className="section-head"><div><p className="eyebrow">{definition.label}</p><h2>{definition.label}日志</h2><p>实时更新；仅显示此服务的记录，数据库仍保留最近 1,000 条全局日志。</p></div><button className="quiet" onClick={() => void loadLogs()}>↻ 刷新</button></div>
     <div className="log-toolbar" role="group" aria-label="日志级别筛选"><span>筛选</span>{(['all', 'info', 'success', 'error'] as const).map((level) => <button key={level} className={filter === level ? 'active' : ''} type="button" onClick={() => setFilter(level)}>{level === 'all' ? `全部 ${logs.length}` : levelLabel[level]}</button>)}</div>
     {loading ? <div className="empty">正在读取运行日志…</div> : error ? <div className="form-error">{error}</div> : visibleLogs.length === 0 ? <div className="empty-card runtime-log-empty"><div className="empty-orbit">≡</div><h3>尚无运行日志</h3><p>开始一次检查后，执行过程和错误信息会显示在这里。</p></div> : <div className="runtime-log-list">{visibleLogs.map((entry) => {
       const isFinishedMagnetNotFound = entry.level === 'info' && /^磁力检索(?:未找到|完成)/.test(entry.message);
       const displayLevel = isFinishedMagnetNotFound ? 'success' : entry.level;
-      return <article className={`runtime-log-entry ${displayLevel}`} key={entry.id}><div className="runtime-log-meta"><span className={`log-level ${displayLevel}`}>{levelLabel[displayLevel]}</span><span>{entry.message.includes('磁力检索') ? '磁力检索' : sourceLabel[entry.source]}</span></div><p title={entry.message}>{entry.message}</p><footer>{entry.subscription_name ? <><strong>{entry.subscription_name}</strong><span>{entry.subscription_url ? shortUrl(entry.subscription_url) : ''}</span></> : <span>{entry.subscription_id ? '已删除订阅' : 'Page Watch'}</span>}{entry.job_id && <code>任务 #{entry.job_id}</code>}</footer><time className="runtime-log-time">{formatTime(entry.created_at)}</time></article>;
+      return <article className={`runtime-log-entry ${displayLevel}`} key={entry.id}><div className="runtime-log-meta"><span className={`log-level ${displayLevel}`}>{levelLabel[displayLevel]}</span><span>{sourceLabel[entry.source]}</span></div><p title={entry.message}>{entry.message}</p><footer>{entry.subscription_name ? <><strong>{entry.subscription_name}</strong><span>{entry.subscription_url ? shortUrl(entry.subscription_url) : ''}</span></> : <span>{entry.subscription_id ? '已删除订阅' : 'Page Watch'}</span>}{entry.job_id && <code>任务 #{entry.job_id}</code>}</footer><time className="runtime-log-time">{formatTime(entry.created_at)}</time></article>;
     })}</div>}
   </section>;
 }
@@ -669,10 +881,24 @@ function RuleFlow({ children }: { children: ReactNode }) {
   return <div className="rule-flow" aria-label="规则执行流程">{children}</div>;
 }
 
+type RuleSave = () => Promise<boolean>;
+
 function RulesLibrary({ open, onToggle, onNotice }: { open: boolean; onToggle: () => void; onNotice: (message: string) => void }) {
+  const presetSaveRef = useRef<RuleSave | null>(null);
+  const inspectionSaveRef = useRef<RuleSave | null>(null);
+  const [saving, setSaving] = useState(false);
+  const saveAll = async () => {
+    if (!presetSaveRef.current || !inspectionSaveRef.current) { onNotice('规则仍在读取，请稍后再保存。'); return; }
+    setSaving(true);
+    try {
+      if (!await presetSaveRef.current()) return;
+      if (!await inspectionSaveRef.current()) return;
+      onNotice('MissAV 检查规则已保存。');
+    } finally { setSaving(false); }
+  };
   return <section id="rules-library" className={`rules-library ${open ? 'is-open' : ''}`}>
-    <div className="section-head rules-library-head"><div><p className="eyebrow">MissAV 订阅</p><h2>检查规则库</h2><p>统一维护 MissAV 的网页读取、发行日期和磁力链接补全规则；新建订阅时直接选择并套用。</p></div><button type="button" className="secondary" aria-expanded={open} onClick={onToggle}>{open ? '收起规则库' : '展开规则库'}</button></div>
-    {open && <div className="rules-library-content"><SubscriptionPresetLibrary onNotice={onNotice} /><InspectionRulesPage embedded onNotice={onNotice} /></div>}
+    <div className="section-head rules-library-head"><div><p className="eyebrow">MissAV</p><h2>MissAV 检查规则</h2><p>一条检查流程依次读取列表页内容、补全发行日期，再检索磁力链接。</p></div><button type="button" className="secondary" aria-expanded={open} onClick={onToggle}>{open ? '收起检查规则' : '检查规则'}</button></div>
+    {open && <div className="rules-library-content"><div className="rules-library-workbench"><RuleFlow><code>MissAV 列表页</code><i>→</i><strong>番号与标题</strong><i>→</i><code>详情页</code><i>→</i><strong>发行日期</strong><i>→</i><code>磁力搜索</code><i>→</i><strong>磁力链接</strong></RuleFlow><SubscriptionPresetLibrary registerSave={(save) => { presetSaveRef.current = save; }}><InspectionRulesPage embedded onNotice={onNotice} registerSave={(save) => { inspectionSaveRef.current = save; }} /></SubscriptionPresetLibrary><div className="rule-save-actions"><button type="button" className="primary" disabled={saving} onClick={() => void saveAll()}>{saving ? '保存中…' : '保存规则'}</button></div></div></div>}
   </section>;
 }
 
@@ -747,10 +973,9 @@ function SubscriptionReadingRules({ subscriptions, targetSubscriptionId, onSubsc
   </section>;
 }
 
-function SubscriptionPresetLibrary({ onNotice }: { onNotice: (message: string) => void }) {
+function SubscriptionPresetLibrary({ children, registerSave }: { children: ReactNode; registerSave: (save: RuleSave) => void }) {
   const [presets, setPresets] = useState<SubscriptionPreset[]>([]);
   const [loading, setLoading] = useState(true);
-  const [managing, setManaging] = useState(false);
   const [error, setError] = useState('');
   const loadPresets = async () => {
     try { setError(''); setPresets(await request<SubscriptionPreset[]>('/api/subscription-presets')); }
@@ -759,13 +984,13 @@ function SubscriptionPresetLibrary({ onNotice }: { onNotice: (message: string) =
   };
   useEffect(() => { void loadPresets(); }, []);
   return <section className="subscription-preset-library">
-    <div className="preset-library-head"><div><span className="rule-kind">网页读取</span><h3>MissAV 检查规则</h3><p>把番号、标题和分页的读取条件保存为规则；新建订阅时选择一条即可填入。</p></div><button type="button" className="secondary" onClick={() => setManaging((current) => !current)}>{managing ? '收起规则' : '管理检查规则'}</button></div>
+    <div className="preset-library-head"><div><span className="rule-kind">流程第 1 步</span><h3>列表读取</h3><p>读取番号、标题和分页；新建 MissAV 订阅时选择一条列表规则即可填入。</p></div></div>
     {loading ? <p className="preset-library-loading">正在读取检查规则…</p> : error ? <p className="form-error">{error}</p> : <div className="preset-library-list">{presets.length ? presets.map((preset) => <span key={preset.id} title={preset.description || preset.selector}>{preset.name}</span>) : <span className="preset-library-empty">还没有检查规则</span>}</div>}
-    {managing && <PresetManager presets={presets} onClose={() => setManaging(false)} onChanged={async () => { await loadPresets(); onNotice('MissAV 检查规则已更新。'); }} />}
+    <div className="rules-editor-content"><PresetManager embedded presets={presets} onClose={() => undefined} onChanged={loadPresets} registerSave={registerSave} />{children}</div>
   </section>;
 }
 
-function InspectionRulesPage({ onNotice, embedded = false }: { onNotice: (message: string) => void; embedded?: boolean }) {
+function InspectionRulesPage({ onNotice, embedded = false, registerSave }: { onNotice: (message: string) => void; embedded?: boolean; registerSave?: (save: RuleSave) => void }) {
   const [form, setForm] = useState<InspectionRules>(freshDefaultInspectionRules);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -778,16 +1003,17 @@ function InspectionRulesPage({ onNotice, embedded = false }: { onNotice: (messag
   }, []);
   const updateRelease = <K extends keyof InspectionRules['releaseDate']>(key: K, value: InspectionRules['releaseDate'][K]) => setForm((old) => ({ ...old, releaseDate: { ...old.releaseDate, [key]: value } }));
   const updateMagnet = <K extends keyof InspectionRules['magnet']>(key: K, value: InspectionRules['magnet'][K]) => setForm((old) => ({ ...old, magnet: { ...old.magnet, [key]: value } }));
-  const save = async (rules = form, success = 'MissAV 补全规则已保存。') => {
+  const save = async (rules = form, success = 'MissAV 补全规则已保存。', notify = true): Promise<boolean> => {
     setBusy(true); setError('');
     try {
       const saved = await request<InspectionRules>('/api/inspection-rules', { method: 'PUT', body: JSON.stringify(rules) });
-      setForm(saved); onNotice(success);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存检查规则。'); }
+      setForm(saved); if (notify) onNotice(success); return true;
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存检查规则。'); return false; }
     finally { setBusy(false); }
   };
+  useEffect(() => { if (registerSave) registerSave(() => save(form, '', false)); }, [form, registerSave]);
   return <section id={embedded ? undefined : 'rules'} className={`inspection-rules-page ${embedded ? 'embedded' : ''}`}>
-    {embedded ? <div className="embedded-rule-toolbar"><div><span className="rule-kind">MissAV 补全</span><h3>MissAV 归档补全规则</h3><p>发行日期从 MissAV 详情页读取；磁力链接按 MissAV 获取到的番号进行补全。</p></div><div className="inspection-rule-actions"><button type="button" className="secondary" disabled={loading || busy} onClick={() => void save(freshDefaultInspectionRules(), '已恢复并保存 MissAV 默认规则。')}>恢复默认值</button><button type="button" className="primary" disabled={loading || busy} onClick={() => void save()}>{busy ? '保存中…' : '保存规则'}</button></div></div> : <div className="section-head"><div><h2>MissAV 检查规则</h2><p>网页内容、发行日期与磁力检索均按这里显示的条件执行。</p></div><div className="inspection-rule-actions"><button type="button" className="secondary" disabled={loading || busy} onClick={() => void save(freshDefaultInspectionRules(), '已恢复并保存 MissAV 默认规则。')}>恢复默认值</button><button type="button" className="primary" disabled={loading || busy} onClick={() => void save()}>{busy ? '保存中…' : '保存规则'}</button></div></div>}
+    {embedded ? <div className="embedded-rule-toolbar"><div><span className="rule-kind">流程第 2、3 步</span><h3>归档补全</h3><p>同一条 MissAV 检查流程中，先从详情页补全发行日期，再按番号检索磁力链接。</p></div><div className="inspection-rule-actions"><button type="button" className="secondary" disabled={loading || busy} onClick={() => void save(freshDefaultInspectionRules(), '已恢复并保存 MissAV 默认规则。')}>恢复默认值</button><button type="button" className="primary" disabled={loading || busy} onClick={() => void save()}>{busy ? '保存中…' : '保存补全规则'}</button></div></div> : <div className="section-head"><div><h2>MissAV 检查规则</h2><p>网页内容、发行日期与磁力检索均按这里显示的条件执行。</p></div><div className="inspection-rule-actions"><button type="button" className="secondary" disabled={loading || busy} onClick={() => void save(freshDefaultInspectionRules(), '已恢复并保存 MissAV 默认规则。')}>恢复默认值</button><button type="button" className="primary" disabled={loading || busy} onClick={() => void save()}>{busy ? '保存中…' : '保存规则'}</button></div></div>}
     {error && <p className="form-error">{error}</p>}
     {loading ? <div className="empty">正在读取检查规则…</div> : <div className="inspection-rule-list">
       <section className={`inspection-rule-card ${form.releaseDate.enabled ? '' : 'disabled'}`}>
@@ -815,13 +1041,14 @@ type QbittorrentSettings = {
   savePath: string;
   tags: string;
   autoDownload: boolean;
+  autoDownloadMinSizeMb: number;
   stopAfterDownload: boolean;
 };
 
 type QbittorrentForm = Omit<QbittorrentSettings, 'apiKeyConfigured' | 'passwordConfigured'> & { apiKey: string; password: string };
 
 const blankQbittorrentForm: QbittorrentForm = {
-  enabled: false, url: '', authMode: 'api_key', apiKey: '', username: '', password: '', category: '', savePath: '', tags: 'page-watch', autoDownload: false, stopAfterDownload: false
+  enabled: false, url: '', authMode: 'api_key', apiKey: '', username: '', password: '', category: '', savePath: '', tags: 'page-watch', autoDownload: false, autoDownloadMinSizeMb: 0, stopAfterDownload: false
 };
 
 function QbittorrentSettingsPage({ onNotice }: { onNotice: (message: string) => void }) {
@@ -834,7 +1061,7 @@ function QbittorrentSettingsPage({ onNotice }: { onNotice: (message: string) => 
   const update = <K extends keyof QbittorrentForm>(key: K, value: QbittorrentForm[K]) => setForm((old) => ({ ...old, [key]: value }));
   useEffect(() => {
     void request<QbittorrentSettings>('/api/settings/qbittorrent').then((settings) => {
-      setForm({ enabled: settings.enabled, url: settings.url, authMode: settings.authMode, apiKey: '', username: settings.username, password: '', category: settings.category, savePath: settings.savePath, tags: settings.tags, autoDownload: settings.autoDownload, stopAfterDownload: settings.stopAfterDownload });
+      setForm({ enabled: settings.enabled, url: settings.url, authMode: settings.authMode, apiKey: '', username: settings.username, password: '', category: settings.category, savePath: settings.savePath, tags: settings.tags, autoDownload: settings.autoDownload, autoDownloadMinSizeMb: settings.autoDownloadMinSizeMb, stopAfterDownload: settings.stopAfterDownload });
       setApiKeyConfigured(settings.apiKeyConfigured);
       setPasswordConfigured(settings.passwordConfigured);
     }).catch((reason) => setError(reason instanceof Error ? reason.message : '无法读取下载设置。')).finally(() => setLoading(false));
@@ -869,7 +1096,7 @@ function QbittorrentSettingsPage({ onNotice }: { onNotice: (message: string) => 
       <label>Web UI 地址<input disabled={loading || busy} value={form.url} onChange={(event) => update('url', event.target.value)} placeholder="例如 http://192.168.1.20:8080" /><span className="field-note">若 qBittorrent 在 NAS 上，请填写 NAS 可访问的局域网地址和 Web UI 端口。</span></label>
       <label>认证方式<select disabled={loading || busy} value={form.authMode} onChange={(event) => update('authMode', event.target.value as QbittorrentForm['authMode'])}><option value="api_key">API 密钥（推荐，qBittorrent 5.2+）</option><option value="password">用户名与密码（旧版兼容）</option></select></label>
       {form.authMode === 'api_key' ? <label>API 密钥<input type="password" autoComplete="off" disabled={loading || busy} value={form.apiKey} onChange={(event) => update('apiKey', event.target.value)} placeholder={apiKeyConfigured ? '已保存；留空则不修改' : '以 qbt_ 开头的 API 密钥'} /><span className="field-note">在 qBittorrent 的“设置 → Web UI → API Key”生成。密钥仅保存于服务端，不会再返回或显示。</span></label> : <div className="two-col"><label>用户名<input autoComplete="username" disabled={loading || busy} value={form.username} onChange={(event) => update('username', event.target.value)} placeholder="qBittorrent 用户名" /></label><label>密码<input type="password" autoComplete="current-password" disabled={loading || busy} value={form.password} onChange={(event) => update('password', event.target.value)} placeholder={passwordConfigured ? '已保存；留空则不修改' : 'qBittorrent 密码'} /><span className="field-note">密码仅保存于服务端，不会再返回或显示。</span></label></div>}</section>
-      <section className="qbit-card"><div className="qbit-card-head"><div><h3>下载规则</h3><p>这些选项会在 qBittorrent 接收任务时一并带上。</p></div></div><div className="two-col"><label>分类<input disabled={loading || busy} value={form.category} onChange={(event) => update('category', event.target.value)} placeholder="可选，例如 movies" /></label><label>标签<input disabled={loading || busy} value={form.tags} onChange={(event) => update('tags', event.target.value)} placeholder="可选，多个标签用逗号分隔" /></label></div><label>保存路径<input disabled={loading || busy} value={form.savePath} onChange={(event) => update('savePath', event.target.value)} placeholder="可选，使用 qBittorrent 容器内可见的路径" /><span className="field-note">Docker 中的路径必须是 qBittorrent 容器已经挂载的目录，例如 <code>/downloads</code>。</span></label><label className="toggle qbit-auto-toggle"><input type="checkbox" checked={form.autoDownload} disabled={loading || busy || !form.enabled} onChange={(event) => update('autoDownload', event.target.checked)} /><span />新找到磁力链接后自动提交下载</label><label className="toggle qbit-auto-toggle"><input type="checkbox" checked={form.stopAfterDownload} disabled={loading || busy || !form.enabled} onChange={(event) => update('stopAfterDownload', event.target.checked)} /><span />下载完成后停止做种<span className="field-note">仅停止由本网站提交且已完成的任务。</span></label></section>
+      <section className="qbit-card"><div className="qbit-card-head"><div><h3>下载规则</h3><p>这些选项会在 qBittorrent 接收任务时一并带上。</p></div></div><div className="two-col"><label>分类<input disabled={loading || busy} value={form.category} onChange={(event) => update('category', event.target.value)} placeholder="可选，例如 movies" /></label><label>标签<input disabled={loading || busy} value={form.tags} onChange={(event) => update('tags', event.target.value)} placeholder="可选，多个标签用逗号分隔" /></label></div><label>保存路径<input disabled={loading || busy} value={form.savePath} onChange={(event) => update('savePath', event.target.value)} placeholder="可选，使用 qBittorrent 容器内可见的路径" /><span className="field-note">Docker 中的路径必须是 qBittorrent 容器已经挂载的目录，例如 <code>/downloads</code>。</span></label><label className="toggle qbit-auto-toggle"><input type="checkbox" checked={form.autoDownload} disabled={loading || busy || !form.enabled} onChange={(event) => update('autoDownload', event.target.checked)} /><span />新找到磁力链接后自动提交下载</label><label>最小单文件大小（MB）<input type="number" min="0" max="1048576" step="1" disabled={loading || busy || !form.enabled} value={form.autoDownloadMinSizeMb} onChange={(event) => update('autoDownloadMinSizeMb', Number(event.target.value))} /><span className="field-note">设为 0 不筛选。大于 0 时，Page Watch 提交给 qBittorrent 的任务会先读取种子文件列表，将小于该大小的广告、图片等文件设为“不下载”，仅下载达到该大小的文件。</span></label><label className="toggle qbit-auto-toggle"><input type="checkbox" checked={form.stopAfterDownload} disabled={loading || busy || !form.enabled} onChange={(event) => update('stopAfterDownload', event.target.checked)} /><span />下载完成后停止做种<span className="field-note">仅停止由本网站提交且已完成的任务。</span></label></section>
       {error && <p className="form-error">{error}</p>}
       <div className="qbit-form-actions"><button type="button" className="secondary" disabled={loading || busy} onClick={() => void testConnection()}>{busy ? '处理中…' : '保存并测试连接'}</button><button className="primary" disabled={loading || busy} type="submit">{busy ? '保存中…' : '保存下载设置'}</button></div>
     </form>
@@ -1014,22 +1241,26 @@ function presetToForm(preset: SubscriptionPreset): PresetForm {
   return { name: preset.name, description: preset.description, selector: preset.selector, renderMode: preset.render_mode, contentSource: preset.content_source, attributeName: preset.attribute_name ?? '', matchPattern: preset.match_pattern ?? '', titleSelector: preset.title_selector ?? '', titleContentSource: preset.title_content_source ?? 'text', titleAttributeName: preset.title_attribute_name ?? '', titleMatchPattern: preset.title_match_pattern ?? '', resultMode: preset.result_mode, intervalMinutes: preset.interval_minutes, scheduleType: 'hourly', scheduleIntervalHours: Math.max(1, Math.round(preset.interval_minutes / 60)), scheduleTime: '09:00', scheduleWeekday: 1, isActive: Boolean(preset.is_active), paginationSelector: preset.pagination_selector ?? '', paginationParameter: preset.pagination_parameter ?? 'page', paginationMatchPattern: preset.pagination_match_pattern ?? '' };
 }
 
-function PresetManager({ presets, onClose, onChanged }: { presets: SubscriptionPreset[]; onClose: () => void; onChanged: () => Promise<void> }) {
+function PresetManager({ presets, onClose, onChanged, embedded = false, registerSave }: { presets: SubscriptionPreset[]; onClose: () => void; onChanged: () => Promise<void>; embedded?: boolean; registerSave?: (save: RuleSave) => void }) {
   const [editing, setEditing] = useState<SubscriptionPreset | 'new' | null>(null);
   const [form, setForm] = useState<PresetForm>(blankPresetForm);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const update = <K extends keyof PresetForm>(key: K, value: PresetForm[K]) => setForm((old) => ({ ...old, [key]: value }));
   const startEdit = (preset: SubscriptionPreset | 'new') => { setEditing(preset); setForm(preset === 'new' ? blankPresetForm : presetToForm(preset)); setError(''); };
-  const save = async () => {
-    if (!editing) return;
+  useEffect(() => {
+    if (embedded && !editing && presets.length) startEdit(presets[0]);
+  }, [embedded, editing, presets]);
+  const save = async (): Promise<boolean> => {
+    if (!editing) return false;
     setBusy(true); setError('');
     try {
       await request(editing === 'new' ? '/api/subscription-presets' : `/api/subscription-presets/${editing.id}`, { method: editing === 'new' ? 'POST' : 'PUT', body: JSON.stringify(form) });
-      await onChanged(); setEditing(null);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存规则。'); }
+      await onChanged(); if (!embedded) setEditing(null); return true;
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存规则。'); return false; }
     finally { setBusy(false); }
   };
+  useEffect(() => { if (registerSave) registerSave(save); }, [editing, form, registerSave]);
   const remove = async (preset: SubscriptionPreset) => {
     if (!window.confirm(`删除规则“${preset.name}”？`)) return;
     setBusy(true); setError('');
@@ -1037,8 +1268,8 @@ function PresetManager({ presets, onClose, onChanged }: { presets: SubscriptionP
     catch (reason) { setError(reason instanceof Error ? reason.message : '无法删除规则。'); }
     finally { setBusy(false); }
   };
-  if (editing) return <section className="preset-manager" aria-label="编辑 MissAV 检查规则">
-    <div className="preset-manager-head"><div><strong>{editing === 'new' ? '新建 MissAV 规则' : '编辑 MissAV 规则'}</strong><small>保存后可在新建 MissAV 订阅时直接选择。</small></div><button type="button" className="close" onClick={() => setEditing(null)}>×</button></div>
+  if (editing) return <section className={`preset-manager ${embedded ? 'embedded' : ''}`} aria-label="编辑 MissAV 列表读取规则">
+    <div className="preset-manager-head"><div><strong>{editing === 'new' ? '新建列表读取规则' : '列表读取规则'}</strong><small>保存后可在新建 MissAV 订阅时直接选择。</small></div>{!embedded && <button type="button" className="close" onClick={() => setEditing(null)}>×</button>}</div>
     <label>规则名称<input autoFocus value={form.name} maxLength={80} onChange={(event) => update('name', event.target.value)} /></label>
     <label>规则说明<input value={form.description} maxLength={200} onChange={(event) => update('description', event.target.value)} placeholder="可选，说明适用的网页和内容" /></label>
     <label>CSS Selector<input value={form.selector} onChange={(event) => update('selector', event.target.value)} placeholder="例如 a.text-secondary[alt]" /></label>
@@ -1047,9 +1278,9 @@ function PresetManager({ presets, onClose, onChanged }: { presets: SubscriptionP
     <section className="preset-title-settings"><label className="toggle"><input type="checkbox" checked={Boolean(form.titleSelector)} onChange={(event) => setForm((old) => event.target.checked ? { ...old, titleSelector: old.selector, titleContentSource: 'text', titleAttributeName: '', titleMatchPattern: old.titleMatchPattern } : { ...old, titleSelector: '', titleAttributeName: '', titleMatchPattern: '' })} /><span />同时读取标题</label>{form.titleSelector && <><label>标题 CSS Selector<input value={form.titleSelector} onChange={(event) => update('titleSelector', event.target.value)} /></label><div className="two-col"><label>标题来源<select value={form.titleContentSource} onChange={(event) => update('titleContentSource', event.target.value as PresetForm['titleContentSource'])}><option value="text">标签中的文字</option><option value="attribute">指定属性的值</option></select></label>{form.titleContentSource === 'attribute' ? <label>标题属性名<input value={form.titleAttributeName} onChange={(event) => update('titleAttributeName', event.target.value)} placeholder="例如 alt" /></label> : <div className="attribute-hint">按条目顺序与内容配对</div>}</div><label>标题匹配规则<input value={form.titleMatchPattern} onChange={(event) => update('titleMatchPattern', event.target.value)} placeholder="可选的正则表达式" /></label></>}</section>
     <section className="preset-title-settings"><label className="toggle"><input type="checkbox" checked={Boolean(form.paginationSelector)} onChange={(event) => setForm((old) => event.target.checked ? { ...old, paginationSelector: old.paginationSelector || '#page-count', paginationParameter: old.paginationParameter || 'page', paginationMatchPattern: old.paginationMatchPattern || '(\\d+)' } : { ...old, paginationSelector: '', paginationMatchPattern: '' })} /><span />包含分页读取</label>{form.paginationSelector && <><label>页数 CSS Selector<input value={form.paginationSelector} onChange={(event) => update('paginationSelector', event.target.value)} /></label><div className="two-col"><label>页码参数名<input value={form.paginationParameter} onChange={(event) => update('paginationParameter', event.target.value)} /></label><label>页数匹配规则<input value={form.paginationMatchPattern} onChange={(event) => update('paginationMatchPattern', event.target.value)} placeholder={'例如 /\\s*(\\d+)'} /></label></div></>}</section>
     <div className="two-col"><label>读取方式<select value={form.renderMode} onChange={(event) => update('renderMode', event.target.value as PresetForm['renderMode'])}><option value="static">HTML 抓取</option><option value="dynamic">浏览器渲染</option></select></label><label>检查间隔（分钟）<input type="number" min="1" max="10080" value={form.intervalMinutes} onChange={(event) => update('intervalMinutes', Number(event.target.value))} /></label></div>
-    <label className="toggle"><input type="checkbox" checked={form.isActive} onChange={(event) => update('isActive', event.target.checked)} /><span />默认启用定时检查</label>{error && <p className="form-error">{error}</p>}<div className="preset-manager-actions"><button type="button" className="secondary" onClick={() => setEditing(null)}>返回列表</button><button type="button" className="primary" disabled={busy} onClick={() => void save()}>{busy ? '保存中…' : '保存规则'}</button></div>
+    <label className="toggle"><input type="checkbox" checked={form.isActive} onChange={(event) => update('isActive', event.target.checked)} /><span />默认启用定时检查</label>{error && <p className="form-error">{error}</p>}<div className="preset-manager-actions">{!embedded && <button type="button" className="secondary" onClick={() => setEditing(null)}>返回列表</button>}<button type="button" className="primary" disabled={busy} onClick={() => void save()}>{busy ? '保存中…' : '保存列表规则'}</button></div>
   </section>;
-  return <section className="preset-manager" aria-label="管理 MissAV 检查规则"><div className="preset-manager-head"><div><strong>MissAV 检查规则</strong><small>可自由新增、编辑或删除规则。</small></div><button type="button" className="close" onClick={onClose}>×</button></div>{error && <p className="form-error">{error}</p>}<div className="preset-rule-list">{presets.map((preset) => <article key={preset.id}><div><strong>{preset.name}</strong><small>{preset.description || preset.selector}</small></div><code>{preset.selector}</code><div><button type="button" onClick={() => startEdit(preset)}>编辑</button><button type="button" className="danger" disabled={busy} onClick={() => void remove(preset)}>删除</button></div></article>)}</div><div className="preset-manager-actions"><button type="button" className="secondary" onClick={onClose}>完成</button><button type="button" className="primary" onClick={() => startEdit('new')}>＋ 新建规则</button></div></section>;
+  return <section className={`preset-manager ${embedded ? 'embedded' : ''}`} aria-label="管理 MissAV 列表读取规则">{!embedded && <div className="preset-manager-head"><div><strong>列表读取规则</strong><small>可自由新增、编辑或删除新建订阅可套用的列表读取规则。</small></div><button type="button" className="close" onClick={onClose}>×</button></div>}{error && <p className="form-error">{error}</p>}<div className="preset-rule-list">{presets.map((preset) => <article key={preset.id}><div><strong>{preset.name}</strong><small>{preset.description || preset.selector}</small></div><code>{preset.selector}</code><div><button type="button" onClick={() => startEdit(preset)}>编辑</button><button type="button" className="danger" disabled={busy} onClick={() => void remove(preset)}>删除</button></div></article>)}</div><div className="preset-manager-actions">{!embedded && <button type="button" className="secondary" onClick={onClose}>完成</button>}<button type="button" className="primary" onClick={() => startEdit('new')}>＋ 新建规则</button></div></section>;
 }
 
 function NetworkSettings({ onClose, onSaved }: { onClose: () => void; onSaved: (message: string) => void }) {

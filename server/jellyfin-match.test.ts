@@ -9,8 +9,8 @@ test('normalizes only a whole archive code', () => {
 
 test('requires an exact code boundary in Jellyfin metadata', () => {
   const media = [
-    { id: 'wrong', name: 'IPZZ-6980.mp4', originalTitle: null, path: null, type: 'Movie' },
-    { id: 'right', name: 'hhd800 IPZZ-698', originalTitle: null, path: '/media/IPZZ-698.mp4', type: 'Movie' }
+    { id: 'wrong', libraryId: 'library', name: 'IPZZ-6980.mp4', originalTitle: null, path: null, type: 'Movie' },
+    { id: 'right', libraryId: 'library', name: 'hhd800 IPZZ-698', originalTitle: null, path: '/media/IPZZ-698.mp4', type: 'Movie' }
   ];
   assert.equal(exactJellyfinMatch('ipzz-698', media)?.id, 'right');
 });

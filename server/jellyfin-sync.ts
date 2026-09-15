@@ -1,29 +1,36 @@
 import { appendRuntimeLog, db, getJellyfinSettings, setSetting } from './db.js';
-import { listJellyfinMedia, type JellyfinMedia } from './jellyfin.js';
-import { archiveKey, mediaKeys } from './jellyfin-match.js';
+import { listJellyfinMedia } from './jellyfin.js';
+import { archiveKey } from './jellyfin-match.js';
+import { readJellyfinMediaIndex, saveJellyfinMediaIndex } from './jellyfin-cache.js';
 
 type ArchiveCandidate = { id: number; subscription_id: number; content: string; jellyfin_status: string; magnet_status: string };
-type Match = Pick<JellyfinMedia, 'id' | 'name'>;
 
-export type JellyfinSyncResult = { scanned: number; matched: number; notFound: number; libraries: number };
+export type JellyfinSyncResult = { scanned: number; indexedCodes: number; matched: number; notFound: number; libraries: number };
+export type JellyfinSyncProgress = { phase: 'reading' | 'indexing' | 'caching' | 'writing'; current: number | null; total: number | null; label: string };
 
 /** Synchronize all archive entries against one locally-built Jellyfin media index. */
-export async function syncJellyfinLibrary(trigger: 'manual' | 'scheduled' = 'scheduled'): Promise<JellyfinSyncResult> {
+export async function syncJellyfinLibrary(trigger: 'manual' | 'scheduled' = 'scheduled', onProgress?: (progress: JellyfinSyncProgress) => Promise<void> | void): Promise<JellyfinSyncResult> {
   const settings = getJellyfinSettings();
   if (!settings.enabled) throw new Error('Jellyfin 影视库同步尚未启用。');
   if (!settings.libraryIds.length) throw new Error('请先选择至少一个 Jellyfin 媒体库。');
 
+  await onProgress?.({ phase: 'reading', current: 0, total: null, label: '正在读取 Jellyfin 媒体库' });
   const media = await listJellyfinMedia(settings);
-  const index = new Map<string, Match>();
-  for (const item of media) {
-    for (const key of mediaKeys(item)) if (!index.has(key)) index.set(key, { id: item.id, name: item.name });
-  }
+  await onProgress?.({ phase: 'indexing', current: media.length, total: media.length, label: `已读取 ${media.length} 个媒体项目，正在更新 MySQL 索引` });
+  await onProgress?.({ phase: 'caching', current: 0, total: media.length, label: `正在保存 ${media.length} 个 Jellyfin 媒体项目到 MySQL` });
+  const cache = await saveJellyfinMediaIndex(media, settings.libraryIds);
+  await setSetting('jellyfin_media_index_synced_at', cache.syncedAt);
+  await onProgress?.({ phase: 'caching', current: media.length, total: media.length, label: `MySQL 索引已更新：${cache.mediaCount} 个媒体项目，${cache.codeCount} 个番号` });
+  // Read back from MySQL: all following archive matching uses the persisted
+  // snapshot, exactly like incoming single-entry matching does.
+  const index = await readJellyfinMediaIndex(settings.libraryIds);
   const entries = await db.all<ArchiveCandidate>('SELECT id, subscription_id, content, jellyfin_status, magnet_status FROM archive_entries ORDER BY id ASC');
+  await onProgress?.({ phase: 'writing', current: 0, total: entries.length, label: `正在写入影视库匹配（0 / ${entries.length}）` });
   const now = new Date().toISOString();
   let matched = 0;
   let notFound = 0;
   await db.transaction(async (tx) => {
-    for (const entry of entries) {
+    for (const [indexPosition, entry] of entries.entries()) {
       const item = index.get(archiveKey(entry.content) ?? '');
       if (item) {
         matched += 1;
@@ -41,9 +48,11 @@ export async function syncJellyfinLibrary(trigger: 'manual' | 'scheduled' = 'sch
         // information only: never revive a previously skipped magnet task
         // without an explicit user action.
       }
+      const completed = indexPosition + 1;
+      if (completed % 25 === 0 || completed === entries.length) await onProgress?.({ phase: 'writing', current: completed, total: entries.length, label: `正在写入影视库匹配（${completed} / ${entries.length}）` });
     }
   });
   await setSetting('jellyfin_last_synced_at', now);
-  await appendRuntimeLog({ level: 'success', source: 'library', message: `Jellyfin 影视库${trigger === 'manual' ? '手动' : '定时'}同步完成：扫描 ${media.length} 个媒体项目，${matched} 条已入库，${notFound} 条未入库。` });
-  return { scanned: media.length, matched, notFound, libraries: settings.libraryIds.length };
+  await appendRuntimeLog({ level: 'success', source: 'library', message: `Jellyfin 影视库${trigger === 'manual' ? '手动' : '定时'}同步完成：已更新 ${cache.mediaCount} 个媒体项目、${cache.codeCount} 个番号索引；${matched} 条已入库，${notFound} 条未入库。` });
+  return { scanned: media.length, indexedCodes: cache.codeCount, matched, notFound, libraries: settings.libraryIds.length };
 }

@@ -7,6 +7,7 @@ import { appendRuntimeLog, db, getJellyfinSettings, getOutboundProxyUrl, getQbit
 import { assertQbittorrentConfig, normalizeQbittorrentUrl, testQbittorrentConnection } from './qbittorrent.js';
 import { assertJellyfinConfig, listJellyfinLibraries, normalizeJellyfinUrl, testJellyfinConnection } from './jellyfin.js';
 import { syncJellyfinLibrary } from './jellyfin-sync.js';
+import { clearJellyfinMediaIndex } from './jellyfin-cache.js';
 import { authenticate, clearSessionCookie, configurePassword, createSession, sessionCookie, statusFor, validatePassword } from './auth.js';
 import { getInspectionRules, inspectionRulesJson, normalizeInspectionRules } from './inspection-rules.js';
 
@@ -15,11 +16,12 @@ const port = Number(process.env.PORT ?? 3030);
 const loginFailures = new Map<string, { count: number; firstAt: number; lockedUntil: number }>();
 const loginWindowMs = 10 * 60_000;
 const loginLimit = 7;
-type LiveChannel = 'archive' | 'logs' | 'subscriptions';
+type LiveChannel = 'archive' | 'logs' | 'subscriptions' | 'tasks';
 type LiveClient = { response: ServerResponse; channel: LiveChannel; subscriptionId: number | null; needsSnapshot: boolean };
 const liveClients = new Set<LiveClient>();
 const archiveVersions = new Map<number, string>();
 let subscriptionsVersion = '';
+let tasksVersion = '';
 let liveInitialized = false;
 let latestLogId = 0;
 let lastSseKeepAliveAt = 0;
@@ -64,11 +66,19 @@ async function pollLiveChanges() {
   const watchesLogs = [...liveClients].some((client) => client.channel === 'logs');
   const watchesArchive = [...liveClients].some((client) => client.channel === 'archive');
   const watchesSubscriptions = [...liveClients].some((client) => client.channel === 'subscriptions');
-  const [latestLog, versions, subscriptionVersion] = await Promise.all([
+  const watchesTasks = [...liveClients].some((client) => client.channel === 'tasks');
+  const [latestLog, versions, subscriptionVersion, taskVersion] = await Promise.all([
     watchesLogs ? db.get<{ id: number }>('SELECT COALESCE(MAX(id), 0) AS id FROM runtime_logs') : Promise.resolve(undefined),
     watchesArchive ? db.all<{ subscription_id: number; version: string }>(`SELECT subscription_id, MAX(updated_at) AS version
       FROM archive_entries GROUP BY subscription_id`) : Promise.resolve([]),
-    watchesSubscriptions ? db.get<{ version: string }>(`SELECT SHA2(CONCAT(COALESCE((SELECT MAX(updated_at) FROM subscriptions), ''), ':', COALESCE((SELECT MAX(updated_at) FROM archive_entries), ''), ':', COALESCE((SELECT MAX(requested_at) FROM jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM release_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM magnet_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM library_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM download_jobs WHERE status IN ('queued','running')), '')), 256) AS version`) : Promise.resolve(undefined)
+    watchesSubscriptions ? db.get<{ version: string }>(`SELECT SHA2(CONCAT(COALESCE((SELECT MAX(updated_at) FROM subscriptions), ''), ':', COALESCE((SELECT MAX(updated_at) FROM archive_entries), ''), ':', COALESCE((SELECT MAX(requested_at) FROM jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM release_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM magnet_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM library_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM download_jobs WHERE status IN ('queued','running')), '')), 256) AS version`) : Promise.resolve(undefined),
+    watchesTasks ? db.get<{ version: string }>(`SELECT SHA2(CONCAT(
+      COALESCE((SELECT MAX(last_seen_at) FROM worker_heartbeats), ''), ':',
+      COALESCE((SELECT MAX(requested_at) FROM jobs), ''), ':', COALESCE((SELECT MAX(started_at) FROM jobs), ''), ':', COALESCE((SELECT MAX(finished_at) FROM jobs), ''), ':', COALESCE((SELECT MAX(retry_after) FROM jobs), ''), ':',
+      COALESCE((SELECT MAX(requested_at) FROM release_jobs), ''), ':', COALESCE((SELECT MAX(started_at) FROM release_jobs), ''), ':', COALESCE((SELECT MAX(finished_at) FROM release_jobs), ''), ':', COALESCE((SELECT MAX(retry_after) FROM release_jobs), ''), ':',
+      COALESCE((SELECT MAX(requested_at) FROM magnet_jobs), ''), ':', COALESCE((SELECT MAX(started_at) FROM magnet_jobs), ''), ':', COALESCE((SELECT MAX(finished_at) FROM magnet_jobs), ''), ':', COALESCE((SELECT MAX(retry_after) FROM magnet_jobs), ''), ':',
+      COALESCE((SELECT MAX(requested_at) FROM library_jobs), ''), ':', COALESCE((SELECT MAX(started_at) FROM library_jobs), ''), ':', COALESCE((SELECT MAX(finished_at) FROM library_jobs), ''), ':', COALESCE((SELECT MAX(retry_after) FROM library_jobs), ''), ':',
+      COALESCE((SELECT MAX(requested_at) FROM download_jobs), ''), ':', COALESCE((SELECT MAX(started_at) FROM download_jobs), ''), ':', COALESCE((SELECT MAX(finished_at) FROM download_jobs), ''), ':', COALESCE((SELECT MAX(retry_after) FROM download_jobs), '')), 256) AS version`) : Promise.resolve(undefined)
   ]);
   const nextLogId = Number(latestLog?.id ?? 0);
   const nextVersions = new Map(versions.map((row) => [row.subscription_id, row.version]));
@@ -78,12 +88,13 @@ async function pollLiveChanges() {
     archiveVersions.clear();
     for (const [subscriptionId, version] of nextVersions) archiveVersions.set(subscriptionId, version);
     subscriptionsVersion = subscriptionVersion?.version ?? '';
+    tasksVersion = taskVersion?.version ?? '';
     liveInitialized = true;
   }
   for (const client of liveClients) {
     if (!client.needsSnapshot) continue;
     client.needsSnapshot = false;
-    writeSse(client, client.channel, client.channel === 'archive' ? { subscriptionId: client.subscriptionId } : client.channel === 'logs' ? { latestId: nextLogId } : { version: subscriptionsVersion });
+    writeSse(client, client.channel, client.channel === 'archive' ? { subscriptionId: client.subscriptionId } : client.channel === 'logs' ? { latestId: nextLogId } : { version: client.channel === 'tasks' ? tasksVersion : subscriptionsVersion });
   }
   if (hadPreviousSnapshot) {
     if (nextLogId > latestLogId) {
@@ -100,6 +111,10 @@ async function pollLiveChanges() {
     if (subscriptionVersion && subscriptionVersion.version !== subscriptionsVersion) {
       subscriptionsVersion = subscriptionVersion.version;
       for (const client of liveClients) if (client.channel === 'subscriptions') writeSse(client, 'subscriptions', { version: subscriptionsVersion });
+    }
+    if (taskVersion && taskVersion.version !== tasksVersion) {
+      tasksVersion = taskVersion.version;
+      for (const client of liveClients) if (client.channel === 'tasks') writeSse(client, 'tasks', { version: tasksVersion });
     }
   }
   if (Date.now() - lastSseKeepAliveAt >= 20_000) {
@@ -161,6 +176,7 @@ type QbittorrentSettingsPayload = {
   savePath?: string;
   tags?: string;
   autoDownload?: boolean;
+  autoDownloadMinSizeMb?: number;
   stopAfterDownload?: boolean;
 };
 
@@ -269,12 +285,13 @@ async function normalizePayload(payload: SubscriptionPayload) {
 async function listSubscriptions() {
   return db.all(`SELECT s.*,
     (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id) AS archive_count,
+    (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.jellyfin_status = 'available') AS jellyfin_available_count,
     JSON_OBJECT(
       'check', JSON_OBJECT('done', 0, 'total', (SELECT COUNT(*) FROM jobs j WHERE j.subscription_id = s.id AND j.status IN ('queued','running'))),
       'release', JSON_OBJECT('done', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.release_status IN ('found','unavailable','failed','unsearched')), 'total', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.release_status <> 'unsearched')),
       'magnet', JSON_OBJECT('done', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.magnet_status IN ('found','not_found','failed','skipped')), 'total', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.magnet_status <> 'unsearched')),
       'library', JSON_OBJECT('done', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.jellyfin_status IN ('available','not_found','failed')), 'total', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.jellyfin_status <> 'unconfigured')),
-      'download', JSON_OBJECT('done', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.download_status IN ('completed','removed','failed','not_queued')), 'total', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.download_status <> 'not_queued'))
+      'download', JSON_OBJECT('done', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.download_status IN ('completed','removed','failed','filtered','not_queued')), 'total', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.download_status <> 'not_queued'))
     ) AS queue_summary,
     CASE
       WHEN s.pagination_selector IS NOT NULL
@@ -290,7 +307,7 @@ app.post('/api/internal/events', async (request, reply) => {
   const token = process.env.WORKER_EVENT_TOKEN;
   if (!token || request.headers['x-page-watch-worker-token'] !== token) return reply.code(403).send({ error: '内部事件令牌无效。' });
   const body = request.body as { channel?: unknown; subscriptionId?: unknown };
-  if (body.channel !== 'logs' && body.channel !== 'subscriptions' && body.channel !== 'archive') return reply.code(400).send({ error: '内部事件类型无效。' });
+  if (body.channel !== 'logs' && body.channel !== 'subscriptions' && body.channel !== 'archive' && body.channel !== 'tasks') return reply.code(400).send({ error: '内部事件类型无效。' });
   const subscriptionId = Number(body.subscriptionId);
   if (body.channel === 'archive' && (!Number.isInteger(subscriptionId) || subscriptionId < 1)) return reply.code(400).send({ error: '归档事件缺少订阅标识。' });
   emitLive(body.channel, body.channel === 'archive' ? subscriptionId : undefined);
@@ -299,7 +316,7 @@ app.post('/api/internal/events', async (request, reply) => {
 });
 app.get('/api/events', async (request, reply) => {
   const query = request.query as { channel?: string; subscriptionId?: string };
-  const channel: LiveChannel | null = query.channel === 'archive' || query.channel === 'logs' || query.channel === 'subscriptions' ? query.channel : null;
+  const channel: LiveChannel | null = query.channel === 'archive' || query.channel === 'logs' || query.channel === 'subscriptions' || query.channel === 'tasks' ? query.channel : null;
   const subscriptionId = Number(query.subscriptionId);
   if (!channel || (channel === 'archive' && (!Number.isInteger(subscriptionId) || subscriptionId < 1))) {
     return reply.code(400).send({ error: '实时订阅参数无效。' });
@@ -349,9 +366,28 @@ app.post('/api/auth/logout', async (_request, reply) => {
   reply.header('Set-Cookie', clearSessionCookie());
   return reply.code(204).send();
 });
-app.get('/api/system/status', async () => {
-  const rows = await db.all<{ worker_name: string; status: 'ready' | 'busy' | 'error'; detail: string; last_seen_at: string }>('SELECT worker_name, status, detail, last_seen_at FROM worker_heartbeats');
+type HeartbeatRow = {
+  worker_name: string;
+  status: 'ready' | 'busy' | 'error';
+  detail: string;
+  last_seen_at: string;
+  task_kind: string | null;
+  subscription_id: number | null;
+  archive_entry_id: number | null;
+  task_content: string | null;
+  progress_current: number | null;
+  progress_total: number | null;
+  progress_label: string | null;
+};
+
+async function getSystemStatus() {
+  const rows = await db.all<HeartbeatRow>('SELECT worker_name, status, detail, last_seen_at, task_kind, subscription_id, archive_entry_id, task_content, progress_current, progress_total, progress_label FROM worker_heartbeats');
   const now = Date.now();
+  // Each worker reports at least every 15 seconds. Leave room for a busy
+  // browser task and for the NAS/local development clock boundary; a worker
+  // actively processing a job is healthy, not an alert condition.
+  const staleAfterMs = 90_000;
+  const futureClockToleranceMs = 5 * 60_000;
   const byName = new Map(rows.map((row) => [row.worker_name, row]));
   const services = [
     ['api', '网页服务'],
@@ -363,18 +399,191 @@ app.get('/api/system/status', async () => {
   ].map(([name, label]) => {
     const row = byName.get(name);
     const age = row ? now - new Date(row.last_seen_at).getTime() : Number.POSITIVE_INFINITY;
-    return { name, label, status: row?.status ?? 'missing', detail: row?.detail ?? '尚未收到心跳', lastSeenAt: row?.last_seen_at ?? null, healthy: Boolean(row && age >= 0 && age < 45_000 && row.status !== 'error') };
+    return { name, label, status: row?.status ?? 'missing', detail: row?.detail ?? '尚未收到心跳', lastSeenAt: row?.last_seen_at ?? null, healthy: Boolean(row && age >= -futureClockToleranceMs && age < staleAfterMs && row.status !== 'error') };
   });
-  return { generatedAt: new Date().toISOString(), services };
+  return { generatedAt: new Date().toISOString(), services, heartbeats: rows };
+}
+
+app.get('/api/system/status', async () => {
+  const { generatedAt, services } = await getSystemStatus();
+  return { generatedAt, services };
+});
+
+type TaskQueueRow = {
+  kind: string;
+  task_id: number;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  priority: number;
+  requested_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  retry_after: string | null;
+  error: string | null;
+  attempt_count: number;
+  subscription_id: number | null;
+  subscription_name: string | null;
+  content: string | null;
+  title: string | null;
+  progress_current: number | null;
+  progress_total: number | null;
+  progress_label: string | null;
+  download_progress: number | string | null;
+};
+type ActiveDownloadRow = { id: number; subscription_id: number; subscription_name: string; content: string; title: string | null; download_status: string; download_progress: number | string | null; download_queued_at: string | null; download_added_at: string | null; download_error: string | null };
+
+const taskQueueUnion = `
+  SELECT CASE WHEN s.pagination_selector IS NOT NULL AND s.initial_scan_completed = 0 THEN 'full_scan' ELSE 'check' END AS kind,
+    j.id AS task_id, j.status, j.priority, j.requested_at, j.started_at, j.finished_at, j.retry_after, j.error, j.attempt_count,
+    s.id AS subscription_id, s.name AS subscription_name, NULL AS content, NULL AS title,
+    CASE WHEN s.pagination_selector IS NOT NULL AND s.initial_scan_completed = 0 THEN s.initial_scan_pages_completed ELSE NULL END AS progress_current,
+    CASE WHEN s.pagination_selector IS NOT NULL AND s.initial_scan_completed = 0 THEN s.initial_scan_total ELSE NULL END AS progress_total,
+    CASE WHEN s.pagination_selector IS NOT NULL AND s.initial_scan_completed = 0 THEN CONCAT('下一个页面：', s.initial_scan_next_page) ELSE NULL END AS progress_label,
+    NULL AS download_progress
+  FROM jobs j JOIN subscriptions s ON s.id = j.subscription_id
+  UNION ALL
+  SELECT 'release', j.id, j.status, j.priority, j.requested_at, j.started_at, j.finished_at, j.retry_after, j.error, j.attempt_count,
+    a.subscription_id, s.name, a.content, a.title, NULL, NULL, NULL, NULL
+  FROM release_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id
+  UNION ALL
+  SELECT 'magnet', j.id, j.status, j.priority, j.requested_at, j.started_at, j.finished_at, j.retry_after, j.error, j.attempt_count,
+    a.subscription_id, s.name, a.content, a.title, NULL, NULL, NULL, NULL
+  FROM magnet_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id
+  UNION ALL
+  SELECT 'library', j.id, j.status, j.priority, j.requested_at, j.started_at, j.finished_at, j.retry_after, j.error, j.attempt_count,
+    a.subscription_id, s.name, a.content, a.title, NULL, NULL, NULL, NULL
+  FROM library_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id
+  UNION ALL
+  SELECT 'download', j.id, j.status, j.priority, j.requested_at, j.started_at, j.finished_at, j.retry_after, j.error, j.attempt_count,
+    a.subscription_id, s.name, a.content, a.title, NULL, NULL, NULL, a.download_progress
+  FROM download_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id`;
+
+function taskStatus(row: Pick<TaskQueueRow, 'status' | 'retry_after'>) {
+  return row.status === 'queued' && row.retry_after && Date.parse(row.retry_after) > Date.now() ? 'retrying' : row.status;
+}
+
+app.get('/api/tasks', async (request) => {
+  const query = request.query as { historyLimit?: string };
+  const requestedHistoryLimit = Number(query.historyLimit ?? 50);
+  // The overview only needs a compact history. The operations drill-down asks
+  // for more so each service can retain a useful recent history of its own.
+  const historyLimit = Number.isInteger(requestedHistoryLimit) ? Math.min(Math.max(requestedHistoryLimit, 1), 300) : 50;
+  const [{ generatedAt, services, heartbeats }, activeRows, historyRows, progressRows, activeDownloads] = await Promise.all([
+    getSystemStatus(),
+    db.all<TaskQueueRow>(`SELECT * FROM (${taskQueueUnion}) AS queue_tasks WHERE status IN ('queued', 'running')`),
+    db.all<TaskQueueRow>(`SELECT * FROM (${taskQueueUnion}) AS queue_tasks WHERE status IN ('completed', 'failed') ORDER BY finished_at DESC, task_id DESC LIMIT ?`, [historyLimit]),
+    db.all<Record<string, number | string | null>>(`SELECT subscription_id,
+      SUM(release_status <> 'unsearched') AS release_total, SUM(release_status IN ('found','unavailable','failed')) AS release_done,
+      SUM(magnet_status <> 'unsearched') AS magnet_total, SUM(magnet_status IN ('found','not_found','failed','skipped')) AS magnet_done,
+      SUM(jellyfin_status <> 'unconfigured') AS library_total, SUM(jellyfin_status IN ('available','not_found','failed')) AS library_done
+      FROM archive_entries GROUP BY subscription_id`),
+    db.all<ActiveDownloadRow>(`SELECT a.id, a.subscription_id, s.name AS subscription_name, a.content, a.title, a.download_status, a.download_progress,
+      a.download_queued_at, a.download_added_at, a.download_error
+      FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
+      WHERE a.download_status IN ('queued', 'running', 'added', 'waiting', 'downloading', 'paused')`)
+  ]);
+  const progressBySubscription = new Map(progressRows.map((row) => [Number(row.subscription_id), row]));
+  const serialize = (row: TaskQueueRow) => {
+    const kind = row.kind;
+    const source = progressBySubscription.get(Number(row.subscription_id));
+    let current = row.progress_current === null ? null : Number(row.progress_current);
+    let total = row.progress_total === null ? null : Number(row.progress_total);
+    let label = row.progress_label;
+    if (source && (kind === 'release' || kind === 'magnet' || kind === 'library')) {
+      current = Number(source[`${kind}_done`] ?? 0);
+      total = Number(source[`${kind}_total`] ?? 0);
+    }
+    if (kind === 'download' && row.download_progress !== null) {
+      const value = Number(row.download_progress);
+      if (Number.isFinite(value)) { current = Math.round(value * 100); total = 100; label = `下载 ${current}%`; }
+    }
+    return {
+      id: `${kind}-${row.task_id}`, kind, status: taskStatus(row), priority: Number(row.priority ?? 0),
+      subscriptionId: row.subscription_id, subscriptionName: row.subscription_name, content: row.content, title: row.title,
+      requestedAt: row.requested_at, startedAt: row.started_at, finishedAt: row.finished_at, retryAfter: row.retry_after,
+      attemptCount: Number(row.attempt_count ?? 0), error: row.error,
+      progress: current !== null || total !== null || label ? { current, total, label } : null
+    };
+  };
+  const active = activeRows.map(serialize);
+  for (const download of activeDownloads) {
+    if (active.some((task) => task.kind === 'download' && task.content === download.content && task.subscriptionId === download.subscription_id)) continue;
+    const numericProgress = download.download_progress === null ? null : Number(download.download_progress);
+    const percent = numericProgress !== null && Number.isFinite(numericProgress) ? Math.round(numericProgress * 100) : null;
+    const label = download.download_status === 'paused' ? 'qBittorrent 已暂停' : percent === null ? '等待 qBittorrent 开始下载' : `下载 ${percent}%`;
+    active.push({ id: `download-state-${download.id}`, kind: 'download', status: download.download_status === 'paused' ? 'queued' : 'running', priority: 0,
+      subscriptionId: download.subscription_id, subscriptionName: download.subscription_name, content: download.content, title: download.title,
+      requestedAt: download.download_queued_at ?? download.download_added_at ?? new Date().toISOString(), startedAt: download.download_added_at, finishedAt: null, retryAfter: null, attemptCount: 0,
+      error: download.download_error, progress: percent === null ? { current: null, total: null, label } : { current: percent, total: 100, label } });
+  }
+  const librarySync = heartbeats.find((row) => row.worker_name === 'library' && row.status === 'busy' && row.task_kind === 'library_sync');
+  if (librarySync) active.push({
+    id: 'library-sync', kind: 'library_sync', status: 'running', priority: 0,
+    subscriptionId: librarySync.subscription_id, subscriptionName: null, content: librarySync.task_content, title: null,
+    requestedAt: librarySync.last_seen_at, startedAt: librarySync.last_seen_at, finishedAt: null, retryAfter: null, attemptCount: 0, error: null,
+    progress: librarySync.progress_current !== null || librarySync.progress_total !== null || librarySync.progress_label ? { current: librarySync.progress_current, total: librarySync.progress_total, label: librarySync.progress_label } : null
+  });
+  const statusOrder: Record<string, number> = { running: 0, queued: 1, retrying: 2 };
+  active.sort((left, right) => (statusOrder[left.status] ?? 9) - (statusOrder[right.status] ?? 9) || right.priority - left.priority || String(left.requestedAt ?? '').localeCompare(String(right.requestedAt ?? '')));
+  const history = historyRows.map(serialize);
+  return {
+    generatedAt,
+    summary: {
+      servicesOnline: services.filter((service) => service.healthy).length,
+      running: active.filter((task) => task.status === 'running').length,
+      queued: active.filter((task) => task.status === 'queued').length,
+      retrying: active.filter((task) => task.status === 'retrying').length,
+      failed: history.filter((task) => task.status === 'failed').length
+    },
+    services,
+    active,
+    history
+  };
 });
 app.get('/api/subscriptions', async () => await listSubscriptions());
+
+type RuntimeLogScope = 'system' | 'check' | 'release' | 'magnet' | 'download' | 'library';
+type RuntimeLogRow = {
+  id: number;
+  level: 'info' | 'success' | 'error';
+  source: 'system' | 'queue' | 'worker' | 'download' | 'library';
+  subscription_id: number | null;
+  subscription_name: string | null;
+  subscription_url: string | null;
+  job_id: number | null;
+  message: string;
+  created_at: string;
+};
+
+/**
+ * Runtime logs predate the task centre and only store broad sources. Keep
+ * those records compatible by assigning a stable service scope at read time.
+ * New messages automatically follow the same rules without a data migration.
+ */
+function runtimeLogScope(log: Pick<RuntimeLogRow, 'source' | 'message'>): RuntimeLogScope {
+  const message = log.message;
+  if (log.source === 'library' || /Jellyfin|影视库/.test(message)) return 'library';
+  if (log.source === 'download' || /qBittorrent|下载|做种/.test(message)) return 'download';
+  if (/磁力|cilisousuo/i.test(message)) return 'magnet';
+  if (/发行日期|详情页字段/.test(message)) return 'release';
+  if (log.source === 'worker' || /检查|全量扫描|网页抓取/.test(message)) return 'check';
+  if (log.source === 'queue') return 'check';
+  return 'system';
+}
+
 app.get('/api/logs', async (request) => {
-  const query = request.query as { limit?: string };
+  const query = request.query as { limit?: string; scope?: string };
   const limitValue = Number(query.limit ?? 300);
   const limit = Number.isInteger(limitValue) ? Math.min(Math.max(limitValue, 1), 1000) : 300;
-  return db.all(`SELECT l.*, s.name AS subscription_name, s.url AS subscription_url
+  const scope = ['system', 'check', 'release', 'magnet', 'download', 'library'].includes(query.scope ?? '') ? query.scope as RuntimeLogScope : null;
+  // Fetch the retained window when filtering so a busy service still receives
+  // the requested number of its own messages rather than a thin slice of the
+  // global feed.
+  const rows = await db.all<RuntimeLogRow>(`SELECT l.*, s.name AS subscription_name, s.url AS subscription_url
     FROM runtime_logs l LEFT JOIN subscriptions s ON s.id = l.subscription_id
-    ORDER BY l.id DESC LIMIT ?`, [limit]);
+    ORDER BY l.id DESC LIMIT ?`, [scope ? 1000 : limit]);
+  return rows.map((row) => ({ ...row, scope: runtimeLogScope(row) }))
+    .filter((row) => !scope || row.scope === scope)
+    .slice(0, limit);
 });
 app.get('/api/subscription-presets', async () => await db.all('SELECT * FROM subscription_presets ORDER BY updated_at DESC, id DESC'));
 app.post('/api/subscription-presets', async (request, reply) => {
@@ -446,7 +655,7 @@ app.get('/api/archive', async (request) => {
   const total = Number(totalRow?.total ?? 0);
   const items = await db.all(`SELECT a.id, a.content, a.title, a.detail_url, a.first_seen_at, a.release_date, a.release_status, a.release_error, a.magnet_status, a.magnet_value, a.magnet_checked_at, a.magnet_error,
       a.download_status, a.download_queued_at, a.download_added_at, a.download_torrent_hash, a.download_checked_at, a.download_error,
-      a.download_progress, a.download_speed, a.download_size, a.downloaded_bytes, a.download_save_path, a.download_content_path, a.download_removed_at,
+      a.download_progress, a.download_speed, a.download_size, a.downloaded_bytes, a.download_save_path, a.download_content_path, a.download_removed_at, a.download_filter_min_size_bytes,
       a.jellyfin_status, a.jellyfin_item_id, a.jellyfin_item_name, a.jellyfin_matched_at, a.jellyfin_error,
       s.id AS subscription_id, s.name AS subscription_name, s.url AS subscription_url
     FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
@@ -532,6 +741,7 @@ function publicQbittorrentSettings() {
     savePath: settings.savePath,
     tags: settings.tags,
     autoDownload: settings.autoDownload,
+    autoDownloadMinSizeMb: settings.autoDownloadMinSizeMb,
     stopAfterDownload: settings.stopAfterDownload
   };
 }
@@ -584,6 +794,10 @@ function normalizeQbittorrentSettings(payload: QbittorrentSettingsPayload) {
   const current = getQbittorrentSettings();
   const enabled = typeof payload.enabled === 'boolean' ? payload.enabled : current.enabled;
   const autoDownload = typeof payload.autoDownload === 'boolean' ? payload.autoDownload : current.autoDownload;
+  const autoDownloadMinSizeMb = payload.autoDownloadMinSizeMb === undefined ? current.autoDownloadMinSizeMb : Number(payload.autoDownloadMinSizeMb);
+  if (!Number.isInteger(autoDownloadMinSizeMb) || autoDownloadMinSizeMb < 0 || autoDownloadMinSizeMb > 1048576) {
+    throw new Error('最小单文件大小需为 0 到 1048576 之间的整数 MB。');
+  }
   const stopAfterDownload = typeof payload.stopAfterDownload === 'boolean' ? payload.stopAfterDownload : current.stopAfterDownload;
   const authMode = payload.authMode === 'api_key' ? 'api_key' : payload.authMode === 'password' ? 'password' : current.authMode;
   const rawUrl = payload.url === undefined ? current.url : compactQbittorrentField(payload.url, 'qBittorrent Web UI 地址', 500);
@@ -596,7 +810,7 @@ function normalizeQbittorrentSettings(payload: QbittorrentSettingsPayload) {
   const category = payload.category === undefined ? current.category : compactQbittorrentField(payload.category, '分类', 255);
   const savePath = payload.savePath === undefined ? current.savePath : compactQbittorrentField(payload.savePath, '保存路径', 1000);
   const tags = payload.tags === undefined ? current.tags : compactQbittorrentField(payload.tags, '标签', 500);
-  const values = { enabled, url, authMode, apiKey, username, password, category, savePath, tags, autoDownload, stopAfterDownload };
+  const values = { enabled, url, authMode, apiKey, username, password, category, savePath, tags, autoDownload, autoDownloadMinSizeMb, stopAfterDownload };
   if (enabled) assertQbittorrentConfig(values);
   return values;
 }
@@ -619,9 +833,9 @@ app.post('/api/subscriptions/:id/download-backfill', async (request, reply) => {
   const subscription = await getSubscription(id);
   if (!subscription) return reply.code(404).send({ error: '订阅不存在。' });
   if (!await ensureQbittorrentEnabled(reply)) return;
-  const candidates = await db.all<{ id: number }>(`SELECT id FROM archive_entries
+  const candidates = await db.all<{ id: number; download_status: string }>(`SELECT id, download_status FROM archive_entries
     WHERE subscription_id = ? AND magnet_status = 'found' AND magnet_value IS NOT NULL
-      AND download_status IN ('not_queued', 'failed') ORDER BY id ASC`, [id]);
+      AND download_status IN ('not_queued', 'failed', 'filtered') ORDER BY id ASC`, [id]);
   let queued = 0;
   await db.transaction(async (tx) => {
     for (const entry of candidates) {
@@ -629,7 +843,13 @@ app.post('/api/subscriptions/:id/download-backfill', async (request, reply) => {
       if (result.queued) {
         queued += 1;
         const now = new Date().toISOString();
-        await tx.run(`UPDATE archive_entries SET download_status = 'queued', download_queued_at = ?, download_error = NULL, updated_at = ? WHERE id = ?`, [now, now, entry.id]);
+        if (entry.download_status === 'filtered') {
+          await tx.run(`UPDATE archive_entries SET download_queued_at = ?,
+            download_error = '已排队手动下载，将恢复种子内全部文件。', updated_at = ? WHERE id = ?`, [now, now, entry.id]);
+        } else {
+          await tx.run(`UPDATE archive_entries SET download_status = 'queued', download_queued_at = ?, download_error = NULL,
+            download_filter_min_size_bytes = NULL, updated_at = ? WHERE id = ?`, [now, now, entry.id]);
+        }
       }
     }
   });
@@ -653,7 +873,13 @@ app.post('/api/archive/:id/download', async (request, reply) => {
     jobId = result.id;
     if (queued) {
       const now = new Date().toISOString();
-      await tx.run(`UPDATE archive_entries SET download_status = 'queued', download_queued_at = ?, download_error = NULL, updated_at = ? WHERE id = ?`, [now, now, entry.id]);
+      if (entry.download_status === 'filtered') {
+        await tx.run(`UPDATE archive_entries SET download_queued_at = ?,
+          download_error = '已排队手动下载，将恢复种子内全部文件。', updated_at = ? WHERE id = ?`, [now, now, entry.id]);
+      } else {
+        await tx.run(`UPDATE archive_entries SET download_status = 'queued', download_queued_at = ?, download_error = NULL,
+          download_filter_min_size_bytes = NULL, updated_at = ? WHERE id = ?`, [now, now, entry.id]);
+      }
     }
   });
   await appendRuntimeLog({ level: 'info', source: 'queue', subscriptionId: entry.subscription_id, jobId, message: queued ? `已将“${entry.content}”加入 qBittorrent 下载队列。` : `“${entry.content}”已在 qBittorrent 下载队列中。` });
@@ -727,6 +953,7 @@ app.put('/api/settings/qbittorrent', async (request, reply) => {
       setSetting('qbit_save_path', settings.savePath),
       setSetting('qbit_tags', settings.tags),
       setSetting('qbit_auto_download', settings.autoDownload ? '1' : '0'),
+      setSetting('qbit_auto_download_min_size_mb', String(settings.autoDownloadMinSizeMb)),
       setSetting('qbit_stop_after_download', settings.stopAfterDownload ? '1' : '0')
     ]);
     return publicQbittorrentSettings();
@@ -760,8 +987,10 @@ app.put('/api/settings/jellyfin', async (request, reply) => {
       setSetting('jellyfin_library_ids', JSON.stringify(settings.libraryIds)),
       setSetting('jellyfin_sync_interval_minutes', String(settings.syncIntervalMinutes)),
       setSetting('jellyfin_skip_magnet_when_available', settings.skipMagnetWhenAvailable ? '1' : '0'),
-      setSetting('jellyfin_last_synced_at', '')
+      setSetting('jellyfin_last_synced_at', ''),
+      setSetting('jellyfin_media_index_synced_at', '')
     ]);
+    await clearJellyfinMediaIndex();
     await db.run(`UPDATE archive_entries SET jellyfin_status = ?, jellyfin_item_id = NULL, jellyfin_item_name = NULL,
       jellyfin_matched_at = NULL, jellyfin_error = NULL, updated_at = ?`, [settings.enabled && settings.libraryIds.length ? 'pending' : 'unconfigured', now]);
     return publicJellyfinSettings();

@@ -1,4 +1,4 @@
-import { appendRuntimeLog, db, queueReleaseJob, refreshSettings, reportWorkerHeartbeat } from './db.js';
+import { appendRuntimeLog, db, queueReleaseJob, refreshSettings, reportWorkerHeartbeat, type WorkerTaskContext } from './db.js';
 import { lookupReleaseDate, ReleaseDateBrowserSession } from './release-date.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription } from './retry.js';
 import { expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
@@ -67,6 +67,8 @@ async function runNextReleaseJob() {
   if (!job) return;
   const started = await db.run("UPDATE release_jobs SET status = 'running', started_at = ?, retry_after = NULL WHERE id = ? AND status = 'queued'", [new Date().toISOString(), job.id]);
   if (!started.changes) return;
+  activeTask = { kind: 'release', subscriptionId: job.subscription_id, archiveEntryId: job.archive_entry_id, content: job.content, label: '正在读取发行日期详情页' };
+  await heartbeat();
 
   try {
     const rule = getInspectionRules().releaseDate;
@@ -76,6 +78,7 @@ async function runNextReleaseJob() {
         await tx.run("UPDATE archive_entries SET release_status = 'unsearched', release_error = NULL, updated_at = ? WHERE id = ?", [finishedAt, job.archive_entry_id]);
         await tx.run("UPDATE release_jobs SET status = 'completed', finished_at = ?, error = '发行日期规则已停用' WHERE id = ?", [finishedAt, job.id]);
       });
+      activeTask = null;
       return;
     }
     const detailUrl = expandReleaseUrl(rule.urlTemplate, { detailUrl: job.detail_url, subscriptionUrl: job.subscription_url, content: job.content });
@@ -93,8 +96,10 @@ async function runNextReleaseJob() {
       await tx.run("UPDATE release_jobs SET status = 'completed', finished_at = ?, error = NULL, retry_after = NULL WHERE id = ?", [finishedAt, job.id]);
     });
     await logProgress(job.subscription_id);
+    activeTask = null;
     notifyLive('archive', job.subscription_id);
     notifyLive('subscriptions');
+    notifyLive('tasks');
   } catch (error) {
     const message = error instanceof Error ? error.message : '未知发行日期读取错误';
     const finishedAt = new Date().toISOString();
@@ -114,15 +119,18 @@ async function runNextReleaseJob() {
     console.error(`Release-date job ${job.id} failed: ${message}`);
     notifyLive('archive', job.subscription_id);
     notifyLive('subscriptions');
+    notifyLive('tasks');
+    activeTask = null;
   }
 }
 
 let working = false;
+let activeTask: WorkerTaskContext | null = null;
 let lastInfrastructureLogAt = 0;
 let lastStalledRecoveryAt = 0;
 
 async function heartbeat() {
-  await reportWorkerHeartbeat('release', working ? '正在读取发行日期详情页' : '发行日期详情页读取', working ? 'busy' : 'ready').catch(() => undefined);
+  await reportWorkerHeartbeat('release', activeTask?.label ?? '发行日期详情页读取', activeTask ? 'busy' : 'ready', activeTask).catch(() => undefined);
 }
 
 async function recoverStalledJobs() {

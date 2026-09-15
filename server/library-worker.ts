@@ -1,14 +1,22 @@
-import { appendRuntimeLog, db, getJellyfinSettings, getSetting, queueMagnetJob, refreshSettings, reportWorkerHeartbeat } from './db.js';
+import { appendRuntimeLog, db, getJellyfinSettings, getSetting, queueMagnetJob, refreshSettings, reportWorkerHeartbeat, type WorkerTaskContext } from './db.js';
 import { findJellyfinMedia } from './jellyfin.js';
 import { exactJellyfinMatch } from './jellyfin-match.js';
 import { syncJellyfinLibrary } from './jellyfin-sync.js';
+import { findCachedJellyfinMedia } from './jellyfin-cache.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription } from './retry.js';
 import { notifyLive } from './live-events.js';
 
+// An idle worker only needs a modest polling cadence. Once a complete local
+// Jellyfin index exists, however, individual matches are indexed MySQL reads
+// rather than remote API requests, so draining a small sequential batch is
+// both safe and dramatically faster for a newly added subscription.
 const POLL_MS = 15_000;
+const LOCAL_MATCH_BATCH_SIZE = 20;
+const LOCAL_MATCH_BATCH_YIELD_MS = 50;
 let working = false;
 let syncing = false;
 let lastErrorLogAt = 0;
+let syncTask: WorkerTaskContext | null = null;
 
 type LibraryJob = { id: number; archive_entry_id: number; attempt_count: number; subscription_id: number; content: string; jellyfin_status: string };
 
@@ -23,8 +31,13 @@ async function runNextLibraryJob() {
   try {
     const settings = getJellyfinSettings();
     if (!settings.enabled || !settings.libraryIds.length) throw new Error('Jellyfin 未启用或尚未选择媒体库。');
-    const media = await findJellyfinMedia(settings, job.content);
-    const match = exactJellyfinMatch(job.content, media);
+    // After the first complete library sync, this is a single indexed MySQL
+    // lookup. The Jellyfin API fallback exists only while no local snapshot is
+    // available yet (for example immediately after configuration changes).
+    const indexReady = Boolean(getSetting('jellyfin_media_index_synced_at'));
+    const match = indexReady
+      ? await findCachedJellyfinMedia(job.content, settings.libraryIds)
+      : exactJellyfinMatch(job.content, await findJellyfinMedia(settings, job.content));
     const finishedAt = new Date().toISOString();
     await db.transaction(async (tx) => {
       if (match) {
@@ -65,12 +78,13 @@ async function runNextLibraryJob() {
   }
   notifyLive('archive', job.subscription_id);
   notifyLive('subscriptions');
+  notifyLive('tasks');
   return true;
 }
 
 async function syncHeartbeat() {
   if (!syncing) return;
-  await reportWorkerHeartbeat('library', '正在同步 Jellyfin 影视库', 'busy').catch(() => undefined);
+  await reportWorkerHeartbeat('library', syncTask?.label ?? '正在同步 Jellyfin 影视库', 'busy', syncTask).catch(() => undefined);
 }
 
 function syncDue() {
@@ -82,6 +96,7 @@ function syncDue() {
 async function tick() {
   if (working) return;
   working = true;
+  let scheduleImmediateTick = false;
   try {
     await refreshSettings();
     const settings = getJellyfinSettings();
@@ -97,19 +112,34 @@ async function tick() {
       await reportWorkerHeartbeat('library', '等待选择 Jellyfin 媒体库', 'error');
       return;
     }
-    if (await runNextLibraryJob()) {
-      await reportWorkerHeartbeat('library', '正在逐条核对 Jellyfin 影视库', 'busy');
+    // A cache miss after configuration changes must build one complete local
+    // snapshot before processing individual archive rows. Otherwise a large
+    // newly-added subscription would fan out into one Jellyfin API search per
+    // item and defeat the purpose of the local index.
+    if (!getSetting('jellyfin_media_index_synced_at') || syncDue()) {
+      syncing = true;
+      syncTask = { kind: 'library_sync', current: 0, total: null, label: '正在读取 Jellyfin 媒体库' };
+      await syncHeartbeat();
+      const result = await syncJellyfinLibrary('scheduled', async (progress) => {
+        syncTask = { kind: 'library_sync', current: progress.current, total: progress.total, label: progress.label };
+        await syncHeartbeat();
+      });
+      syncing = false;
+      syncTask = null;
+      await reportWorkerHeartbeat('library', `Jellyfin 已同步 ${result.scanned} 个媒体项目、${result.indexedCodes} 个番号索引，匹配 ${result.matched} 条归档`);
       return;
     }
-    if (!syncDue()) {
-      await reportWorkerHeartbeat('library', `Jellyfin 影视库将在下个计划周期同步（每 ${settings.syncIntervalMinutes} 分钟）`);
+    let processed = 0;
+    while (processed < LOCAL_MATCH_BATCH_SIZE && await runNextLibraryJob()) processed += 1;
+    if (processed > 0) {
+      await reportWorkerHeartbeat('library', `正在查询 MySQL Jellyfin 媒体索引（本批已处理 ${processed} 项）`, 'busy');
+      // Yield between bounded batches to keep this single Worker responsive
+      // to heartbeats and the rest of the Node.js service, without returning
+      // to the 15-second idle polling delay while a queue is still backed up.
+      scheduleImmediateTick = processed === LOCAL_MATCH_BATCH_SIZE;
       return;
     }
-    syncing = true;
-    await syncHeartbeat();
-    const result = await syncJellyfinLibrary('scheduled');
-    syncing = false;
-    await reportWorkerHeartbeat('library', `Jellyfin 已同步 ${result.scanned} 个媒体项目，匹配 ${result.matched} 条归档`);
+    await reportWorkerHeartbeat('library', `Jellyfin 影视库将在下个计划周期同步（每 ${settings.syncIntervalMinutes} 分钟）`);
   } catch (error) {
     const message = error instanceof Error ? error.message : '未知 Jellyfin 同步错误';
     console.error(`Jellyfin library sync failed: ${message}`);
@@ -118,7 +148,12 @@ async function tick() {
       lastErrorLogAt = Date.now();
       await appendRuntimeLog({ level: 'error', source: 'library', message: `Jellyfin 影视库同步失败：${message}` }).catch(() => undefined);
     }
-  } finally { syncing = false; working = false; }
+  } finally {
+    syncing = false;
+    syncTask = null;
+    working = false;
+    if (scheduleImmediateTick) setTimeout(() => void tick(), LOCAL_MATCH_BATCH_YIELD_MS);
+  }
 }
 
 void appendRuntimeLog({ level: 'info', source: 'system', message: 'Jellyfin 影视库同步 Worker 已启动。' })

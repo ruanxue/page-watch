@@ -1,5 +1,5 @@
 import { captureSubscription, closeCaptureBrowser } from './capture.js';
-import { appendRuntimeLog, db, getSubscription, JOB_PRIORITY, queueJob, refreshSettings, reportWorkerHeartbeat, type Subscription } from './db.js';
+import { appendRuntimeLog, db, getSubscription, JOB_PRIORITY, queueJob, refreshSettings, reportWorkerHeartbeat, type Subscription, type WorkerTaskContext } from './db.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription } from './retry.js';
 import { notifyLive } from './live-events.js';
 
@@ -74,13 +74,17 @@ async function runNextJob() {
     subscription = await getSubscription(job.subscription_id);
     if (!subscription) throw new Error('订阅已删除。');
     const fullScan = Boolean(subscription.pagination_selector && !subscription.initial_scan_completed);
+    activeTask = { kind: fullScan ? 'full_scan' : 'check', subscriptionId: subscription.id, current: fullScan ? subscription.initial_scan_pages_completed : null, total: fullScan ? subscription.initial_scan_total : null, label: fullScan ? `下一个页面：${subscription.initial_scan_next_page}` : '正在读取网页内容' };
+    await heartbeat();
     await appendRuntimeLog({ level: 'info', source: 'worker', subscriptionId: subscription.id, jobId: job.id, message: fullScan ? (subscription.initial_scan_run_id ? `恢复全量检查：从第 ${subscription.initial_scan_next_page} 页继续。` : '开始全量检查。') : '开始检查第一页。' });
     const result = await captureSubscription(subscription);
     await db.run("UPDATE jobs SET status = 'completed', finished_at = ? WHERE id = ?", [new Date().toISOString(), job.id]);
     const additions = result.addedCount ? `，新增 ${result.addedCount} 条内容` : '，没有新增内容';
     await appendRuntimeLog({ level: 'success', source: 'worker', subscriptionId: subscription.id, jobId: job.id, message: `${result.totalPages > 1 ? `全量检查完成，共读取 ${result.totalPages} 页` : '检查完成'}，提取 ${result.itemCount} 项${additions}。` });
+    activeTask = null;
     notifyLive('archive', subscription.id);
     notifyLive('subscriptions');
+    notifyLive('tasks');
   } catch (error) {
     const message = error instanceof Error ? error.message : '未知抓取错误';
     const attempt = job.attempt_count + 1;
@@ -100,16 +104,19 @@ async function runNextJob() {
     if (subscription) {
       notifyLive('archive', subscription.id);
       notifyLive('subscriptions');
+      notifyLive('tasks');
     }
+    activeTask = null;
   }
 }
 
 let working = false;
+let activeTask: WorkerTaskContext | null = null;
 let lastInfrastructureLogAt = 0;
 let lastStalledRecoveryAt = 0;
 
 async function heartbeat() {
-  await reportWorkerHeartbeat('capture', working ? '正在执行网页检查' : '检查计划与网页抓取', working ? 'busy' : 'ready').catch(() => undefined);
+  await reportWorkerHeartbeat('capture', activeTask?.label ?? '检查计划与网页抓取', activeTask ? 'busy' : 'ready', activeTask).catch(() => undefined);
 }
 
 async function reportInfrastructureError(error: unknown) {

@@ -1,4 +1,4 @@
-export type LiveEventChannel = 'logs' | 'archive' | 'subscriptions';
+export type LiveEventChannel = 'logs' | 'archive' | 'subscriptions' | 'tasks';
 
 /**
  * Workers are separate Node processes even in the single Docker container.

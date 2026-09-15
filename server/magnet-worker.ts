@@ -1,4 +1,4 @@
-import { appendRuntimeLog, db, getQbittorrentSettings, queueDownloadJob, refreshSettings, reportWorkerHeartbeat } from './db.js';
+import { appendRuntimeLog, db, getQbittorrentSettings, queueDownloadJob, refreshSettings, reportWorkerHeartbeat, type WorkerTaskContext } from './db.js';
 import { lookupMagnet } from './magnet.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription } from './retry.js';
 import { getInspectionRules } from './inspection-rules.js';
@@ -38,6 +38,8 @@ async function runNextMagnetJob() {
 
   const started = await db.run("UPDATE magnet_jobs SET status = 'running', started_at = ?, retry_after = NULL WHERE id = ? AND status = 'queued'", [new Date().toISOString(), job.id]);
   if (!started.changes) return;
+  activeTask = { kind: 'magnet', subscriptionId: job.subscription_id, archiveEntryId: job.archive_entry_id, content: job.content, label: '正在检索磁力链接' };
+  await heartbeat();
 
   try {
     const rule = getInspectionRules().magnet;
@@ -47,6 +49,7 @@ async function runNextMagnetJob() {
         await tx.run("UPDATE archive_entries SET magnet_status = 'unsearched', magnet_error = NULL, updated_at = ? WHERE id = ?", [finishedAt, job.archive_entry_id]);
         await tx.run("UPDATE magnet_jobs SET status = 'completed', finished_at = ?, error = '磁力检索规则已停用' WHERE id = ?", [finishedAt, job.id]);
       });
+      activeTask = null;
       return;
     }
     const result = await lookupMagnet(job.content, rule);
@@ -60,7 +63,8 @@ async function runNextMagnetJob() {
         if (qbit.enabled && qbit.autoDownload) {
           const queued = await queueDownloadJob(job.archive_entry_id, tx);
           downloadQueued = queued.queued;
-          if (queued.queued) await tx.run(`UPDATE archive_entries SET download_status = 'queued', download_queued_at = ?, download_error = NULL, updated_at = ?
+          if (queued.queued) await tx.run(`UPDATE archive_entries SET download_status = 'queued', download_queued_at = ?, download_error = NULL,
+            download_filter_min_size_bytes = NULL, updated_at = ?
             WHERE id = ?`, [finishedAt, finishedAt, job.archive_entry_id]);
         }
       } else {
@@ -75,8 +79,10 @@ async function runNextMagnetJob() {
       await appendRuntimeLog({ level: 'info', source: 'queue', subscriptionId: job.subscription_id, message: `已将“${job.content}”加入 qBittorrent 下载队列。` });
     }
     await logProgress(job.subscription_id);
+    activeTask = null;
     notifyLive('archive', job.subscription_id);
     notifyLive('subscriptions');
+    notifyLive('tasks');
   } catch (error) {
     const message = error instanceof Error ? error.message : '未知磁力检索错误';
     const finishedAt = new Date().toISOString();
@@ -96,15 +102,18 @@ async function runNextMagnetJob() {
     console.error(`Magnet job ${job.id} failed: ${message}`);
     notifyLive('archive', job.subscription_id);
     notifyLive('subscriptions');
+    notifyLive('tasks');
+    activeTask = null;
   }
 }
 
 let working = false;
+let activeTask: WorkerTaskContext | null = null;
 let lastInfrastructureLogAt = 0;
 let lastStalledRecoveryAt = 0;
 
 async function heartbeat() {
-  await reportWorkerHeartbeat('magnet', working ? '正在检索磁力链接' : '磁力检索队列', working ? 'busy' : 'ready').catch(() => undefined);
+  await reportWorkerHeartbeat('magnet', activeTask?.label ?? '磁力检索队列', activeTask ? 'busy' : 'ready', activeTask).catch(() => undefined);
 }
 
 async function reportInfrastructureError(error: unknown) {

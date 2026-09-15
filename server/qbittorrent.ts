@@ -32,6 +32,13 @@ type TorrentInfoResponse = {
   content_path?: unknown;
 };
 
+type TorrentFileResponse = {
+  index?: unknown;
+  name?: unknown;
+  size?: unknown;
+  priority?: unknown;
+};
+
 export type QbittorrentTorrentState = {
   hash: string;
   state: string;
@@ -41,6 +48,18 @@ export type QbittorrentTorrentState = {
   downloadSpeed: number;
   savePath: string | null;
   contentPath: string | null;
+};
+
+export type QbittorrentTorrentFile = {
+  index: number;
+  name: string;
+  size: number;
+  priority: number;
+};
+
+export type QbittorrentAddOptions = {
+  /** qBittorrent stops after receiving magnet metadata, before payload download. */
+  stopCondition?: 'MetadataReceived';
 };
 
 /** Make previously saved HTML-escaped magnet values safe for qBittorrent. */
@@ -226,7 +245,7 @@ export async function testQbittorrentConnection(config: QbittorrentConfig) {
 }
 
 /** Submit a magnet to qBittorrent. qBittorrent itself de-duplicates matching info hashes. */
-export async function addMagnetToQbittorrent(input: QbittorrentConfig, magnet: string) {
+export async function addMagnetToQbittorrent(input: QbittorrentConfig, magnet: string, options: QbittorrentAddOptions = {}) {
   const normalizedMagnet = normalizeMagnetForSubmission(magnet);
   if (!normalizedMagnet.toLowerCase().startsWith('magnet:?')) throw new Error('保存的磁力链接格式无效，无法提交给 qBittorrent。');
   const { config, headers } = await authorizedHeaders(input);
@@ -235,6 +254,7 @@ export async function addMagnetToQbittorrent(input: QbittorrentConfig, magnet: s
   if (config.category?.trim()) body.set('category', config.category.trim());
   if (config.savePath?.trim()) body.set('savepath', config.savePath.trim());
   if (config.tags?.trim()) body.set('tags', config.tags.trim());
+  if (options.stopCondition) body.set('stopCondition', options.stopCondition);
   const response = await postMultipart(endpoint(config.url, 'api/v2/torrents/add'), body, headers);
   const message = (await response.text()).trim();
   if (!response.ok) throw new Error(`qBittorrent 添加任务失败（HTTP ${response.status}）：${message || '服务器未提供详细说明。'}`);
@@ -246,9 +266,78 @@ export async function addMagnetToQbittorrent(input: QbittorrentConfig, magnet: s
   return { torrentHash: accepted.torrentHash ?? torrentHashFromMagnet(normalizedMagnet) };
 }
 
+function requestedTorrentHashes(hashes: string[]) {
+  return [...new Set(hashes.map((hash) => hash.trim().toLowerCase()).filter((hash) => /^[a-f0-9]{40}$/.test(hash)))];
+}
+
+/** Start torrents after Page Watch has accepted their metadata-based size check. */
+export async function startQbittorrentTorrents(input: QbittorrentConfig, hashes: string[]) {
+  const requested = requestedTorrentHashes(hashes);
+  if (!requested.length) return;
+  const { config, headers } = await authorizedHeaders(input);
+  const form = new URLSearchParams({ hashes: requested.join('|') });
+  let response = await postForm(endpoint(config.url, 'api/v2/torrents/start'), form, headers);
+  // qBittorrent 5 renamed resume to start; retain compatibility for older NAS
+  // installations that expose the older Web API route.
+  if (response.status === 404 || response.status === 405) {
+    await response.text();
+    response = await postForm(endpoint(config.url, 'api/v2/torrents/resume'), form, headers);
+  }
+  const body = (await response.text()).trim();
+  if (!response.ok) throw new Error(`qBittorrent 开始下载失败（HTTP ${response.status}）：${body || '服务器未提供详细说明。'}`);
+}
+
+/**
+ * Returns null while qBittorrent is still receiving metadata. Once metadata
+ * exists, its file list is authoritative and exposes each file's size and
+ * selectable priority.
+ */
+export async function getQbittorrentTorrentFiles(input: QbittorrentConfig, hash: string) {
+  const requested = requestedTorrentHashes([hash]);
+  if (!requested.length) throw new Error('qBittorrent 种子哈希格式无效。');
+  const { config, headers } = await authorizedHeaders(input);
+  const url = endpoint(config.url, 'api/v2/torrents/files');
+  url.searchParams.set('hash', requested[0]);
+  const response = await requestQbittorrent(url, { headers });
+  const body = (await response.text()).trim();
+  // This is qBittorrent's documented “metadata hasn't downloaded yet” state;
+  // it is normal for a newly-added magnet and should remain waiting.
+  if (response.status === 409) return null;
+  if (!response.ok) throw new Error(`qBittorrent 文件列表读取失败（HTTP ${response.status}）：${body || '服务器未提供详细说明。'}`);
+  let results: unknown;
+  try { results = JSON.parse(body); } catch { throw new Error('qBittorrent 文件列表返回的不是有效 JSON。'); }
+  if (!Array.isArray(results)) throw new Error('qBittorrent 文件列表返回的数据格式无效。');
+  return results.flatMap((item) => {
+    const file = item as TorrentFileResponse;
+    const index = Number(file.index);
+    const size = Number(file.size);
+    const priority = Number(file.priority);
+    const name = typeof file.name === 'string' ? file.name.trim() : '';
+    return Number.isInteger(index) && index >= 0 && Number.isFinite(size) && size >= 0 && Number.isFinite(priority) && name
+      ? [{ index, name, size: Math.trunc(size), priority: Math.trunc(priority) }]
+      : [];
+  }) as QbittorrentTorrentFile[];
+}
+
+/** Mark a set of torrent files as normal (1) or excluded (0) priority. */
+export async function setQbittorrentTorrentFilePriority(input: QbittorrentConfig, hash: string, indexes: number[], priority: 0 | 1) {
+  const requested = requestedTorrentHashes([hash]);
+  const ids = [...new Set(indexes.filter((index) => Number.isInteger(index) && index >= 0))];
+  if (!requested.length) throw new Error('qBittorrent 种子哈希格式无效。');
+  if (!ids.length) return;
+  const { config, headers } = await authorizedHeaders(input);
+  // Bound the form payload so an unusually large multi-file torrent cannot
+  // exceed the NAS proxy's request-line or body limits.
+  for (let offset = 0; offset < ids.length; offset += 250) {
+    const response = await postForm(endpoint(config.url, 'api/v2/torrents/filePrio'), new URLSearchParams({ hash: requested[0], id: ids.slice(offset, offset + 250).join('|'), priority: String(priority) }), headers);
+    const body = (await response.text()).trim();
+    if (!response.ok) throw new Error(`qBittorrent 文件筛选设置失败（HTTP ${response.status}）：${body || '服务器未提供详细说明。'}`);
+  }
+}
+
 /** Stop only the supplied Page Watch torrents after their download completes. */
 export async function stopQbittorrentTorrents(input: QbittorrentConfig, hashes: string[]) {
-  const requested = [...new Set(hashes.map((hash) => hash.trim().toLowerCase()).filter((hash) => /^[a-f0-9]{40}$/.test(hash)))];
+  const requested = requestedTorrentHashes(hashes);
   if (!requested.length) return;
   const { config, headers } = await authorizedHeaders(input);
   const form = new URLSearchParams({ hashes: requested.join('|') });
@@ -265,7 +354,7 @@ export async function stopQbittorrentTorrents(input: QbittorrentConfig, hashes: 
 
 /** Read the current qBittorrent state for known info hashes without mutating any torrent. */
 export async function getQbittorrentTorrentStates(input: QbittorrentConfig, hashes: string[]) {
-  const requested = [...new Set(hashes.map((hash) => hash.trim().toLowerCase()).filter((hash) => /^[a-f0-9]{40}$/.test(hash)))];
+  const requested = requestedTorrentHashes(hashes);
   if (!requested.length) return [] as QbittorrentTorrentState[];
   const { config, headers } = await authorizedHeaders(input);
   const url = endpoint(config.url, 'api/v2/torrents/info');

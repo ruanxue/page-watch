@@ -99,6 +99,7 @@ export async function ensureMySqlSchema(pool: Pool) {
     download_save_path TEXT NULL,
     download_content_path TEXT NULL,
     download_removed_at VARCHAR(40) NULL,
+    download_filter_min_size_bytes BIGINT NULL,
     jellyfin_status VARCHAR(16) NOT NULL DEFAULT 'unconfigured',
     jellyfin_item_id VARCHAR(64) NULL,
     jellyfin_item_name TEXT NULL,
@@ -200,6 +201,13 @@ export async function ensureMySqlSchema(pool: Pool) {
     worker_name VARCHAR(64) NOT NULL,
     status VARCHAR(16) NOT NULL,
     detail VARCHAR(255) NOT NULL,
+    task_kind VARCHAR(32) NULL,
+    subscription_id INT NULL,
+    archive_entry_id INT NULL,
+    task_content VARCHAR(255) NULL,
+    progress_current INT NULL,
+    progress_total INT NULL,
+    progress_label VARCHAR(128) NULL,
     last_seen_at VARCHAR(40) NOT NULL,
     PRIMARY KEY (worker_name)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
@@ -241,6 +249,29 @@ export async function ensureMySqlSchema(pool: Pool) {
     UNIQUE KEY idx_library_jobs_active_entry (active_archive_entry_id)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 
+  // Jellyfin is an external service. Keep a compact local mirror of the
+  // selected libraries' searchable metadata so new archive entries can be
+  // matched with indexed MySQL lookups instead of one remote API search each.
+  await pool.query(`CREATE TABLE IF NOT EXISTS jellyfin_media_items (
+    item_id VARCHAR(64) NOT NULL,
+    library_id VARCHAR(128) NOT NULL,
+    name TEXT NOT NULL,
+    original_title TEXT NULL,
+    media_path TEXT NULL,
+    media_type VARCHAR(32) NOT NULL,
+    sync_id CHAR(36) NOT NULL,
+    synced_at VARCHAR(40) NOT NULL,
+    PRIMARY KEY (item_id),
+    KEY idx_jellyfin_media_items_library (library_id, sync_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+
+  await pool.query(`CREATE TABLE IF NOT EXISTS jellyfin_media_codes (
+    item_id VARCHAR(64) NOT NULL,
+    code VARCHAR(32) NOT NULL,
+    PRIMARY KEY (item_id, code),
+    KEY idx_jellyfin_media_codes_code (code)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+
   // CREATE TABLE IF NOT EXISTS does not amend an existing table, so add newer
   // archive fields safely for installations created by earlier releases.
   await addColumnIfMissing(pool, 'archive_entries', 'detail_url', 'TEXT NULL');
@@ -261,6 +292,7 @@ export async function ensureMySqlSchema(pool: Pool) {
   await addColumnIfMissing(pool, 'archive_entries', 'download_save_path', 'TEXT NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'download_content_path', 'TEXT NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'download_removed_at', 'VARCHAR(40) NULL');
+  await addColumnIfMissing(pool, 'archive_entries', 'download_filter_min_size_bytes', 'BIGINT NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'jellyfin_status', "VARCHAR(16) NOT NULL DEFAULT 'unconfigured'");
   await addColumnIfMissing(pool, 'archive_entries', 'jellyfin_item_id', 'VARCHAR(64) NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'jellyfin_item_name', 'TEXT NULL');
@@ -285,6 +317,13 @@ export async function ensureMySqlSchema(pool: Pool) {
   await addColumnIfMissing(pool, 'subscriptions', 'next_scheduled_at', 'VARCHAR(40) NULL');
   await addColumnIfMissing(pool, 'subscriptions', 'pagination_parameter', "VARCHAR(64) NOT NULL DEFAULT 'page'");
   await addColumnIfMissing(pool, 'subscriptions', 'pagination_match_pattern', 'VARCHAR(1024) NULL');
+  await addColumnIfMissing(pool, 'worker_heartbeats', 'task_kind', 'VARCHAR(32) NULL');
+  await addColumnIfMissing(pool, 'worker_heartbeats', 'subscription_id', 'INT NULL');
+  await addColumnIfMissing(pool, 'worker_heartbeats', 'archive_entry_id', 'INT NULL');
+  await addColumnIfMissing(pool, 'worker_heartbeats', 'task_content', 'VARCHAR(255) NULL');
+  await addColumnIfMissing(pool, 'worker_heartbeats', 'progress_current', 'INT NULL');
+  await addColumnIfMissing(pool, 'worker_heartbeats', 'progress_total', 'INT NULL');
+  await addColumnIfMissing(pool, 'worker_heartbeats', 'progress_label', 'VARCHAR(128) NULL');
   await addColumnIfMissing(pool, 'subscription_presets', 'pagination_selector', 'TEXT NULL');
   await addColumnIfMissing(pool, 'subscription_presets', 'pagination_parameter', "VARCHAR(64) NOT NULL DEFAULT 'page'");
   await addColumnIfMissing(pool, 'subscription_presets', 'pagination_match_pattern', 'VARCHAR(1024) NULL');

@@ -134,11 +134,15 @@ async function queueUnique(table: 'jobs' | 'release_jobs' | 'magnet_jobs' | 'dow
   if (existing) {
     // A manual request upgrades waiting automatic work, but never interrupts a
     // running worker task.
-    if (existing.priority < priority) await client.run(`UPDATE \`${table}\` SET priority = ? WHERE id = ? AND status = 'queued'`, [priority, existing.id]);
+    if (existing.priority < priority) {
+      await client.run(`UPDATE \`${table}\` SET priority = ? WHERE id = ? AND status = 'queued'`, [priority, existing.id]);
+      if (client === db) notifyLive('tasks');
+    }
     return { id: existing.id, queued: false };
   }
   try {
     const result = await client.run(`INSERT INTO \`${table}\` (\`${column}\`, status, requested_at, priority) VALUES (?, 'queued', ?, ?)`, [id, new Date().toISOString(), priority]);
+    if (client === db) notifyLive('tasks');
     return { id: result.lastInsertRowid, queued: true };
   } catch (error) {
     const duplicate = await client.get<{ id: number }>(`SELECT id FROM \`${table}\` WHERE \`${column}\` = ? AND status IN ('queued', 'running')`, [id]);
@@ -152,15 +156,26 @@ export async function queueJob(subscriptionId: number, priority: JobPriority = J
 }
 
 export type MagnetStatus = 'unsearched' | 'pending' | 'found' | 'not_found' | 'failed' | 'skipped';
-export type DownloadStatus = 'not_queued' | 'queued' | 'running' | 'added' | 'waiting' | 'downloading' | 'paused' | 'completed' | 'removed' | 'failed';
+export type DownloadStatus = 'not_queued' | 'queued' | 'running' | 'added' | 'waiting' | 'downloading' | 'paused' | 'completed' | 'removed' | 'filtered' | 'failed';
 
 export type WorkerName = 'api' | 'capture' | 'release' | 'magnet' | 'download' | 'library';
+export type WorkerTaskContext = {
+  kind?: string | null;
+  subscriptionId?: number | null;
+  archiveEntryId?: number | null;
+  content?: string | null;
+  current?: number | null;
+  total?: number | null;
+  label?: string | null;
+};
 
 /** A tiny, DB-backed heartbeat is reliable across the separate Docker services. */
-export async function reportWorkerHeartbeat(workerName: WorkerName, detail: string, status: 'ready' | 'busy' | 'error' = 'ready') {
-  await db.run(`INSERT INTO worker_heartbeats (worker_name, status, detail, last_seen_at) VALUES (?, ?, ?, ?)
-    ON DUPLICATE KEY UPDATE status = VALUES(status), detail = VALUES(detail), last_seen_at = VALUES(last_seen_at)`,
-  [workerName, status, detail.slice(0, 255), new Date().toISOString()]);
+export async function reportWorkerHeartbeat(workerName: WorkerName, detail: string, status: 'ready' | 'busy' | 'error' = 'ready', task: WorkerTaskContext | null = null) {
+  await db.run(`INSERT INTO worker_heartbeats (worker_name, status, detail, task_kind, subscription_id, archive_entry_id, task_content, progress_current, progress_total, progress_label, last_seen_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE status = VALUES(status), detail = VALUES(detail), task_kind = VALUES(task_kind), subscription_id = VALUES(subscription_id), archive_entry_id = VALUES(archive_entry_id), task_content = VALUES(task_content), progress_current = VALUES(progress_current), progress_total = VALUES(progress_total), progress_label = VALUES(progress_label), last_seen_at = VALUES(last_seen_at)`,
+  [workerName, status, detail.slice(0, 255), task?.kind?.slice(0, 32) ?? null, task?.subscriptionId ?? null, task?.archiveEntryId ?? null, task?.content?.slice(0, 255) ?? null, task?.current ?? null, task?.total ?? null, task?.label?.slice(0, 128) ?? null, new Date().toISOString()]);
+  notifyLive('tasks');
 }
 
 export async function queueMagnetJob(archiveEntryId: number, client: DatabaseClient = db, priority: JobPriority = JOB_PRIORITY.normal) {
@@ -238,6 +253,7 @@ export type QbittorrentSettings = {
   savePath: string;
   tags: string;
   autoDownload: boolean;
+  autoDownloadMinSizeMb: number;
   stopAfterDownload: boolean;
 };
 
@@ -271,6 +287,7 @@ export function getJellyfinSettings(): JellyfinSettings {
 
 /** Credentials are intentionally server-only; API routes must never return them. */
 export function getQbittorrentSettings(): QbittorrentSettings {
+  const configuredMinimum = Number(getSetting('qbit_auto_download_min_size_mb'));
   return {
     enabled: getSetting('qbit_enabled') === '1',
     url: getSetting('qbit_url').trim(),
@@ -282,6 +299,7 @@ export function getQbittorrentSettings(): QbittorrentSettings {
     savePath: getSetting('qbit_save_path'),
     tags: getSetting('qbit_tags'),
     autoDownload: getSetting('qbit_auto_download') === '1',
+    autoDownloadMinSizeMb: Number.isInteger(configuredMinimum) && configuredMinimum >= 0 && configuredMinimum <= 1048576 ? configuredMinimum : 0,
     stopAfterDownload: getSetting('qbit_stop_after_download') === '1'
   };
 }
