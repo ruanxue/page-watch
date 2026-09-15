@@ -287,6 +287,28 @@ export async function ensureMySqlSchema(pool: Pool) {
     UNIQUE KEY idx_library_jobs_active_entry (active_archive_entry_id)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 
+  // Complete Jellyfin snapshots are heavyweight external work. Keep them in a
+  // first-class durable queue so the API can acknowledge a manual request
+  // immediately and the lightweight runner can hand it to an on-demand child.
+  await pool.query(`CREATE TABLE IF NOT EXISTS library_sync_jobs (
+    id INT NOT NULL AUTO_INCREMENT,
+    trigger_type VARCHAR(16) NOT NULL DEFAULT 'scheduled',
+    status VARCHAR(16) NOT NULL DEFAULT 'queued',
+    requested_at VARCHAR(40) NOT NULL,
+    started_at VARCHAR(40) NULL,
+    finished_at VARCHAR(40) NULL,
+    error TEXT NULL,
+    priority INT NOT NULL DEFAULT 0,
+    progress_phase VARCHAR(32) NULL,
+    progress_current INT NULL,
+    progress_total INT NULL,
+    progress_label VARCHAR(255) NULL,
+    active_marker TINYINT GENERATED ALWAYS AS (CASE WHEN status IN ('queued', 'running') THEN 1 ELSE NULL END) STORED,
+    PRIMARY KEY (id),
+    KEY idx_library_sync_jobs_priority (status, priority, requested_at),
+    UNIQUE KEY idx_library_sync_jobs_active (active_marker)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+
   // Jellyfin is an external service. Keep a compact local mirror of the
   // selected libraries' searchable metadata so new archive entries can be
   // matched with indexed MySQL lookups instead of one remote API search each.
@@ -366,12 +388,18 @@ export async function ensureMySqlSchema(pool: Pool) {
   await addColumnIfMissing(pool, 'subscription_presets', 'pagination_selector', 'TEXT NULL');
   await addColumnIfMissing(pool, 'subscription_presets', 'pagination_parameter', "VARCHAR(64) NOT NULL DEFAULT 'page'");
   await addColumnIfMissing(pool, 'subscription_presets', 'pagination_match_pattern', 'VARCHAR(1024) NULL');
+  await addColumnIfMissing(pool, 'library_sync_jobs', 'trigger_type', "VARCHAR(16) NOT NULL DEFAULT 'scheduled'");
+  await addColumnIfMissing(pool, 'library_sync_jobs', 'progress_phase', 'VARCHAR(32) NULL');
+  await addColumnIfMissing(pool, 'library_sync_jobs', 'progress_current', 'INT NULL');
+  await addColumnIfMissing(pool, 'library_sync_jobs', 'progress_total', 'INT NULL');
+  await addColumnIfMissing(pool, 'library_sync_jobs', 'progress_label', 'VARCHAR(255) NULL');
 
   // Index creation is safe when API and workers boot together.
   await addIndexIfMissing(pool, 'jobs', 'idx_jobs_priority', 'KEY idx_jobs_priority (status, priority, requested_at)');
   await addIndexIfMissing(pool, 'release_jobs', 'idx_release_jobs_priority', 'KEY idx_release_jobs_priority (status, priority, requested_at)');
   await addIndexIfMissing(pool, 'magnet_jobs', 'idx_magnet_jobs_priority', 'KEY idx_magnet_jobs_priority (status, priority, requested_at)');
   await addIndexIfMissing(pool, 'download_jobs', 'idx_download_jobs_priority', 'KEY idx_download_jobs_priority (status, priority, requested_at)');
+  await addIndexIfMissing(pool, 'library_sync_jobs', 'idx_library_sync_jobs_priority', 'KEY idx_library_sync_jobs_priority (status, priority, requested_at)');
   await addIndexIfMissing(pool, 'archive_entries', 'idx_archive_entries_code', 'KEY idx_archive_entries_code (archive_code)');
 }
 

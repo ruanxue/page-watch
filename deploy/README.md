@@ -52,7 +52,7 @@
    bash scripts/nas/update.sh
    ```
 
-打开 `http://NAS_LAN_IP:3030`。Page Watch 只运行一个容器；容器内以网页 API/SSE 进程和统一执行引擎运行，网页检查与发行日期共享一个按需回收的 Chromium 浏览器池。任务中心仍会分别展示网页检查、发行日期、磁力检索、qBittorrent 下载和 Jellyfin 同步任务。原有 MySQL 数据库继续被使用；订阅、档案、规则、下载配置、Jellyfin 配置和日志不会随镜像升级而丢失。
+打开 `http://NAS_LAN_IP:3030`。Page Watch 只运行一个容器；容器内常驻网页 API/SSE 进程和轻量执行引擎，网页执行器（含 Chromium）与 Jellyfin 全量同步器只会在有任务时启动，并在完成/空闲后退出。任务中心仍会分别展示网页检查、发行日期、磁力检索、qBittorrent 下载和 Jellyfin 同步任务。原有 MySQL 数据库继续被使用；订阅、档案、规则、下载配置、Jellyfin 配置和日志不会随镜像升级而丢失。
 
 ## 内部服务地址
 

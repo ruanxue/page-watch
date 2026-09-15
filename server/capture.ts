@@ -1,7 +1,4 @@
 import crypto from 'node:crypto';
-import { setDefaultResultOrder } from 'node:dns';
-import dns from 'node:dns/promises';
-import net from 'node:net';
 import * as cheerio from 'cheerio';
 import { ProxyAgent } from 'undici';
 import { db, getJellyfinSettings, getOutboundProxyUrl, queueLibraryJob, queueMagnetJob, queueReleaseJob, recordPerformanceMetric, type DatabaseClient, type Subscription } from './db.js';
@@ -10,10 +7,9 @@ import { describeError } from './error-details.js';
 import { expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
 import { archiveKey } from './jellyfin-match.js';
 import { missavBackupUrl, missavFallbackFailure, shouldTryMissavBackup } from './site-fallback.js';
+import { assertSafeUrl as validateSafeUrl } from './url-safety.js';
+import { readResponseText } from './bounded-body.js';
 
-// Some DNS forwarders return an unusable ::1 AAAA record together with a valid
-// public A record.  Prefer the valid IPv4 address for Node's outbound requests.
-setDefaultResultOrder('ipv4first');
 
 export type CaptureResult = {
   title: string;
@@ -96,49 +92,8 @@ function contentForItems(items: CapturedItem[]) {
   return items.map((item) => item.content).join('\n');
 }
 
-const blockedHosts = new Set(['localhost', 'localhost.localdomain', 'metadata.google.internal']);
-function isPrivateIp(value: string) {
-  const hostname = value.replace(/^\[|\]$/g, '').toLowerCase();
-  if (!net.isIP(hostname)) return false;
-  if (hostname === '::1' || hostname === '::' || hostname === '0.0.0.0') return true;
-  if (hostname.startsWith('fc') || hostname.startsWith('fd') || hostname.startsWith('fe80:')) return true;
-  if (hostname.startsWith('127.') || hostname.startsWith('10.') || hostname.startsWith('192.168.') || hostname.startsWith('169.254.')) return true;
-  const first = Number(hostname.split('.')[0]);
-  const second = Number(hostname.split('.')[1]);
-  return first === 172 && second >= 16 && second <= 31;
-}
-
-function isIpv6Loopback(value: string) {
-  return value.replace(/^\[|\]$/g, '').toLowerCase() === '::1';
-}
-
 export async function assertSafeUrl(raw: string) {
-  let url: URL;
-  try { url = new URL(raw); } catch { throw new Error('请输入有效的网页地址。'); }
-  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('只允许 http 或 https 地址。');
-  if (blockedHosts.has(url.hostname.toLowerCase()) || isPrivateIp(url.hostname)) {
-    throw new Error('不允许访问本机或内网地址。');
-  }
-  const addresses = await dns.lookup(url.hostname, { all: true, verbatim: true }).catch(() => []);
-  // With an outbound proxy, the proxy performs the eventual DNS lookup. Some
-  // domains are intentionally only resolvable from that network, so rejecting
-  // them here would make a correctly configured proxy unusable. Literal and
-  // locally resolved private addresses remain blocked above/below.
-  if (!addresses.length && !getOutboundProxyUrl()) throw new Error('无法解析该网页地址。');
-  const privateAddresses = addresses.filter((address) => isPrivateIp(address.address));
-  const publicAddresses = addresses.filter((address) => !isPrivateIp(address.address));
-  // A few router DNS forwarders (including common proxy-router setups) append
-  // ::1 to every hostname while still returning a valid public IPv4 A record.
-  // Accept only that narrow mixed result; all other private/mixed DNS answers
-  // remain blocked to prevent an external hostname from reaching the LAN.
-  const hasOnlyIpv6LoopbackAlongsidePublicAddress = publicAddresses.length > 0
-    && privateAddresses.length > 0
-    && privateAddresses.every((address) => isIpv6Loopback(address.address));
-  if (privateAddresses.length > 0 && !hasOnlyIpv6LoopbackAlongsidePublicAddress) {
-    const resolved = addresses.map((address) => address.address).join(', ');
-    throw new Error(`不允许访问解析到内网的地址（${url.hostname}：${resolved}）。`);
-  }
-  return url;
+  return validateSafeUrl(raw, { allowUnresolvedViaProxy: true, hasOutboundProxy: Boolean(getOutboundProxyUrl()) });
 }
 
 function normalize(text: string) {
@@ -163,8 +118,7 @@ async function getStatic(url: URL, selector: string, contentSource: Subscription
       return getStatic(await assertSafeUrl(new URL(location, url).toString()), selector, contentSource, attributeName, matchPattern, resultMode, pageCountSelector, pageCountPattern, titleSelector, titleContentSource, titleAttributeName, titleMatchPattern);
     }
     if (!response.ok) throw new Error(`网页返回 HTTP ${response.status}`);
-    const html = await response.text();
-    if (html.length > 5_000_000) throw new Error('网页内容超过 5 MB，已停止解析。');
+    const html = await readResponseText(response);
     const $ = cheerio.load(html);
     const elements = $(selector).toArray();
     if (!elements.length) throw new Error(`找不到选择器：${selector}`);
@@ -295,11 +249,14 @@ export async function captureSubscription(subscription: Subscription, browserPri
 async function stagePage(subscription: Subscription, scanId: string, page: number, items: CapturedItem[]) {
   const now = new Date().toISOString();
   await db.transaction(async (tx) => {
-    for (let position = 0; position < items.length; position += 1) {
-      const item = items[position];
+    // Use bounded multi-row inserts: a large pagination page must not turn
+    // into hundreds of per-row MySQL round trips or one unbounded statement.
+    for (let offset = 0; offset < items.length; offset += 100) {
+      const batch = items.slice(offset, offset + 100);
       await tx.run(`INSERT IGNORE INTO initial_scan_items
         (subscription_id, scan_id, page_number, item_position, content, title, detail_url, content_hash, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [subscription.id, scanId, page, position + 1, item.content, item.title, item.detailUrl, hash(item.content), now]);
+        VALUES ${batch.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}`,
+      batch.flatMap((item, index) => [subscription.id, scanId, page, offset + index + 1, item.content, item.title, item.detailUrl, hash(item.content), now]));
     }
     await tx.run(`UPDATE subscriptions SET initial_scan_pages_completed = GREATEST(initial_scan_pages_completed, ?), initial_scan_next_page = ?, last_error = NULL, updated_at = ?
       WHERE id = ? AND initial_scan_run_id = ?`, [page, page + 1, now, subscription.id, scanId]);
@@ -332,20 +289,49 @@ async function captureInitialFullScan(subscription: Subscription, browserPriorit
     catch (error) { throw new Error(describeError(error, { action: `第 ${page}/${total} 页读取`, target: url.hostname, proxyUrl: getOutboundProxyUrl() }), { cause: error }); }
     await stagePage(subscription, scanId, page, result.items);
   }
-  const staged = await db.all<{ content: string; title: string | null; detail_url: string | null }>(`SELECT content, title, detail_url FROM initial_scan_items
-    WHERE subscription_id = ? AND scan_id = ? ORDER BY page_number ASC, item_position ASC, id ASC`, [subscription.id, scanId]);
-  const items = uniqueItems(staged.map((item) => ({ content: item.content, title: item.title, detailUrl: item.detail_url })));
-  const content = contentForItems(items);
   const now = new Date().toISOString();
-  const result = { title: first?.title ?? subscription.name, items, content, hash: hash(content), pageCount: total };
-  const changed = Boolean(subscription.last_hash && subscription.last_hash !== result.hash);
-  const stored = await db.transaction(async (tx) => {
+  let cursor = 0;
+  let itemCount = 0;
+  let content = '';
+  const contentHash = crypto.createHash('sha256');
+  let addedCount = 0;
+  let stored = false;
+  await db.transaction(async (tx) => {
+    // Keep the staged archive invisible until all pages have arrived and this
+    // one transaction commits, while only retaining one 200-row slice in RAM.
+    while (true) {
+      const batch = await tx.all<{ id: number; content: string; title: string | null; detail_url: string | null }>(`SELECT id, content, title, detail_url FROM initial_scan_items
+        WHERE subscription_id = ? AND scan_id = ? AND id > ? ORDER BY page_number ASC, item_position ASC, id ASC LIMIT 200`, [subscription.id, scanId, cursor]);
+      if (!batch.length) break;
+      cursor = batch[batch.length - 1].id;
+      const items = batch.map((item) => ({ content: item.content, title: item.title, detailUrl: item.detail_url }));
+      for (const item of items) {
+        if (content) { content += '\n'; contentHash.update('\n'); }
+        content += item.content;
+        contentHash.update(item.content);
+      }
+      itemCount += items.length;
+    }
+    const contentDigest = contentHash.digest('hex');
     const write = await tx.run(`UPDATE subscriptions SET last_checked_at = ?, last_hash = ?, last_content = ?, last_error = NULL,
       initial_scan_completed = 1, initial_scan_total = ?, initial_scan_pages_completed = ?, initial_scan_run_id = NULL, initial_scan_next_page = 1, updated_at = ?
-      WHERE id = ? AND initial_scan_run_id = ?`, [now, result.hash, result.content, total, total, now, subscription.id, scanId]);
-    const addedCount = write.changes ? await archiveNewItems(subscription, items, now, tx) : 0;
-    if (write.changes) await tx.run('DELETE FROM initial_scan_items WHERE subscription_id = ? AND scan_id = ?', [subscription.id, scanId]);
-    return { stored: Boolean(write.changes), addedCount };
+      WHERE id = ? AND initial_scan_run_id = ?`, [now, contentDigest, content, total, total, now, subscription.id, scanId]);
+    stored = Boolean(write.changes);
+    if (!stored) return;
+    // A second bounded cursor pass keeps the write conditional on the
+    // optimistic subscription update, matching the prior all-or-nothing
+    // semantics without retaining every staged row in memory.
+    cursor = 0;
+    while (true) {
+      const batch = await tx.all<{ id: number; content: string; title: string | null; detail_url: string | null }>(`SELECT id, content, title, detail_url FROM initial_scan_items
+        WHERE subscription_id = ? AND scan_id = ? AND id > ? ORDER BY page_number ASC, item_position ASC, id ASC LIMIT 200`, [subscription.id, scanId, cursor]);
+      if (!batch.length) break;
+      cursor = batch[batch.length - 1].id;
+      addedCount += await archiveNewItems(subscription, batch.map((item) => ({ content: item.content, title: item.title, detailUrl: item.detail_url })), now, tx);
+    }
+    await tx.run('DELETE FROM initial_scan_items WHERE subscription_id = ? AND scan_id = ?', [subscription.id, scanId]);
   });
-  return { ...result, changed, capturedAt: now, ...stored, itemCount: items.length, totalPages: total };
+  const result = { title: first?.title ?? subscription.name, content, hash: hash(content), pageCount: total };
+  const changed = Boolean(subscription.last_hash && subscription.last_hash !== result.hash);
+  return { ...result, changed, capturedAt: now, stored, addedCount: stored ? addedCount : 0, itemCount, totalPages: total };
 }

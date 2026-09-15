@@ -1,8 +1,9 @@
 import { appendRuntimeLog, db, getQbittorrentSettings, queueDownloadJob, recordPerformanceMetric, refreshSettings, reportWorkerHeartbeat, type WorkerTaskContext } from './db.js';
-import { lookupMagnet } from './magnet.js';
+import { webExecutor } from './web-executor-client.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { getInspectionRules } from './inspection-rules.js';
 import { notifyLive } from './live-events.js';
+import { isExecutionEngineDraining } from './engine-drain.js';
 
 const POLL_MS = 1_000;
 
@@ -31,10 +32,12 @@ async function logProgress(subscriptionId: number) {
 }
 
 async function runNextMagnetJob() {
+  if (isExecutionEngineDraining()) return;
   const job = await db.get<MagnetJob>(`SELECT j.id, j.archive_entry_id, j.attempt_count, a.subscription_id, a.content
     FROM magnet_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id
     WHERE j.status = 'queued' AND (j.retry_after IS NULL OR j.retry_after <= ?) ORDER BY j.priority DESC, j.requested_at ASC, j.id ASC LIMIT 1`, [new Date().toISOString()]);
   if (!job) return;
+  if (isExecutionEngineDraining()) return;
 
   const started = await db.run("UPDATE magnet_jobs SET status = 'running', started_at = ?, retry_after = NULL WHERE id = ? AND status = 'queued'", [new Date().toISOString(), job.id]);
   if (!started.changes) return;
@@ -53,7 +56,7 @@ async function runNextMagnetJob() {
       activeTask = null;
       return;
     }
-    const result = await lookupMagnet(job.content, rule);
+    const result = await webExecutor.magnet(job.content, rule);
     const finishedAt = new Date().toISOString();
     let downloadQueued = false;
     await db.transaction(async (tx) => {
@@ -140,6 +143,7 @@ async function tick() {
   working = true;
   try {
     await heartbeat();
+    if (isExecutionEngineDraining()) return;
     await refreshSettings();
     await recoverStalledJobs();
     await runNextMagnetJob();

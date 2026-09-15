@@ -201,6 +201,68 @@ export async function queueLibraryJob(archiveEntryId: number, client: DatabaseCl
   return queueUnique('library_jobs', 'archive_entry_id', archiveEntryId, priority, client);
 }
 
+export type LibrarySyncJob = {
+  id: number;
+  trigger_type: 'manual' | 'scheduled';
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  requested_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  error: string | null;
+  priority: number;
+  progress_phase: string | null;
+  progress_current: number | null;
+  progress_total: number | null;
+  progress_label: string | null;
+};
+
+/** Queue only one active complete snapshot. A manual click upgrades a waiting
+ * scheduled run but never interrupts a currently-running child. */
+export async function queueLibrarySyncJob(trigger: 'manual' | 'scheduled', priority: JobPriority = JOB_PRIORITY.normal) {
+  const existing = await db.get<Pick<LibrarySyncJob, 'id' | 'priority' | 'status'>>("SELECT id, priority, status FROM library_sync_jobs WHERE status IN ('queued', 'running') ORDER BY id DESC LIMIT 1");
+  if (existing) {
+    if (existing.status === 'queued' && Number(existing.priority) < priority) {
+      await db.run("UPDATE library_sync_jobs SET priority = ?, trigger_type = 'manual' WHERE id = ?", [priority, existing.id]);
+      notifyLive('tasks');
+    }
+    return { id: existing.id, queued: false };
+  }
+  try {
+    const result = await db.run(`INSERT INTO library_sync_jobs (trigger_type, status, requested_at, priority)
+      VALUES (?, 'queued', ?, ?)`, [trigger, new Date().toISOString(), priority]);
+    notifyLive('tasks');
+    return { id: result.lastInsertRowid, queued: true };
+  } catch (error) {
+    const raced = await db.get<Pick<LibrarySyncJob, 'id'>>("SELECT id FROM library_sync_jobs WHERE status IN ('queued', 'running') ORDER BY id DESC LIMIT 1");
+    if (raced) return { id: raced.id, queued: false };
+    throw error;
+  }
+}
+
+/**
+ * The unified runner uses this conservative snapshot before an optional
+ * memory-only restart. A queued retry counts as work too: preserving a few
+ * megabytes is never worth delaying a user's queued task.
+ */
+export async function getExecutionEngineQueueState() {
+  const row = await db.get<{ queued: number | string; running: number | string; busy_workers: number | string }>(`SELECT
+      COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued,
+      COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running,
+      (SELECT COUNT(*) FROM worker_heartbeats
+        WHERE worker_name IN ('capture', 'release', 'magnet', 'download', 'library')
+          AND status = 'busy'
+          AND last_seen_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 45 SECOND)) AS busy_workers
+    FROM (
+      SELECT status FROM jobs
+      UNION ALL SELECT status FROM release_jobs
+      UNION ALL SELECT status FROM magnet_jobs
+      UNION ALL SELECT status FROM library_jobs
+      UNION ALL SELECT status FROM download_jobs
+      UNION ALL SELECT status FROM library_sync_jobs
+    ) AS execution_queue`);
+  return { queued: Number(row?.queued ?? 0), running: Number(row?.running ?? 0), busyWorkers: Number(row?.busy_workers ?? 0) };
+}
+
 type RuntimeLogInput = {
   level: 'info' | 'success' | 'error';
   source: 'system' | 'queue' | 'worker' | 'download' | 'library';
@@ -270,8 +332,8 @@ async function encryptLegacySensitiveSettings() {
 }
 
 export type PerformanceMetricInput = {
-  scope: 'capture' | 'release' | 'magnet' | 'library' | 'download';
-  metric: 'processed' | 'retry' | 'jellyfin_cache' | 'chromium_rebuild';
+  scope: 'capture' | 'release' | 'magnet' | 'library' | 'download' | 'runner';
+  metric: 'processed' | 'retry' | 'jellyfin_cache' | 'chromium_rebuild' | 'memory_reclaim';
   dimension?: string;
   durationMs?: number;
   count?: number;

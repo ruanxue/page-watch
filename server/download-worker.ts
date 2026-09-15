@@ -2,6 +2,7 @@ import { appendRuntimeLog, db, getQbittorrentSettings, recordPerformanceMetric, 
 import { addMagnetToQbittorrent, getQbittorrentTorrentFiles, getQbittorrentTorrentStates, setQbittorrentTorrentFilePriority, startQbittorrentTorrents, stopQbittorrentTorrents, torrentHashFromMagnet, type QbittorrentTorrentFile, type QbittorrentTorrentState } from './qbittorrent.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { notifyLive } from './live-events.js';
+import { isExecutionEngineDraining } from './engine-drain.js';
 
 const POLL_MS = 1_000;
 const STATUS_SYNC_MS = 5_000;
@@ -43,10 +44,12 @@ function displaySize(bytes: number) {
 }
 
 async function runNextDownloadJob() {
+  if (isExecutionEngineDraining()) return;
   const job = await db.get<DownloadJob>(`SELECT j.id, j.archive_entry_id, j.attempt_count, j.priority, a.subscription_id, a.content, a.magnet_value, a.download_status, a.download_torrent_hash
     FROM download_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id
     WHERE j.status = 'queued' AND (j.retry_after IS NULL OR j.retry_after <= ?) ORDER BY j.priority DESC, j.requested_at ASC, j.id ASC LIMIT 1`, [new Date().toISOString()]);
   if (!job) return;
+  if (isExecutionEngineDraining()) return;
 
   const claimed = await db.run("UPDATE download_jobs SET status = 'running', started_at = ?, retry_after = NULL WHERE id = ? AND status = 'queued'", [new Date().toISOString(), job.id]);
   if (!claimed.changes) return;
@@ -381,6 +384,7 @@ async function tick() {
   working = true;
   try {
     await heartbeat();
+    if (isExecutionEngineDraining()) return;
     await refreshSettings();
     await recoverStalledJobs();
     await runNextDownloadJob();

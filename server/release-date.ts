@@ -1,14 +1,19 @@
 import * as cheerio from 'cheerio';
 import { ProxyAgent } from 'undici';
-import { assertSafeUrl } from './capture.js';
+import { assertSafeUrl as validateSafeUrl } from './url-safety.js';
 import { getOutboundProxyUrl } from './db.js';
 import { browserPool } from './browser-pool.js';
 import { describeError } from './error-details.js';
 import type { ReleaseDateRule } from './inspection-rules.js';
 import { missavBackupUrl, missavFallbackFailure, shouldTryMissavBackup } from './site-fallback.js';
+import { readResponseText } from './bounded-body.js';
 
 const REQUEST_TIMEOUT_MS = 25_000;
 let lastRequestStartedAt = 0;
+
+async function assertSafeUrl(raw: string) {
+  return validateSafeUrl(raw, { allowUnresolvedViaProxy: true, hasOutboundProxy: Boolean(getOutboundProxyUrl()) });
+}
 
 export type ReleaseDateLookupResult =
   | { status: 'found'; releaseDate: string }
@@ -48,6 +53,13 @@ function securityChallengeReason(html: string) {
   const $ = cheerio.load(html);
   const title = normalize($('title').first().text());
   const body = normalize($('body').text()).slice(0, 4_000);
+  if (/just a moment|attention required|checking your browser|verify you are human|performing security verification/i.test(`${title}\n${body}`)) {
+    return '详情页被网站安全验证拦截，未获取到实际内容；请确认代理可访问目标站点后重试。';
+  }
+  return null;
+}
+
+function securityChallengeText(title: string, body: string) {
   if (/just a moment|attention required|checking your browser|verify you are human|performing security verification/i.test(`${title}\n${body}`)) {
     return '详情页被网站安全验证拦截，未获取到实际内容；请确认代理可访问目标站点后重试。';
   }
@@ -118,12 +130,11 @@ async function fetchDetail(url: URL, requestGapMs: number, redirectsLeft = 3): P
       if (redirectsLeft <= 0) throw new Error('详情页重定向次数过多。');
       return fetchDetail(await assertSafeUrl(new URL(location, url).toString()), requestGapMs, redirectsLeft - 1);
     }
-    const html = await response.text();
+    const html = await readResponseText(response);
     if (!response.ok) {
       const challengeReason = securityChallengeReason(html);
       throw new Error(challengeReason ? `${challengeReason}（HTTP ${response.status}）。` : `详情页返回 HTTP ${response.status}。`);
     }
-    if (html.length > 5_000_000) throw new Error('详情页超过 5 MB，已停止解析。');
     return html;
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') throw new Error(describeError(new Error('请求超时', { cause: error }), { action: '发行日期详情页读取', target: url.hostname, proxyUrl }));
@@ -205,11 +216,75 @@ async function fetchDetailInBrowser(url: URL, rule: ReleaseDateRule, session?: R
   });
 }
 
+/**
+ * Successful dynamic lookups stay inside Chromium's DOM. Returning a full
+ * HTML document and then parsing it with Cheerio briefly kept two DOM-sized
+ * copies alive for every detail page.
+ */
+async function inspectReleaseDateInBrowser(url: URL, rule: ReleaseDateRule, priority = 0): Promise<ReleaseDateExtraction> {
+  await waitForRequestSlot(rule.requestIntervalMs);
+  const proxyUrl = getOutboundProxyUrl();
+  try {
+    return await browserPool.use('release', async (page) => {
+      const response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await assertSafeUrl(page.url());
+      const diagnostic = await page.evaluate((config) => {
+        const normalizeLabel = (value: string) => value.replace(/\s+/g, ' ').trim().replace(/[：:]/g, '');
+        const containers = Array.from(document.querySelectorAll(config.containerSelector));
+        const expected = normalizeLabel(config.labelText);
+        const labelled = containers.filter((container) => normalizeLabel(container.querySelector(config.labelSelector)?.textContent ?? '') === expected);
+        const values = labelled.map((container) => {
+          const element = container.querySelector(config.valueSelector);
+          if (!element) return null;
+          return config.valueSource === 'attribute' ? element.getAttribute(config.valueAttribute ?? '') : element.textContent;
+        });
+        return {
+          containers: containers.length,
+          labelled: labelled.length,
+          values,
+          title: document.title.slice(0, 500),
+          body: (document.body?.innerText ?? '').slice(0, 4_000)
+        };
+      }, {
+        containerSelector: rule.containerSelector,
+        labelSelector: rule.labelSelector,
+        labelText: rule.labelText,
+        valueSelector: rule.valueSelector,
+        valueSource: rule.valueSource,
+        valueAttribute: rule.valueAttribute
+      });
+      if (response && !response.ok()) {
+        const challenge = securityChallengeText(diagnostic.title, diagnostic.body);
+        throw new Error(challenge ? `${challenge}（HTTP ${response.status()}）。` : `详情页返回 HTTP ${response.status()}。`);
+      }
+      const challenge = securityChallengeText(diagnostic.title, diagnostic.body);
+      if (challenge) return { releaseDate: null, reason: challenge };
+      if (!diagnostic.containers) return { releaseDate: null, reason: `详情页未找到字段容器“${rule.containerSelector}”。` };
+      if (!diagnostic.labelled) return { releaseDate: null, reason: `字段容器中未找到标签“${rule.labelText}”。` };
+      for (const raw of diagnostic.values) {
+        const value = normalize(raw ?? '');
+        if (!value) continue;
+        const matched = matchedValue(value, rule.valueMatchPattern);
+        if (!matched) return { releaseDate: null, reason: `日期值“${value.slice(0, 80)}”不符合当前日期匹配规则。` };
+        const releaseDate = validDate(matched);
+        return releaseDate
+          ? { releaseDate, reason: '' }
+          : { releaseDate: null, reason: `日期值“${matched}”不是有效的 YYYY-MM-DD 日期。` };
+      }
+      return { releaseDate: null, reason: `标签“${rule.labelText}”中未找到日期节点“${rule.valueSelector}”或可读取的日期值。` };
+    }, priority);
+  } catch (error) {
+    if (error instanceof Error && /timeout/i.test(error.message)) throw new Error(describeError(error, { action: '发行日期详情页浏览器读取', target: url.hostname, proxyUrl }));
+    throw new Error(describeError(error, { action: '发行日期详情页浏览器读取', target: url.hostname, proxyUrl }));
+  }
+}
+
 export async function lookupReleaseDate(rawUrl: string, rule: ReleaseDateRule, session?: ReleaseDateBrowserSession, priority = 0): Promise<ReleaseDateLookupResult> {
   const url = await assertSafeUrl(rawUrl);
   const read = async (target: URL) => {
-    const html = rule.renderMode === 'dynamic' ? await fetchDetailInBrowser(target, rule, session, priority) : await fetchDetail(target, rule.requestIntervalMs);
-    const result = inspectReleaseDate(html, rule);
+    const result = rule.renderMode === 'dynamic'
+      ? await inspectReleaseDateInBrowser(target, rule, priority)
+      : inspectReleaseDate(await fetchDetail(target, rule.requestIntervalMs), rule);
     return result.releaseDate ? { status: 'found', releaseDate: result.releaseDate } as const : { status: 'unavailable', reason: result.reason } as const;
   };
   let primaryResult: ReleaseDateLookupResult | null = null;

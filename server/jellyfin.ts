@@ -1,4 +1,5 @@
 import { describeError } from './error-details.js';
+import { readResponseText } from './bounded-body.js';
 
 export type JellyfinConfig = {
   url: string;
@@ -76,7 +77,7 @@ async function jellyfinRequest(config: JellyfinConfig, pathname: string, search?
       headers: { authorization: jellyfinAuthorizationHeader(checked.apiKey), accept: 'application/json' },
       signal: controller.signal
     });
-    const body = await response.text();
+    const body = await readResponseText(response);
     if (!response.ok) {
       const detail = body.replace(/\s+/g, ' ').trim().slice(0, 300);
       throw new Error(`Jellyfin 请求失败（HTTP ${response.status}）：${detail || '服务器未提供详细说明。'}`);
@@ -163,11 +164,21 @@ function normalizeMedia(value: unknown, libraryId: string) {
 
 /** Retrieve an entire selected library in pages so matching is local and deterministic. */
 export async function listJellyfinMedia(config: JellyfinConfig) {
+  const all: JellyfinMedia[] = [];
+  await streamJellyfinMedia(config, async (page) => { all.push(...page); });
+  return all;
+}
+
+/** Stream selected-library pages to a caller-owned sink. The full synchronizer
+ * writes each page immediately instead of retaining a complete server snapshot
+ * in Node memory. */
+export async function streamJellyfinMedia(config: JellyfinConfig, onPage: (page: JellyfinMedia[], scannedRaw: number, totalRaw: number | null) => Promise<void> | void) {
   const checked = assertJellyfinConfig(config);
   const libraryIds = [...new Set((checked.libraryIds ?? []).map((id) => id.trim()).filter(Boolean))];
   if (!libraryIds.length) throw new Error('请至少选择一个 Jellyfin 媒体库。');
   const userId = await jellyfinLibraryUserId(checked);
-  const all: JellyfinMedia[] = [];
+  let scannedRaw = 0;
+  let knownTotal: number | null = null;
   for (const libraryId of libraryIds) {
     let startIndex = 0;
     let total = Number.POSITIVE_INFINITY;
@@ -191,14 +202,18 @@ export async function listJellyfinMedia(config: JellyfinConfig) {
         const media = normalizeMedia(item, libraryId);
         return media ? [media] : [];
       });
-      all.push(...page);
+      scannedRaw += received;
       const parsedTotal = Number(result.TotalRecordCount);
       total = Number.isInteger(parsedTotal) && parsedTotal >= 0 ? parsedTotal : startIndex + received;
+      // Multiple selected libraries have independent totals; reporting a
+      // running lower bound remains more useful than allocating a full list.
+      knownTotal = knownTotal === null ? total : Math.max(knownTotal, scannedRaw + Math.max(0, total - startIndex - received));
+      await onPage(page, scannedRaw, knownTotal);
       if (!received) break;
       startIndex += received;
     }
   }
-  return [...new Map(all.map((item) => [item.id, item])).values()];
+  return scannedRaw;
 }
 
 /** Search selected libraries before applying strict local code matching. */

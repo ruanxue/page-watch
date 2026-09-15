@@ -22,7 +22,6 @@ services:
   app:
     <<: *page-watch-service
     container_name: pagewatch
-    command: node build/server/all-in-one.js
     shm_size: 1gb
     ports:
       - "${PAGE_WATCH_PORT:-3030}:3030"
@@ -31,7 +30,7 @@ services:
       PORT: 3030
       APP_SESSION_SECURE: ${APP_SESSION_SECURE:-false}
     healthcheck:
-      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3030/api/ready').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))\""]
+      test: ["CMD-SHELL", "curl --fail --silent --show-error http://127.0.0.1:3030/api/ready >/dev/null"]
       interval: 30s
       timeout: 5s
       retries: 3

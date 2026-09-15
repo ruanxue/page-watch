@@ -1,7 +1,8 @@
-import { captureSubscription, closeCaptureBrowser } from './capture.js';
+import { webExecutor } from './web-executor-client.js';
 import { appendRuntimeLog, db, getSubscription, JOB_PRIORITY, queueJob, recordPerformanceMetric, refreshSettings, reportWorkerHeartbeat, type Subscription, type WorkerTaskContext } from './db.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { notifyLive } from './live-events.js';
+import { isExecutionEngineDraining } from './engine-drain.js';
 
 const POLL_MS = 10_000;
 
@@ -50,6 +51,7 @@ function nextScheduledAt(subscription: Subscription, now: Date) {
 }
 
 async function enqueueDueSubscriptions() {
+  if (isExecutionEngineDraining()) return;
   const subscriptions = await db.all<Subscription>('SELECT * FROM subscriptions WHERE is_active = 1');
   const now = new Date();
   for (const subscription of subscriptions) {
@@ -64,9 +66,11 @@ async function enqueueDueSubscriptions() {
 }
 
 async function runNextJob() {
+  if (isExecutionEngineDraining()) return;
   const now = new Date().toISOString();
   const job = await db.get<{ id: number; subscription_id: number; attempt_count: number; priority: number }>("SELECT * FROM jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?) ORDER BY priority DESC, requested_at ASC, id ASC LIMIT 1", [now]);
   if (!job) return;
+  if (isExecutionEngineDraining()) return;
   const started = await db.run("UPDATE jobs SET status = 'running', started_at = ?, retry_after = NULL WHERE id = ? AND status = 'queued'", [now, job.id]);
   if (!started.changes) return;
   let subscription: Subscription | undefined;
@@ -78,7 +82,7 @@ async function runNextJob() {
     activeTask = { kind: fullScan ? 'full_scan' : 'check', subscriptionId: subscription.id, current: fullScan ? subscription.initial_scan_pages_completed : null, total: fullScan ? subscription.initial_scan_total : null, label: fullScan ? `下一个页面：${subscription.initial_scan_next_page}` : '正在读取网页内容' };
     await heartbeat();
     await appendRuntimeLog({ level: 'info', source: 'worker', subscriptionId: subscription.id, jobId: job.id, message: fullScan ? (subscription.initial_scan_run_id ? `恢复全量检查：从第 ${subscription.initial_scan_next_page} 页继续。` : '开始全量检查。') : '开始检查第一页。' });
-    const result = await captureSubscription(subscription, job.priority);
+    const result = await webExecutor.capture(subscription, job.priority);
     await db.run("UPDATE jobs SET status = 'completed', finished_at = ? WHERE id = ?", [new Date().toISOString(), job.id]);
     const additions = result.addedCount ? `，新增 ${result.addedCount} 条内容` : '，没有新增内容';
     await appendRuntimeLog({ level: 'success', source: 'worker', subscriptionId: subscription.id, jobId: job.id, message: `${result.totalPages > 1 ? `全量检查完成，共读取 ${result.totalPages} 页` : '检查完成'}，提取 ${result.itemCount} 项${additions}。` });
@@ -146,6 +150,7 @@ async function tick() {
   working = true;
   try {
     await heartbeat();
+    if (isExecutionEngineDraining()) return;
     await refreshSettings();
     await recoverStalledJobs();
     await enqueueDueSubscriptions();
@@ -165,5 +170,3 @@ void tick();
 setInterval(() => void tick(), POLL_MS);
 const heartbeatTimer = setInterval(() => void heartbeat(), 15_000);
 heartbeatTimer.unref();
-process.once('SIGTERM', () => { void closeCaptureBrowser(); });
-process.once('SIGINT', () => { void closeCaptureBrowser(); });

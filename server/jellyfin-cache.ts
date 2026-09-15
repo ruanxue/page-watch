@@ -21,40 +21,54 @@ function chunks<T>(values: T[], size: number) {
   return result;
 }
 
+export class JellyfinMediaIndexWriter {
+  readonly syncId = randomUUID();
+  readonly syncedAt = new Date().toISOString();
+  private mediaCount = 0;
+  private codeCount = 0;
+
+  constructor(private readonly libraryIds: string[]) {
+    if (!selectedLibraryIds(libraryIds).length) throw new Error('请至少选择一个 Jellyfin 媒体库。');
+  }
+
+  async writePage(media: JellyfinMedia[]) {
+    if (!media.length) return;
+    const unique = [...new Map(media.map((item) => [item.id, item])).values()];
+    const codes = unique.flatMap((item) => [...mediaKeys(item)].map((code) => ({ itemId: item.id, code })));
+    await db.transaction(async (tx) => {
+      for (const batch of chunks(unique, 100)) {
+        await tx.run(`INSERT INTO jellyfin_media_items
+          (item_id, library_id, name, original_title, media_path, media_type, sync_id, synced_at)
+          VALUES ${batch.map(() => '(?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}
+          ON DUPLICATE KEY UPDATE library_id = VALUES(library_id), name = VALUES(name), original_title = VALUES(original_title),
+            media_path = VALUES(media_path), media_type = VALUES(media_type), sync_id = VALUES(sync_id), synced_at = VALUES(synced_at)`,
+        batch.flatMap((item) => [item.id, item.libraryId, item.name, item.originalTitle, item.path, item.type, this.syncId, this.syncedAt]));
+      }
+      for (const batch of chunks(unique.map((item) => item.id), 250)) await tx.run(`DELETE FROM jellyfin_media_codes WHERE item_id IN (${placeholders(batch)})`, batch);
+      for (const batch of chunks(codes, 250)) await tx.run(`INSERT IGNORE INTO jellyfin_media_codes (item_id, code)
+        VALUES ${batch.map(() => '(?, ?)').join(', ')}`, batch.flatMap((item) => [item.itemId, item.code]));
+    });
+    this.mediaCount += unique.length;
+    this.codeCount += codes.length;
+  }
+
+  async finalize() {
+    const selected = selectedLibraryIds(this.libraryIds);
+    const ids = placeholders(selected);
+    await db.transaction(async (tx) => {
+      await tx.run(`DELETE c FROM jellyfin_media_codes c JOIN jellyfin_media_items m ON m.item_id = c.item_id
+        WHERE m.library_id IN (${ids}) AND m.sync_id <> ?`, [...selected, this.syncId]);
+      await tx.run(`DELETE FROM jellyfin_media_items WHERE library_id IN (${ids}) AND sync_id <> ?`, [...selected, this.syncId]);
+    });
+    return { mediaCount: this.mediaCount, codeCount: this.codeCount, syncedAt: this.syncedAt };
+  }
+}
+
 /** Replace the selected-library snapshot only after Jellyfin has been read successfully. */
 export async function saveJellyfinMediaIndex(media: JellyfinMedia[], libraryIds: string[]) {
-  const selected = selectedLibraryIds(libraryIds);
-  if (!selected.length) throw new Error('请至少选择一个 Jellyfin 媒体库。');
-  const syncId = randomUUID();
-  const syncedAt = new Date().toISOString();
-  const codes = media.flatMap((item) => [...mediaKeys(item)].map((code) => ({ itemId: item.id, code })));
-  await db.transaction(async (tx) => {
-    // A complete library snapshot often contains hundreds of entries. Keep
-    // each statement bounded for NAS MySQL while avoiding the former
-    // per-item INSERT/DELETE round trips.
-    for (const batch of chunks(media, 100)) {
-      const values = batch.flatMap((item) => [item.id, item.libraryId, item.name, item.originalTitle, item.path, item.type, syncId, syncedAt]);
-      await tx.run(`INSERT INTO jellyfin_media_items
-        (item_id, library_id, name, original_title, media_path, media_type, sync_id, synced_at)
-        VALUES ${batch.map(() => '(?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}
-        ON DUPLICATE KEY UPDATE library_id = VALUES(library_id), name = VALUES(name), original_title = VALUES(original_title),
-          media_path = VALUES(media_path), media_type = VALUES(media_type), sync_id = VALUES(sync_id), synced_at = VALUES(synced_at)`, values);
-    }
-    for (const batch of chunks(media.map((item) => item.id), 250)) {
-      await tx.run(`DELETE FROM jellyfin_media_codes WHERE item_id IN (${placeholders(batch)})`, batch);
-    }
-    for (const batch of chunks(codes, 250)) {
-      await tx.run(`INSERT IGNORE INTO jellyfin_media_codes (item_id, code)
-        VALUES ${batch.map(() => '(?, ?)').join(', ')}`, batch.flatMap((item) => [item.itemId, item.code]));
-    }
-    // The sync contains every item in each configured library. Anything from
-    // those libraries not seen during this run is no longer usable locally.
-    const ids = placeholders(selected);
-    await tx.run(`DELETE c FROM jellyfin_media_codes c JOIN jellyfin_media_items m ON m.item_id = c.item_id
-      WHERE m.library_id IN (${ids}) AND m.sync_id <> ?`, [...selected, syncId]);
-    await tx.run(`DELETE FROM jellyfin_media_items WHERE library_id IN (${ids}) AND sync_id <> ?`, [...selected, syncId]);
-  });
-  return { mediaCount: media.length, codeCount: codes.length, syncedAt };
+  const writer = new JellyfinMediaIndexWriter(libraryIds);
+  await writer.writePage(media);
+  return writer.finalize();
 }
 
 /** Build the full-sync matcher from the persisted MySQL index, never the raw API response. */

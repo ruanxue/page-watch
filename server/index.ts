@@ -2,11 +2,10 @@ import path from 'node:path';
 import type { ServerResponse } from 'node:http';
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
-import { assertSafeUrl } from './capture.js';
-import { appendRuntimeLog, db, getIntegrationStatuses, getJellyfinSettings, getOutboundProxyUrl, getQbittorrentSettings, getRuntimeMetrics, getRuntimeSettings, getSetting, getSubscription, JOB_PRIORITY, maintainPerformanceMetrics, queueDownloadJob, queueJob, queueMagnetJob, queueReleaseJob, recordPerformanceMetric, refreshSettings, reportIntegrationStatus, reportWorkerHeartbeat, setRuntimeSettings, setSetting, type IntegrationService, type Subscription } from './db.js';
+import { assertSafeUrl as validateSafeUrl } from './url-safety.js';
+import { appendRuntimeLog, db, getIntegrationStatuses, getJellyfinSettings, getOutboundProxyUrl, getQbittorrentSettings, getRuntimeMetrics, getRuntimeSettings, getSetting, getSubscription, JOB_PRIORITY, maintainPerformanceMetrics, queueDownloadJob, queueJob, queueLibrarySyncJob, queueMagnetJob, queueReleaseJob, refreshSettings, reportIntegrationStatus, reportWorkerHeartbeat, setRuntimeSettings, setSetting, type IntegrationService, type Subscription } from './db.js';
 import { assertQbittorrentConfig, normalizeQbittorrentUrl, testQbittorrentConnection } from './qbittorrent.js';
 import { assertJellyfinConfig, listJellyfinLibraries, normalizeJellyfinUrl, testJellyfinConnection } from './jellyfin.js';
-import { syncJellyfinLibrary } from './jellyfin-sync.js';
 import { startRuntimeMemoryReporter } from './runtime-observability.js';
 import { clearJellyfinMediaIndex } from './jellyfin-cache.js';
 import { authenticate, clearSessionCookie, configurePassword, createSession, sessionCookie, statusFor, validatePassword } from './auth.js';
@@ -26,6 +25,13 @@ let tasksVersion = '';
 let liveInitialized = false;
 let latestLogId = 0;
 let lastSseKeepAliveAt = 0;
+
+// DNS may be intentionally delegated to the configured outbound proxy. Keep
+// API-side validation equally strict about private addresses without rejecting
+// a hostname that is only resolvable from the proxy network.
+async function assertSafeUrl(raw: string) {
+  return validateSafeUrl(raw, { allowUnresolvedViaProxy: true, hasOutboundProxy: Boolean(getOutboundProxyUrl()) });
+}
 
 function authPath(url: string) {
   return url.split('?')[0];
@@ -72,13 +78,14 @@ async function pollLiveChanges() {
     watchesLogs ? db.get<{ id: number }>('SELECT COALESCE(MAX(id), 0) AS id FROM runtime_logs') : Promise.resolve(undefined),
     watchesArchive ? db.all<{ subscription_id: number; version: string }>(`SELECT subscription_id, MAX(updated_at) AS version
       FROM archive_entries GROUP BY subscription_id`) : Promise.resolve([]),
-    watchesSubscriptions ? db.get<{ version: string }>(`SELECT SHA2(CONCAT(COALESCE((SELECT MAX(updated_at) FROM subscriptions), ''), ':', COALESCE((SELECT MAX(updated_at) FROM archive_entries), ''), ':', COALESCE((SELECT MAX(requested_at) FROM jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM release_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM magnet_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM library_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM download_jobs WHERE status IN ('queued','running')), '')), 256) AS version`) : Promise.resolve(undefined),
+    watchesSubscriptions ? db.get<{ version: string }>(`SELECT SHA2(CONCAT(COALESCE((SELECT MAX(updated_at) FROM subscriptions), ''), ':', COALESCE((SELECT MAX(updated_at) FROM archive_entries), ''), ':', COALESCE((SELECT MAX(requested_at) FROM jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM release_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM magnet_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM library_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM library_sync_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM download_jobs WHERE status IN ('queued','running')), '')), 256) AS version`) : Promise.resolve(undefined),
     watchesTasks ? db.get<{ version: string }>(`SELECT SHA2(CONCAT(
       COALESCE((SELECT MAX(last_seen_at) FROM worker_heartbeats), ''), ':',
       COALESCE((SELECT MAX(requested_at) FROM jobs), ''), ':', COALESCE((SELECT MAX(started_at) FROM jobs), ''), ':', COALESCE((SELECT MAX(finished_at) FROM jobs), ''), ':', COALESCE((SELECT MAX(retry_after) FROM jobs), ''), ':',
       COALESCE((SELECT MAX(requested_at) FROM release_jobs), ''), ':', COALESCE((SELECT MAX(started_at) FROM release_jobs), ''), ':', COALESCE((SELECT MAX(finished_at) FROM release_jobs), ''), ':', COALESCE((SELECT MAX(retry_after) FROM release_jobs), ''), ':',
       COALESCE((SELECT MAX(requested_at) FROM magnet_jobs), ''), ':', COALESCE((SELECT MAX(started_at) FROM magnet_jobs), ''), ':', COALESCE((SELECT MAX(finished_at) FROM magnet_jobs), ''), ':', COALESCE((SELECT MAX(retry_after) FROM magnet_jobs), ''), ':',
       COALESCE((SELECT MAX(requested_at) FROM library_jobs), ''), ':', COALESCE((SELECT MAX(started_at) FROM library_jobs), ''), ':', COALESCE((SELECT MAX(finished_at) FROM library_jobs), ''), ':', COALESCE((SELECT MAX(retry_after) FROM library_jobs), ''), ':',
+      COALESCE((SELECT MAX(requested_at) FROM library_sync_jobs), ''), ':', COALESCE((SELECT MAX(started_at) FROM library_sync_jobs), ''), ':', COALESCE((SELECT MAX(finished_at) FROM library_sync_jobs), ''), ':',
       COALESCE((SELECT MAX(requested_at) FROM download_jobs), ''), ':', COALESCE((SELECT MAX(started_at) FROM download_jobs), ''), ':', COALESCE((SELECT MAX(finished_at) FROM download_jobs), ''), ':', COALESCE((SELECT MAX(retry_after) FROM download_jobs), '')), 256) AS version`) : Promise.resolve(undefined)
   ]);
   const nextLogId = Number(latestLog?.id ?? 0);
@@ -502,7 +509,11 @@ const taskQueueUnion = `
   UNION ALL
   SELECT 'download', j.id, j.status, j.priority, j.requested_at, j.started_at, j.finished_at, j.retry_after, j.error, j.attempt_count,
     a.subscription_id, s.name, a.content, a.title, NULL, NULL, NULL, a.download_progress
-  FROM download_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id`;
+  FROM download_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id
+  UNION ALL
+  SELECT 'library_sync', j.id, j.status, j.priority, j.requested_at, j.started_at, j.finished_at, NULL, j.error, 0,
+    NULL, NULL, NULL, NULL, j.progress_current, j.progress_total, j.progress_label, NULL
+  FROM library_sync_jobs j`;
 
 function taskStatus(row: Pick<TaskQueueRow, 'status' | 'retry_after'>) {
   return row.status === 'queued' && row.retry_after && Date.parse(row.retry_after) > Date.now() ? 'retrying' : row.status;
@@ -563,13 +574,6 @@ app.get('/api/tasks', async (request) => {
       requestedAt: download.download_queued_at ?? download.download_added_at ?? new Date().toISOString(), startedAt: download.download_added_at, finishedAt: null, retryAfter: null, attemptCount: 0,
       error: download.download_error, progress: percent === null ? { current: null, total: null, label } : { current: percent, total: 100, label } });
   }
-  const librarySync = heartbeats.find((row) => row.worker_name === 'library' && row.status === 'busy' && row.task_kind === 'library_sync');
-  if (librarySync) active.push({
-    id: 'library-sync', kind: 'library_sync', status: 'running', priority: 0,
-    subscriptionId: librarySync.subscription_id, subscriptionName: null, content: librarySync.task_content, title: null,
-    requestedAt: librarySync.last_seen_at, startedAt: librarySync.last_seen_at, finishedAt: null, retryAfter: null, attemptCount: 0, error: null,
-    progress: librarySync.progress_current !== null || librarySync.progress_total !== null || librarySync.progress_label ? { current: librarySync.progress_current, total: librarySync.progress_total, label: librarySync.progress_label } : null
-  });
   const statusOrder: Record<string, number> = { running: 0, queued: 1, retrying: 2 };
   active.sort((left, right) => (statusOrder[left.status] ?? 9) - (statusOrder[right.status] ?? 9) || right.priority - left.priority || String(left.requestedAt ?? '').localeCompare(String(right.requestedAt ?? '')));
   const history = historyRows.map(serialize);
@@ -638,11 +642,20 @@ app.get('/api/metrics', async (request, reply) => {
       containerMemoryBytes: numberMetric('container_memory_bytes'),
       apiRssBytes: numberMetric('api_rss_bytes'),
       runnerRssBytes: numberMetric('runner_rss_bytes'),
+      webExecutorRssBytes: numberMetric('web_executor_rss_bytes'),
+      webExecutorState: runtime.get('web_executor_state')?.text_value ?? 'offline',
+      librarySyncRssBytes: numberMetric('library_sync_rss_bytes'),
+      librarySyncState: runtime.get('library_sync_state')?.text_value ?? 'offline',
       browser: {
         state: runtime.get('browser_state')?.text_value ?? 'unknown',
         activePages: numberMetric('browser_active_pages'),
         queuedPages: numberMetric('browser_queued_pages'),
         navigationCount: numberMetric('browser_navigation_count')
+      },
+      engineMemoryReclaim: {
+        state: runtime.get('runner_reclaim_state')?.text_value ?? 'waiting',
+        gcBeforeBytes: numberMetric('runner_gc_before_bytes'),
+        gcAfterBytes: numberMetric('runner_gc_after_bytes')
       }
     }
   };
@@ -1139,6 +1152,8 @@ app.post('/api/settings/qbittorrent/test', async (_request, reply) => {
 app.get('/api/settings/jellyfin', async () => publicJellyfinSettings());
 app.put('/api/settings/jellyfin', async (request, reply) => {
   try {
+    const activeSync = await db.get<{ id: number }>("SELECT id FROM library_sync_jobs WHERE status = 'running' LIMIT 1");
+    if (activeSync) return reply.code(409).send({ error: 'Jellyfin 全量同步正在执行；请等待任务完成后再修改连接或媒体库。' });
     const settings = normalizeJellyfinSettings(request.body as JellyfinSettingsPayload);
     const now = new Date().toISOString();
     await Promise.all([
@@ -1154,7 +1169,10 @@ app.put('/api/settings/jellyfin', async (request, reply) => {
     await clearJellyfinMediaIndex();
     await db.run(`UPDATE archive_entries SET jellyfin_status = ?, jellyfin_item_id = NULL, jellyfin_item_name = NULL,
       jellyfin_matched_at = NULL, jellyfin_error = NULL, updated_at = ?`, [settings.enabled && settings.libraryIds.length ? 'pending' : 'unconfigured', now]);
-    if (!settings.enabled) await reportIntegrationStatus('jellyfin', 'disabled', 'Jellyfin 已在 Page Watch 中停用');
+    if (!settings.enabled) {
+      await db.run("UPDATE library_sync_jobs SET status = 'completed', finished_at = ?, error = 'Jellyfin 已停用', progress_phase = 'cancelled', progress_label = 'Jellyfin 已停用' WHERE status = 'queued'", [now]);
+      await reportIntegrationStatus('jellyfin', 'disabled', 'Jellyfin 已在 Page Watch 中停用');
+    }
     return publicJellyfinSettings();
   } catch (error) {
     return reply.code(400).send({ error: error instanceof Error ? error.message : '无法保存 Jellyfin 设置。' });
@@ -1177,17 +1195,14 @@ app.post('/api/settings/jellyfin/test', async (_request, reply) => {
 });
 
 app.post('/api/settings/jellyfin/sync', async (_request, reply) => {
-  const startedAt = Date.now();
   try {
-    const result = await syncJellyfinLibrary('manual');
-    await recordPerformanceMetric({ scope: 'library', metric: 'processed', dimension: 'full_sync', durationMs: Date.now() - startedAt }).catch(() => undefined);
-    await reportIntegrationStatus('jellyfin', 'healthy', '最近一次媒体库同步成功').catch(() => undefined);
-    return { ok: true, ...result };
+    const settings = getJellyfinSettings();
+    if (!settings.enabled || !settings.libraryIds.length) return reply.code(400).send({ error: '请先启用 Jellyfin 并选择至少一个媒体库。' });
+    const queued = await queueLibrarySyncJob('manual', JOB_PRIORITY.manual);
+    await appendRuntimeLog({ level: 'info', source: 'library', message: queued.queued ? 'Jellyfin 手动全量同步已加入队列。' : 'Jellyfin 全量同步已在队列中或正在执行。' });
+    return reply.code(202).send({ queued: queued.queued, jobId: queued.id });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Jellyfin 影视库同步失败。';
-    await reportIntegrationStatus('jellyfin', 'degraded', '最近一次媒体库同步失败').catch(() => undefined);
-    await appendRuntimeLog({ level: 'error', source: 'library', message: `Jellyfin 影视库手动同步失败：${message}` });
-    return reply.code(400).send({ error: message });
+    return reply.code(400).send({ error: error instanceof Error ? error.message : '无法加入 Jellyfin 同步队列。' });
   }
 });
 

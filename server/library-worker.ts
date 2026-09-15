@@ -1,10 +1,11 @@
-import { appendRuntimeLog, db, getJellyfinSettings, getSetting, queueMagnetJob, recordPerformanceMetric, refreshSettings, reportIntegrationStatus, reportWorkerHeartbeat, type WorkerTaskContext } from './db.js';
+import { appendRuntimeLog, db, getJellyfinSettings, getSetting, JOB_PRIORITY, queueLibrarySyncJob, queueMagnetJob, recordPerformanceMetric, refreshSettings, reportIntegrationStatus, reportWorkerHeartbeat, setSetting, type LibrarySyncJob, type WorkerTaskContext } from './db.js';
 import { findJellyfinMedia } from './jellyfin.js';
 import { exactJellyfinMatch } from './jellyfin-match.js';
-import { syncJellyfinLibrary } from './jellyfin-sync.js';
+import { librarySyncExecutor } from './library-sync-client.js';
 import { findCachedJellyfinMedia } from './jellyfin-cache.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { notifyLive } from './live-events.js';
+import { isExecutionEngineDraining } from './engine-drain.js';
 
 // An idle worker only needs a modest polling cadence. Once a complete local
 // Jellyfin index exists, however, individual matches are indexed MySQL reads
@@ -20,12 +21,52 @@ let syncTask: WorkerTaskContext | null = null;
 
 type LibraryJob = { id: number; archive_entry_id: number; attempt_count: number; subscription_id: number; content: string; jellyfin_status: string };
 
+async function runNextLibrarySync() {
+  if (isExecutionEngineDraining()) return false;
+  const job = await db.get<LibrarySyncJob>(`SELECT * FROM library_sync_jobs
+    WHERE status = 'queued' ORDER BY priority DESC, requested_at ASC, id ASC LIMIT 1`);
+  if (!job) return false;
+  const startedAt = new Date().toISOString();
+  if (!(await db.run("UPDATE library_sync_jobs SET status = 'running', started_at = ?, error = NULL WHERE id = ? AND status = 'queued'", [startedAt, job.id])).changes) return true;
+  await setSetting('jellyfin_last_sync_attempt_at', startedAt);
+  syncing = true;
+  syncTask = { kind: 'library_sync', current: 0, total: null, label: '正在启动 Jellyfin 同步器' };
+  await syncHeartbeat();
+  const startedAtMs = Date.now();
+  try {
+    const result = await librarySyncExecutor.run(job.trigger_type, async (progress) => {
+      syncTask = { kind: 'library_sync', current: progress.current, total: progress.total, label: progress.label };
+      await db.run(`UPDATE library_sync_jobs SET progress_phase = ?, progress_current = ?, progress_total = ?, progress_label = ? WHERE id = ?`,
+        [progress.phase, progress.current, progress.total, progress.label.slice(0, 255), job.id]);
+      await syncHeartbeat();
+    });
+    const finished = new Date().toISOString();
+    await db.run(`UPDATE library_sync_jobs SET status = 'completed', finished_at = ?, error = NULL,
+      progress_phase = 'completed', progress_label = ?, progress_current = ?, progress_total = ? WHERE id = ?`,
+    [finished, `同步完成：${result.scanned} 个媒体项目，${result.matched} 条已入库`, result.scanned, result.scanned, job.id]);
+    await recordPerformanceMetric({ scope: 'library', metric: 'processed', dimension: 'full_sync', durationMs: Date.now() - startedAtMs }).catch(() => undefined);
+    await reportIntegrationStatus('jellyfin', 'healthy', '最近一次媒体库同步成功').catch(() => undefined);
+    await appendRuntimeLog({ level: 'success', source: 'library', message: `Jellyfin 影视库${job.trigger_type === 'manual' ? '手动' : '定时'}同步任务完成：扫描 ${result.scanned} 个媒体项目，${result.matched} 条已入库。` });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '未知 Jellyfin 同步错误';
+    await db.run("UPDATE library_sync_jobs SET status = 'failed', finished_at = ?, error = ?, progress_phase = 'failed', progress_label = ? WHERE id = ?", [new Date().toISOString(), message, '同步失败', job.id]);
+    await reportIntegrationStatus('jellyfin', 'degraded', '最近一次媒体库同步失败').catch(() => undefined);
+    await appendRuntimeLog({ level: 'error', source: 'library', message: `Jellyfin 影视库${job.trigger_type === 'manual' ? '手动' : '定时'}同步失败：${message}` });
+  } finally {
+    syncing = false;
+    syncTask = null;
+  }
+  return true;
+}
+
 async function runNextLibraryJob() {
+  if (isExecutionEngineDraining()) return false;
   const job = await db.get<LibraryJob>(`SELECT j.id, j.archive_entry_id, j.attempt_count, a.subscription_id, a.content, a.jellyfin_status
     FROM library_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id
     WHERE j.status = 'queued' AND (j.retry_after IS NULL OR j.retry_after <= ?)
     ORDER BY j.priority DESC, j.requested_at ASC, j.id ASC LIMIT 1`, [new Date().toISOString()]);
   if (!job) return false;
+  if (isExecutionEngineDraining()) return false;
   const startedAt = new Date().toISOString();
   if (!(await db.run("UPDATE library_jobs SET status = 'running', started_at = ?, retry_after = NULL WHERE id = ? AND status = 'queued'", [startedAt, job.id])).changes) return true;
   const startedAtMs = Date.now();
@@ -96,7 +137,12 @@ async function syncHeartbeat() {
 
 function syncDue() {
   const last = Date.parse(getSetting('jellyfin_last_synced_at'));
+  const lastAttempt = Date.parse(getSetting('jellyfin_last_sync_attempt_at'));
   const interval = getJellyfinSettings().syncIntervalMinutes * 60_000;
+  // A failed bootstrap should remain visible as a failed task, not create a
+  // fresh external request every polling tick. The next planned retry is
+  // bounded to five minutes (or the configured interval if shorter).
+  if (!Number.isFinite(last) && Number.isFinite(lastAttempt) && Date.now() - lastAttempt < Math.min(interval, 5 * 60_000)) return false;
   return !Number.isFinite(last) || Date.now() - last >= interval;
 }
 
@@ -106,6 +152,7 @@ async function tick() {
   let scheduleImmediateTick = false;
   try {
     await refreshSettings();
+    if (isExecutionEngineDraining()) return;
     const settings = getJellyfinSettings();
     if (!settings.enabled) {
       // Finish any already-queued gate checks by falling back to magnet work;
@@ -120,25 +167,10 @@ async function tick() {
       return;
     }
     // A cache miss after configuration changes must build one complete local
-    // snapshot before processing individual archive rows. Otherwise a large
-    // newly-added subscription would fan out into one Jellyfin API search per
-    // item and defeat the purpose of the local index.
-    if (!getSetting('jellyfin_media_index_synced_at') || syncDue()) {
-      syncing = true;
-      syncTask = { kind: 'library_sync', current: 0, total: null, label: '正在读取 Jellyfin 媒体库' };
-      await syncHeartbeat();
-      const syncStartedAtMs = Date.now();
-      const result = await syncJellyfinLibrary('scheduled', async (progress) => {
-        syncTask = { kind: 'library_sync', current: progress.current, total: progress.total, label: progress.label };
-        await syncHeartbeat();
-      });
-      syncing = false;
-      syncTask = null;
-      await recordPerformanceMetric({ scope: 'library', metric: 'processed', dimension: 'full_sync', durationMs: Date.now() - syncStartedAtMs }).catch(() => undefined);
-      await reportIntegrationStatus('jellyfin', 'healthy', '最近一次媒体库同步成功').catch(() => undefined);
-      await reportWorkerHeartbeat('library', `Jellyfin 已同步 ${result.scanned} 个媒体项目、${result.indexedCodes} 个番号索引，匹配 ${result.matched} 条归档`);
-      return;
-    }
+    // snapshot before processing individual archive rows. The durable job lets
+    // an on-demand child own that heavy work while this runner stays lean.
+    if (!getSetting('jellyfin_media_index_synced_at') || syncDue()) await queueLibrarySyncJob('scheduled', JOB_PRIORITY.normal);
+    if (await runNextLibrarySync()) return;
     let processed = 0;
     while (processed < LOCAL_MATCH_BATCH_SIZE && await runNextLibraryJob()) processed += 1;
     if (processed > 0) {

@@ -20,7 +20,9 @@ async function readFirstNumber(paths: string[]) {
   return null;
 }
 
-export async function reportRuntimeMemory(role: 'api' | 'runner', browser?: BrowserSnapshot) {
+export type RuntimeProcessRole = 'api' | 'runner' | 'web_executor' | 'library_sync';
+
+export async function reportRuntimeMemory(role: RuntimeProcessRole, browser?: BrowserSnapshot) {
   const cgroupBytes = await readFirstNumber(['/sys/fs/cgroup/memory.current', '/sys/fs/cgroup/memory/memory.usage_in_bytes']);
   const metrics: RuntimeMetric[] = [
     { key: `${role}_rss_bytes`, value: process.memoryUsage().rss },
@@ -37,7 +39,7 @@ export async function reportRuntimeMemory(role: 'api' | 'runner', browser?: Brow
   await reportRuntimeMetrics(metrics);
 }
 
-export function startRuntimeMemoryReporter(role: 'api' | 'runner', browser?: () => BrowserSnapshot | undefined) {
+export function startRuntimeMemoryReporter(role: RuntimeProcessRole, browser?: () => BrowserSnapshot | undefined) {
   const report = () => void reportRuntimeMemory(role, browser?.()).catch(() => undefined);
   report();
   const timer = setInterval(report, 15_000);

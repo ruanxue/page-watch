@@ -1,8 +1,9 @@
 import { appendRuntimeLog, db, queueReleaseJob, recordPerformanceMetric, refreshSettings, reportWorkerHeartbeat, type WorkerTaskContext } from './db.js';
-import { lookupReleaseDate, ReleaseDateBrowserSession } from './release-date.js';
+import { webExecutor } from './web-executor-client.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
 import { notifyLive } from './live-events.js';
+import { isExecutionEngineDraining } from './engine-drain.js';
 
 const POLL_MS = 1_000;
 const BACKFILL_BATCH_SIZE = 100;
@@ -10,7 +11,6 @@ const BACKFILL_BATCH_SIZE = 100;
 // `2026-08-28T00:00:00+08:00` were matched correctly. Requeue it once after
 // upgrading, while leaving genuine, detailed "unavailable" results alone.
 const PREVIOUS_DATE_PATTERN_RESULT = '详情页未找到标签“发行日期”对应的日期值。';
-const browserSession = new ReleaseDateBrowserSession();
 
 type ReleaseJob = {
   id: number;
@@ -26,6 +26,7 @@ type ReleaseJob = {
 type LegacyEntry = { id: number; subscription_id: number; content: string; detail_url: string | null; subscription_url: string };
 
 async function queueLegacyReleaseLookups() {
+  if (isExecutionEngineDraining()) return;
   const rule = getInspectionRules().releaseDate;
   if (!rule.enabled) return;
   const entries = await db.all<LegacyEntry>(`SELECT a.id, a.subscription_id, a.content, a.detail_url, s.url AS subscription_url
@@ -62,10 +63,12 @@ async function logProgress(subscriptionId: number) {
 }
 
 async function runNextReleaseJob() {
+  if (isExecutionEngineDraining()) return;
   const job = await db.get<ReleaseJob>(`SELECT j.id, j.archive_entry_id, j.attempt_count, j.priority, a.subscription_id, a.content, a.detail_url, s.url AS subscription_url
     FROM release_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id
     WHERE j.status = 'queued' AND (j.retry_after IS NULL OR j.retry_after <= ?) ORDER BY j.priority DESC, j.requested_at ASC, j.id ASC LIMIT 1`, [new Date().toISOString()]);
   if (!job) return;
+  if (isExecutionEngineDraining()) return;
   const started = await db.run("UPDATE release_jobs SET status = 'running', started_at = ?, retry_after = NULL WHERE id = ? AND status = 'queued'", [new Date().toISOString(), job.id]);
   if (!started.changes) return;
   const startedAtMs = Date.now();
@@ -85,7 +88,7 @@ async function runNextReleaseJob() {
     }
     const detailUrl = expandReleaseUrl(rule.urlTemplate, { detailUrl: job.detail_url, subscriptionUrl: job.subscription_url, content: job.content });
     if (!detailUrl) throw new Error('发行日期规则无法生成详情页地址；请检查详情页地址模板或内容链接。');
-    const result = await lookupReleaseDate(detailUrl, rule, browserSession, job.priority);
+    const result = await webExecutor.release(detailUrl, rule, job.priority);
     const finishedAt = new Date().toISOString();
     await db.transaction(async (tx) => {
       if (result.status === 'found') {
@@ -158,6 +161,7 @@ async function tick() {
   working = true;
   try {
     await heartbeat();
+    if (isExecutionEngineDraining()) return;
     await refreshSettings();
     await recoverStalledJobs();
     await queueLegacyReleaseLookups();
@@ -175,5 +179,3 @@ void tick();
 setInterval(() => void tick(), POLL_MS);
 const heartbeatTimer = setInterval(() => void heartbeat(), 15_000);
 heartbeatTimer.unref();
-process.once('SIGTERM', () => { void browserSession.close(); });
-process.once('SIGINT', () => { void browserSession.close(); });

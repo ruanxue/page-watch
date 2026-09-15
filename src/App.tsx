@@ -160,7 +160,12 @@ type PerformanceMetrics = {
     containerMemoryBytes: number | null;
     apiRssBytes: number | null;
     runnerRssBytes: number | null;
+    webExecutorRssBytes: number | null;
+    webExecutorState: string;
+    librarySyncRssBytes: number | null;
+    librarySyncState: string;
     browser: { state: string; activePages: number | null; queuedPages: number | null; navigationCount: number | null };
+    engineMemoryReclaim: { state: string; gcBeforeBytes: number | null; gcAfterBytes: number | null };
   };
 };
 
@@ -842,7 +847,14 @@ function PerformanceOverview({ metrics, error, integrations, range, onRange }: {
   const max = Math.max(1, ...trend.map(([, count]) => count));
   const retries = (metrics?.retries ?? []).sort((left, right) => right.count - left.count);
   const rebuilds = (metrics?.chromiumRebuilds ?? []).sort((left, right) => right.count - left.count);
-  const runtime = metrics?.runtime ?? { containerMemoryBytes: null, apiRssBytes: null, runnerRssBytes: null, browser: { state: 'unknown', activePages: null, queuedPages: null, navigationCount: null } };
+  const runtime = metrics?.runtime ?? { containerMemoryBytes: null, apiRssBytes: null, runnerRssBytes: null, webExecutorRssBytes: null, webExecutorState: 'offline', librarySyncRssBytes: null, librarySyncState: 'offline', browser: { state: 'unknown', activePages: null, queuedPages: null, navigationCount: null }, engineMemoryReclaim: { state: 'waiting', gcBeforeBytes: null, gcAfterBytes: null } };
+  const reclaimState = runtime.engineMemoryReclaim.state === 'restarting'
+    ? '正在安全重启执行引擎以回收内存'
+    : runtime.engineMemoryReclaim.state === 'gc_complete'
+      ? `已执行受控 GC${runtime.engineMemoryReclaim.gcBeforeBytes !== null && runtime.engineMemoryReclaim.gcAfterBytes !== null ? `：${formatBytes(runtime.engineMemoryReclaim.gcBeforeBytes)} → ${formatBytes(runtime.engineMemoryReclaim.gcAfterBytes)}` : ''}`
+      : runtime.engineMemoryReclaim.state === 'gc_unavailable'
+        ? '受控 GC 不可用；达到条件时将安全重启执行引擎'
+        : '已启用：队列和浏览器持续空闲后自动回收';
   return <section className="performance-overview" aria-label="长期性能指标">
     <div className="operation-section-heading"><div><h2>性能概览</h2><p>指标仅记录聚合计数与耗时；分钟数据保留 30 天，之后按小时汇总至 180 天。</p></div><div className="metric-range" role="group" aria-label="性能指标时间范围">{(['24h', '7d', '30d', '180d'] as const).map((item) => <button type="button" key={item} className={range === item ? 'active' : ''} onClick={() => onRange(item)}>{item}</button>)}</div></div>
     {!metrics ? <div className={`operation-queue-empty ${error ? 'metric-load-error' : ''}`}>{error || '正在读取长期性能指标…'}</div> : <>
@@ -857,7 +869,9 @@ function PerformanceOverview({ metrics, error, integrations, range, onRange }: {
         <article><span>Chromium 重建</span><strong>{rebuilds.reduce((total, item) => total + item.count, 0)}</strong><small>{rebuilds.length ? rebuilds.map((item) => `${metricWorkerLabel[item.scope as keyof typeof metricWorkerLabel] ?? item.scope} ${chromiumReasonLabel[item.reason] ?? item.reason} ${item.count}`).join(' · ') : '当前范围内没有重建'}</small></article>
         <article><span>自动重试</span><strong>{retries.reduce((total, item) => total + item.count, 0)}</strong><small>{retries.length ? retries.slice(0, 3).map((item) => `${retryReasonLabel[item.reason] ?? item.reason} ${item.count}`).join(' · ') : '当前范围内没有自动重试'}</small></article>
       </div>
-      <p className="browser-runtime-state">浏览器池：{runtime.browser.state === 'active' ? '正在渲染' : runtime.browser.state === 'idle' ? '空闲待命' : runtime.browser.state === 'closed' ? '已回收' : '状态读取中'} · {runtime.browser.activePages ?? 0} 页面执行中 · {runtime.browser.queuedPages ?? 0} 页面排队 · 本轮 {runtime.browser.navigationCount ?? 0} 次导航</p>
+      <p className="browser-runtime-state">网页执行器：{runtime.webExecutorState === 'offline' ? '已回收（Chromium 不存在）' : runtime.webExecutorState === 'busy' ? '正在执行' : runtime.webExecutorState === 'browser_idle' ? '浏览器空闲待命' : '正在启动'}{runtime.webExecutorState === 'offline' ? '' : ` · RSS ${formatBytes(runtime.webExecutorRssBytes)}`} · 浏览器池：{runtime.browser.state === 'active' ? '正在渲染' : runtime.browser.state === 'idle' ? '空闲待命' : runtime.browser.state === 'closed' ? '已回收' : '状态读取中'} · {runtime.browser.activePages ?? 0} 页面执行中 · {runtime.browser.queuedPages ?? 0} 页面排队 · 本轮 {runtime.browser.navigationCount ?? 0} 次导航</p>
+      <p className="browser-runtime-state">Jellyfin 同步器：{runtime.librarySyncState === 'offline' ? '已回收' : runtime.librarySyncState === 'running' ? '正在同步' : runtime.librarySyncState === 'starting' ? '正在启动' : runtime.librarySyncState}{runtime.librarySyncState === 'offline' ? '' : ` · RSS ${formatBytes(runtime.librarySyncRssBytes)}`}</p>
+      <p className="browser-runtime-state">空闲内存回收：{reclaimState}</p>
       <section className="throughput-chart"><header><strong>每分钟处理量</strong><small>最近 60 分钟</small></header><div className="throughput-bars" aria-label="最近 60 分钟处理量趋势">{trend.length ? trend.map(([minute, count]) => <i key={minute} title={`${formatTime(minute)}：${count} 项`} style={{ height: `${Math.max(4, Math.round(count / max * 100))}%` }} />) : <span>尚无处理记录</span>}</div></section>
       <div className="worker-performance-list">{metrics.workers.map((worker) => <article key={worker.scope}><strong>{metricWorkerLabel[worker.scope]}</strong><span>{worker.processed} 项</span><small>平均 {formatDuration(worker.averageDurationMs)}</small></article>)}</div>
     </>}
@@ -1252,8 +1266,8 @@ function JellyfinSettingsPanel({ onNotice }: { onNotice: (message: string) => vo
     setBusy(true); setError('');
     try {
       await save(false);
-      const result = await request<{ scanned: number; matched: number; notFound: number }>('/api/settings/jellyfin/sync', { method: 'POST' });
-      onNotice(`Jellyfin 已同步：扫描 ${result.scanned} 个媒体，${result.matched} 条已入库。`);
+      const result = await request<{ queued: boolean; jobId: number }>('/api/settings/jellyfin/sync', { method: 'POST' });
+      onNotice(result.queued ? `Jellyfin 全量同步已加入队列（任务 #${result.jobId}），可在运行中心查看进度。` : `Jellyfin 全量同步已在执行或排队中（任务 #${result.jobId}）。`);
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Jellyfin 影视库同步失败。'); }
     finally { setBusy(false); }
   }

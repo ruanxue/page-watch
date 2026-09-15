@@ -4,6 +4,7 @@ import { getOutboundProxyUrl } from './db.js';
 import { describeError } from './error-details.js';
 import { defaultInspectionRules, type MagnetRule } from './inspection-rules.js';
 import { findMagnetDetailPath as parseMagnetDetailPath } from './magnet-parser.js';
+import { readResponseText } from './bounded-body.js';
 
 export { decodeCloudflareEmail } from './magnet-parser.js';
 
@@ -51,8 +52,7 @@ async function fetchTarget(url: URL, stage: '节点测速' | '搜索页' | '详�
     });
     if (response.status >= 300 && response.status < 400) throw new Error(`目标网站返回重定向（HTTP ${response.status}）。`);
     if (!response.ok) throw new Error(`目标网站返回 HTTP ${response.status}。`);
-    const html = await response.text();
-    if (html.length > 5_000_000) throw new Error('目标页面超过 5 MB，已停止解析。');
+    const html = await readResponseText(response);
     return { html, latencyMs: Math.round(performance.now() - requestedAt) };
   } catch (error) {
     const action = stage === '节点测速' ? '磁力节点测速' : `磁力${stage}请求`;
