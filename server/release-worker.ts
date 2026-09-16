@@ -1,4 +1,4 @@
-import { appendRuntimeLog, db, queueReleaseJob, recordPerformanceMetric, refreshSettings, reportWorkerHeartbeat, type WorkerTaskContext } from './db.js';
+import { appendRuntimeLog, db, queueReleaseJob, recordPerformanceMetric, refreshSettings, reportWorkerHeartbeat, scheduleSubscriptionProgressRebuild, type WorkerTaskContext } from './db.js';
 import { webExecutor } from './web-executor-client.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
@@ -83,6 +83,7 @@ async function runNextReleaseJob() {
         await tx.run("UPDATE archive_entries SET release_status = 'unsearched', release_error = NULL, updated_at = ? WHERE id = ?", [finishedAt, job.archive_entry_id]);
         await tx.run("UPDATE release_jobs SET status = 'completed', finished_at = ?, error = '发行日期规则已停用' WHERE id = ?", [finishedAt, job.id]);
       });
+      scheduleSubscriptionProgressRebuild(job.subscription_id);
       activeTask = null;
       return;
     }
@@ -100,6 +101,7 @@ async function runNextReleaseJob() {
       }
       await tx.run("UPDATE release_jobs SET status = 'completed', finished_at = ?, error = NULL, retry_after = NULL WHERE id = ?", [finishedAt, job.id]);
     });
+    scheduleSubscriptionProgressRebuild(job.subscription_id);
     await logProgress(job.subscription_id);
     await recordPerformanceMetric({ scope: 'release', metric: 'processed', dimension: result.status, durationMs: Date.now() - startedAtMs }).catch(() => undefined);
     activeTask = null;
@@ -119,6 +121,7 @@ async function runNextReleaseJob() {
         await tx.run("UPDATE release_jobs SET status = 'failed', finished_at = ?, error = ?, attempt_count = ?, retry_after = NULL WHERE id = ?", [finishedAt, message, attempt, job.id]);
       }
     });
+    scheduleSubscriptionProgressRebuild(job.subscription_id);
     await appendRuntimeLog({ level: shouldRetry ? 'info' : 'error', source: 'worker', subscriptionId: job.subscription_id, message: shouldRetry ? `发行日期读取“${job.content}”暂时失败，${retryDescription(attempt)}：${message}` : `发行日期读取“${job.content}”失败：${message}` });
     await recordPerformanceMetric({ scope: 'release', metric: shouldRetry ? 'retry' : 'processed', dimension: shouldRetry ? retryReason(error) : 'failed', durationMs: shouldRetry ? 0 : Date.now() - startedAtMs }).catch(() => undefined);
     await logProgress(job.subscription_id);

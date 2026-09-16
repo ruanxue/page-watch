@@ -1,4 +1,4 @@
-import { appendRuntimeLog, db, getQbittorrentSettings, queueDownloadJob, recordPerformanceMetric, refreshSettings, reportWorkerHeartbeat, type WorkerTaskContext } from './db.js';
+import { appendRuntimeLog, db, getQbittorrentSettings, queueDownloadJob, recordPerformanceMetric, refreshSettings, reportWorkerHeartbeat, scheduleSubscriptionProgressRebuild, type WorkerTaskContext } from './db.js';
 import { webExecutor } from './web-executor-client.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { getInspectionRules } from './inspection-rules.js';
@@ -53,6 +53,7 @@ async function runNextMagnetJob() {
         await tx.run("UPDATE archive_entries SET magnet_status = 'unsearched', magnet_error = NULL, updated_at = ? WHERE id = ?", [finishedAt, job.archive_entry_id]);
         await tx.run("UPDATE magnet_jobs SET status = 'completed', finished_at = ?, error = '磁力检索规则已停用' WHERE id = ?", [finishedAt, job.id]);
       });
+      scheduleSubscriptionProgressRebuild(job.subscription_id);
       activeTask = null;
       return;
     }
@@ -77,6 +78,7 @@ async function runNextMagnetJob() {
       }
       await tx.run("UPDATE magnet_jobs SET status = 'completed', finished_at = ?, error = NULL, retry_after = NULL WHERE id = ?", [finishedAt, job.id]);
     });
+    scheduleSubscriptionProgressRebuild(job.subscription_id);
     if (result.status === 'not_found') {
       await appendRuntimeLog({ level: 'success', source: 'worker', subscriptionId: job.subscription_id, message: `磁力检索完成，未找到“${job.content}”：${result.reason}` });
     } else if (downloadQueued) {
@@ -101,6 +103,7 @@ async function runNextMagnetJob() {
         await tx.run("UPDATE magnet_jobs SET status = 'failed', finished_at = ?, error = ?, attempt_count = ?, retry_after = NULL WHERE id = ?", [finishedAt, message, attempt, job.id]);
       }
     });
+    scheduleSubscriptionProgressRebuild(job.subscription_id);
     await appendRuntimeLog({ level: shouldRetry ? 'info' : 'error', source: 'worker', subscriptionId: job.subscription_id, message: shouldRetry ? `磁力检索“${job.content}”暂时失败，${retryDescription(attempt)}：${message}` : `磁力检索“${job.content}”失败：${message}` });
     await recordPerformanceMetric({ scope: 'magnet', metric: shouldRetry ? 'retry' : 'processed', dimension: shouldRetry ? retryReason(error) : 'failed', durationMs: shouldRetry ? 0 : Date.now() - startedAtMs }).catch(() => undefined);
     await logProgress(job.subscription_id);

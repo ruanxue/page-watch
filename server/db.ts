@@ -249,6 +249,33 @@ export async function rebuildSubscriptionProgress(subscriptionId?: number, clien
       library_total=VALUES(library_total), library_done=VALUES(library_done), download_total=VALUES(download_total), download_done=VALUES(download_done), updated_at=VALUES(updated_at)`, params);
 }
 
+// NAS MySQL deployments commonly deny CREATE TRIGGER while binary logging is
+// enabled. Keep the compact read-model up to date in the application instead:
+// transitions for the same subscription are coalesced, so a batch of archive
+// jobs costs one bounded aggregate query rather than one query per row or a
+// full archive scan whenever the UI refreshes.
+const pendingProgressRebuilds = new Set<number>();
+let progressRebuildTimer: NodeJS.Timeout | null = null;
+const PROGRESS_REBUILD_DEBOUNCE_MS = 2_000;
+
+export function scheduleSubscriptionProgressRebuild(subscriptionId: number) {
+  if (!Number.isInteger(subscriptionId) || subscriptionId < 1) return;
+  pendingProgressRebuilds.add(subscriptionId);
+  if (progressRebuildTimer) return;
+  progressRebuildTimer = setTimeout(() => { void flushSubscriptionProgressRebuilds(); }, PROGRESS_REBUILD_DEBOUNCE_MS);
+}
+
+export async function flushSubscriptionProgressRebuilds() {
+  if (progressRebuildTimer) clearTimeout(progressRebuildTimer);
+  progressRebuildTimer = null;
+  const subscriptionIds = [...pendingProgressRebuilds];
+  pendingProgressRebuilds.clear();
+  await Promise.all(subscriptionIds.map(async (subscriptionId) => {
+    try { await rebuildSubscriptionProgress(subscriptionId); }
+    catch (error) { console.error(`Unable to rebuild subscription progress for ${subscriptionId}: ${error instanceof Error ? error.message : String(error)}`); }
+  }));
+}
+
 export async function queueMagnetJob(archiveEntryId: number, client: DatabaseClient = db, priority: JobPriority = JOB_PRIORITY.normal) {
   return queueUnique('magnet_jobs', 'archive_entry_id', archiveEntryId, priority, client);
 }

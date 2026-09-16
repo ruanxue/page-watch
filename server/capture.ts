@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import * as cheerio from 'cheerio';
 import { ProxyAgent } from 'undici';
-import { db, getJellyfinSettings, getOutboundProxyUrl, queueLibraryJob, queueMagnetJob, queueReleaseJob, recordPerformanceMetric, type DatabaseClient, type Subscription } from './db.js';
+import { db, getJellyfinSettings, getOutboundProxyUrl, queueLibraryJob, queueMagnetJob, queueReleaseJob, recordPerformanceMetric, scheduleSubscriptionProgressRebuild, type DatabaseClient, type Subscription } from './db.js';
 import { browserPool } from './browser-pool.js';
 import { describeError } from './error-details.js';
 import { expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
@@ -243,6 +243,7 @@ export async function captureSubscription(subscription: Subscription, browserPri
     const addedCount = write.changes ? await archiveNewItems(subscription, result.items, now, tx) : 0;
     return { stored: Boolean(write.changes), addedCount };
   });
+  if (stored.addedCount) scheduleSubscriptionProgressRebuild(subscription.id);
   return { ...result, changed, capturedAt: now, ...stored, itemCount: result.items.length, totalPages: 1 };
 }
 
@@ -331,6 +332,7 @@ async function captureInitialFullScan(subscription: Subscription, browserPriorit
     }
     await tx.run('DELETE FROM initial_scan_items WHERE subscription_id = ? AND scan_id = ?', [subscription.id, scanId]);
   });
+  if (stored && addedCount) scheduleSubscriptionProgressRebuild(subscription.id);
   const result = { title: first?.title ?? subscription.name, content, hash: hash(content), pageCount: total };
   const changed = Boolean(subscription.last_hash && subscription.last_hash !== result.hash);
   return { ...result, changed, capturedAt: now, stored, addedCount: stored ? addedCount : 0, itemCount, totalPages: total };

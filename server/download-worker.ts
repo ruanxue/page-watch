@@ -1,4 +1,4 @@
-import { appendRuntimeLog, db, getQbittorrentSettings, recordPerformanceMetric, refreshSettings, reportIntegrationStatus, reportWorkerHeartbeat, type WorkerTaskContext } from './db.js';
+import { appendRuntimeLog, db, getQbittorrentSettings, recordPerformanceMetric, refreshSettings, reportIntegrationStatus, reportWorkerHeartbeat, scheduleSubscriptionProgressRebuild, type WorkerTaskContext } from './db.js';
 import { addMagnetToQbittorrent, getQbittorrentTorrentFiles, getQbittorrentTorrentStates, setQbittorrentTorrentFilePriority, startQbittorrentTorrents, stopQbittorrentTorrents, torrentHashFromMagnet, type QbittorrentTorrentFile, type QbittorrentTorrentState } from './qbittorrent.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { notifyLive } from './live-events.js';
@@ -135,6 +135,7 @@ async function runNextDownloadJob() {
     if (!/未启用/.test(message)) await reportIntegrationStatus('qbittorrent', 'degraded', '最近一次下载提交失败').catch(() => undefined);
     console.error(`Download job ${job.id} failed: ${message}`);
   }
+  scheduleSubscriptionProgressRebuild(job.subscription_id);
   activeTask = null;
   notifyLive('archive', job.subscription_id);
   notifyLive('tasks');
@@ -389,7 +390,10 @@ async function syncDownloadStates() {
     const skipped = entry.skippedCount ? `，已跳过 ${entry.skippedCount} 个较小文件` : '';
     await appendRuntimeLog({ level: 'success', source: 'download', subscriptionId: entry.subscription_id, message: `“${entry.content}”已按单文件大小筛选：保留 ${entry.selectedCount} 个文件（共 ${displaySize(entry.selectedBytes)}，每个 ≥ ${displaySize(entry.minimum)}）${skipped}，已开始下载。` });
   }
-  for (const subscriptionId of changedSubscriptionIds) notifyLive('archive', subscriptionId);
+  for (const subscriptionId of changedSubscriptionIds) {
+    scheduleSubscriptionProgressRebuild(subscriptionId);
+    notifyLive('archive', subscriptionId);
+  }
   if (completed.length || removed.length || filtered.length || accepted.length) notifyLive('tasks');
 }
 

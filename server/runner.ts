@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { db, flushTelemetry, getJellyfinSettings, getSetting, refreshSettings, reportRuntimeMetrics } from './db.js';
+import { db, flushSubscriptionProgressRebuilds, flushTelemetry, getJellyfinSettings, getSetting, refreshSettings, reportRuntimeMetrics } from './db.js';
 import { webExecutor } from './web-executor-client.js';
 import { librarySyncExecutor } from './library-sync-client.js';
 import { startRuntimeMemoryReporter } from './runtime-observability.js';
@@ -154,6 +154,7 @@ async function shutdown(exitCode = 0) {
       { key: 'runner_rss_bytes', value: 0 }
     ]).catch(() => undefined);
   }
+  await flushSubscriptionProgressRebuilds();
   await flushTelemetry().catch(() => undefined);
   previewServer.close(() => process.exit(exitCode));
 }

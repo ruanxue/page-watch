@@ -1,4 +1,4 @@
-import { appendRuntimeLog, db, getJellyfinSettings, getSetting, JOB_PRIORITY, queueLibrarySyncJob, queueMagnetJob, recordPerformanceMetric, refreshSettings, reportIntegrationStatus, reportWorkerHeartbeat, setSetting, type LibrarySyncJob, type WorkerTaskContext } from './db.js';
+import { appendRuntimeLog, db, getJellyfinSettings, getSetting, JOB_PRIORITY, queueLibrarySyncJob, queueMagnetJob, recordPerformanceMetric, refreshSettings, reportIntegrationStatus, reportWorkerHeartbeat, scheduleSubscriptionProgressRebuild, setSetting, type LibrarySyncJob, type WorkerTaskContext } from './db.js';
 import { findJellyfinMedia } from './jellyfin.js';
 import { exactJellyfinMatch } from './jellyfin-match.js';
 import { librarySyncExecutor } from './library-sync-client.js';
@@ -58,7 +58,10 @@ async function runNextLibrarySync() {
   }
   if (!syncing) {
     const subscriptions = await db.all<{ id: number }>('SELECT id FROM subscriptions');
-    for (const subscription of subscriptions) notifyLive('archive', subscription.id);
+    for (const subscription of subscriptions) {
+      scheduleSubscriptionProgressRebuild(subscription.id);
+      notifyLive('archive', subscription.id);
+    }
     notifyLive('subscriptions');
     notifyLive('tasks');
   }
@@ -130,6 +133,7 @@ async function runNextLibraryJob() {
     await recordPerformanceMetric({ scope: 'library', metric: retry ? 'retry' : 'processed', dimension: retry ? retryReason(error) : 'failed', durationMs: retry ? 0 : Date.now() - startedAtMs }).catch(() => undefined);
     if (usedRemoteLookup) await reportIntegrationStatus('jellyfin', 'degraded', '最近一次 Jellyfin 查询失败').catch(() => undefined);
   }
+  scheduleSubscriptionProgressRebuild(job.subscription_id);
   notifyLive('archive', job.subscription_id);
   // Jellyfin availability is shown in the compact subscription summary, so
   // this is one of the few per-entry transitions that merits that refresh.
