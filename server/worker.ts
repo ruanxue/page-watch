@@ -55,12 +55,20 @@ async function enqueueDueSubscriptions() {
   const subscriptions = await db.all<Subscription>('SELECT * FROM subscriptions WHERE is_active = 1');
   const now = new Date();
   for (const subscription of subscriptions) {
-    const due = subscription.next_scheduled_at ? new Date(subscription.next_scheduled_at) : scheduledAfter(subscription, new Date(subscription.last_checked_at ?? subscription.updated_at));
+    const hadSchedule = Boolean(subscription.next_scheduled_at);
+    const due = hadSchedule
+      ? new Date(subscription.next_scheduled_at!)
+      : scheduledAfter(subscription, new Date(subscription.last_checked_at ?? subscription.updated_at));
     if (now >= due) {
       const queued = await queueJob(subscription.id, JOB_PRIORITY.normal);
       const next = nextScheduledAt(subscription, now);
       await db.run('UPDATE subscriptions SET next_scheduled_at = ? WHERE id = ?', [next.toISOString(), subscription.id]);
       if (queued.queued) await appendRuntimeLog({ level: 'info', source: 'queue', subscriptionId: subscription.id, message: `计划检查已排队（${subscription.schedule_type === 'hourly' ? '按小时' : `${scheduleStaggerMinutes(subscription)} 分钟错峰`}）。` });
+    } else if (!hadSchedule) {
+      // Persist the first calculated wake-up. Without this a fresh
+      // subscription would make the API wake the engine every fallback scan
+      // even though its configured interval has not arrived yet.
+      await db.run('UPDATE subscriptions SET next_scheduled_at = ? WHERE id = ?', [due.toISOString(), subscription.id]);
     }
   }
 }
@@ -163,10 +171,15 @@ async function tick() {
   }
 }
 
-void appendRuntimeLog({ level: 'info', source: 'system', message: '检查 Worker 已启动。' })
-  .catch((error) => console.error(`Unable to save worker startup log: ${error instanceof Error ? error.message : String(error)}`));
-console.log('Page Watch worker started');
-void tick();
-setInterval(() => void tick(), POLL_MS);
-const heartbeatTimer = setInterval(() => void heartbeat(), 15_000);
-heartbeatTimer.unref();
+export async function runCaptureWorkerTick() { await tick(); }
+export function isCaptureWorkerBusy() { return working; }
+
+if (process.env.PAGE_WATCH_WORKER_AUTOSTART !== '0') {
+  void appendRuntimeLog({ level: 'info', source: 'system', message: '检查 Worker 已启动。' })
+    .catch((error) => console.error(`Unable to save worker startup log: ${error instanceof Error ? error.message : String(error)}`));
+  console.log('Page Watch worker started');
+  void tick();
+  setInterval(() => void tick(), POLL_MS);
+  const heartbeatTimer = setInterval(() => void heartbeat(), 15_000);
+  heartbeatTimer.unref();
+}

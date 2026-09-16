@@ -1,31 +1,75 @@
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import type { ServerResponse } from 'node:http';
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
+import fastifyCompress from '@fastify/compress';
 import { assertSafeUrl as validateSafeUrl } from './url-safety.js';
-import { appendRuntimeLog, db, getIntegrationStatuses, getJellyfinSettings, getOutboundProxyUrl, getQbittorrentSettings, getRuntimeMetrics, getRuntimeSettings, getSetting, getSubscription, JOB_PRIORITY, maintainPerformanceMetrics, queueDownloadJob, queueJob, queueLibrarySyncJob, queueMagnetJob, queueReleaseJob, refreshSettings, reportIntegrationStatus, reportWorkerHeartbeat, setRuntimeSettings, setSetting, type IntegrationService, type Subscription } from './db.js';
+import { appendRuntimeLog, db, getIntegrationStatuses, getJellyfinSettings, getOutboundProxyUrl, getQbittorrentSettings, getRuntimeMetrics, getRuntimeSettings, getSetting, getSubscription, JOB_PRIORITY, maintainPerformanceMetrics, queueDownloadJob, queueJob, queueLibrarySyncJob, queueMagnetJob, queueReleaseJob, rebuildSubscriptionProgress, refreshSettings, reportIntegrationStatus, reportRuntimeMetrics, reportWorkerHeartbeat, setRuntimeSettings, setSetting, type IntegrationService, type Subscription } from './db.js';
 import { assertQbittorrentConfig, normalizeQbittorrentUrl, testQbittorrentConnection } from './qbittorrent.js';
 import { assertJellyfinConfig, listJellyfinLibraries, normalizeJellyfinUrl, testJellyfinConnection } from './jellyfin.js';
 import { startRuntimeMemoryReporter } from './runtime-observability.js';
 import { clearJellyfinMediaIndex } from './jellyfin-cache.js';
 import { authenticate, clearSessionCookie, configurePassword, createSession, sessionCookie, statusFor, validatePassword } from './auth.js';
 import { getInspectionRules, inspectionRulesJson, normalizeInspectionRules } from './inspection-rules.js';
+import { ExecutionEngineController } from './engine-controller.js';
+import { EngineWakeScheduler } from './engine-wake-scheduler.js';
+
+// Docker creates a random private token in its entry script. Keep a fixed,
+// loopback-only fallback for `npm run dev`, so the on-demand child can still
+// publish task and SSE events without a separate supervisor.
+if (!process.env.WORKER_EVENT_TOKEN && process.env.NODE_ENV !== 'production') process.env.WORKER_EVENT_TOKEN = 'page-watch-dev-runner';
 
 const app = Fastify({ logger: { level: 'warn' } });
+await app.register(fastifyCompress, { encodings: ['br', 'gzip'], threshold: 1024 });
 const port = Number(process.env.PORT ?? 3030);
+const engineController = new ExecutionEngineController();
+const engineWakeScheduler = new EngineWakeScheduler(engineController);
+
+app.addHook('onResponse', (request, reply, done) => {
+  const path = request.url.split('?')[0];
+  const queuesWork = request.method === 'POST' && (
+    /^\/api\/subscriptions\/\d+\/(run|full-scan|release-backfill|magnet-backfill|download-backfill)$/.test(path)
+    || /^\/api\/archive\/\d+\/(magnet-retry|download)$/.test(path)
+    || path === '/api/settings/jellyfin/sync'
+  );
+  if (queuesWork && reply.statusCode < 400) void engineWakeScheduler.wake('网页操作已加入队列').catch((error) => app.log.warn(`Unable to wake execution engine: ${error instanceof Error ? error.message : String(error)}`));
+  done();
+});
+
+engineController.onChange((snapshot) => {
+  void reportRuntimeMetrics([
+    { key: 'engine_state', text: snapshot.state },
+    { key: 'engine_last_started_at', text: snapshot.lastStartedAt ?? '' },
+    { key: 'engine_start_count', value: snapshot.starts },
+    { key: 'runner_rss_bytes', value: snapshot.state === 'sleeping' || snapshot.state === 'error' ? 0 : null }
+  ]).catch(() => undefined);
+  emitLive('tasks');
+  emitLive('services');
+  emitLive('metrics');
+});
 const loginFailures = new Map<string, { count: number; firstAt: number; lockedUntil: number }>();
 const loginWindowMs = 10 * 60_000;
 const loginLimit = 7;
-type LiveChannel = 'archive' | 'logs' | 'subscriptions' | 'tasks' | 'metrics';
-type LiveClient = { response: ServerResponse; channel: LiveChannel; subscriptionId: number | null; needsSnapshot: boolean };
+type LiveChannel = 'archive' | 'logs' | 'subscriptions' | 'tasks' | 'task-summary' | 'task-active' | 'services' | 'metrics';
+const liveChannels = new Set<LiveChannel>(['archive', 'logs', 'subscriptions', 'tasks', 'task-summary', 'task-active', 'services', 'metrics']);
+type LiveClient = {
+  response: ServerResponse;
+  topics: Set<LiveChannel>;
+  archiveSubscriptionIds: Set<number>;
+  needsSnapshot: boolean;
+  blockedAt: number | null;
+};
 const liveClients = new Set<LiveClient>();
+const pendingLiveEvents = new Map<string, { channel: LiveChannel; subscriptionId?: number }>();
+const liveVersions = new Map<LiveChannel, number>();
+let liveFlushTimer: NodeJS.Timeout | null = null;
 const archiveVersions = new Map<number, string>();
 let subscriptionsVersion = '';
 let tasksVersion = '';
 let liveInitialized = false;
 let latestLogId = 0;
 let lastSseKeepAliveAt = 0;
-
 // DNS may be intentionally delegated to the configured outbound proxy. Keep
 // API-side validation equally strict about private addresses without rejecting
 // a hostname that is only resolvable from the proxy network.
@@ -35,6 +79,25 @@ async function assertSafeUrl(raw: string) {
 
 function authPath(url: string) {
   return url.split('?')[0];
+}
+
+/** Authenticated API payloads are revalidated, never shared. The lightweight
+ * ETag lets an inactive view keep its in-memory snapshot without re-downloading
+ * identical task or subscription documents after it regains focus. */
+function privateJson(request: { headers: Record<string, string | string[] | undefined> }, reply: { header: (name: string, value: string) => unknown; code: (status: number) => { send: (value?: unknown) => unknown }; send: (value: unknown) => unknown }, payload: unknown) {
+  // `generatedAt` is intentionally informational. Excluding it from the
+  // validator makes conditional GET useful when the underlying read model is
+  // unchanged instead of defeating caching once per request.
+  const cachePayload = payload && typeof payload === 'object' && !Array.isArray(payload)
+    ? Object.fromEntries(Object.entries(payload as Record<string, unknown>).filter(([key]) => key !== 'generatedAt'))
+    : payload;
+  const encoded = JSON.stringify(cachePayload);
+  const etag = `\"${createHash('sha1').update(encoded).digest('base64url')}\"`;
+  reply.header('Cache-Control', 'private, max-age=0, must-revalidate');
+  reply.header('Vary', 'Accept-Encoding, Cookie');
+  reply.header('ETag', etag);
+  if (request.headers['if-none-match'] === etag) return reply.code(304).send();
+  return reply.send(payload);
 }
 
 function loginAllowed(ip: string) {
@@ -55,32 +118,69 @@ function recordFailedLogin(ip: string) {
 
 function writeSse(client: LiveClient, event: string, data?: unknown) {
   if (client.response.writableEnded || client.response.destroyed) { liveClients.delete(client); return; }
-  client.response.write(`event: ${event}\n`);
-  if (data !== undefined) client.response.write(`data: ${JSON.stringify(data)}\n`);
-  client.response.write('\n');
+  if (client.response.writableLength > 64 * 1024) {
+    client.blockedAt ??= Date.now();
+    if (Date.now() - client.blockedAt >= 15_000) {
+      liveClients.delete(client);
+      client.response.destroy();
+    }
+    return;
+  }
+  const payload = `event: ${event}\n${data === undefined ? '' : `data: ${JSON.stringify(data)}\n`}\n`;
+  const accepted = client.response.write(payload);
+  if (accepted) client.blockedAt = null;
+  else client.blockedAt ??= Date.now();
+}
+
+function clientWatches(client: LiveClient, channel: LiveChannel, subscriptionId?: number) {
+  if (!client.topics.has(channel)) return false;
+  return channel !== 'archive' || (subscriptionId !== undefined && client.archiveSubscriptionIds.has(subscriptionId));
+}
+
+function expandedLiveChannels(channel: LiveChannel) {
+  // Keep the original `tasks` event for older clients, while newer pages can
+  // invalidate only the compact summary or active queue they actually render.
+  return channel === 'tasks' ? ['tasks', 'task-summary', 'task-active'] as LiveChannel[] : [channel];
+}
+
+function queueLive(channel: LiveChannel, subscriptionId?: number) {
+  const key = `${channel}:${subscriptionId ?? ''}`;
+  pendingLiveEvents.set(key, { channel, subscriptionId });
+  if (!liveFlushTimer) {
+    liveFlushTimer = setTimeout(() => {
+      liveFlushTimer = null;
+      for (const event of pendingLiveEvents.values()) {
+        const version = (liveVersions.get(event.channel) ?? 0) + 1;
+        liveVersions.set(event.channel, version);
+        for (const client of liveClients) {
+          if (!clientWatches(client, event.channel, event.subscriptionId)) continue;
+          writeSse(client, event.channel, event.channel === 'archive'
+            ? { subscriptionId: event.subscriptionId, version }
+            : { version });
+        }
+      }
+      pendingLiveEvents.clear();
+    }, 250);
+    liveFlushTimer.unref();
+  }
 }
 
 function emitLive(channel: LiveChannel, subscriptionId?: number) {
-  for (const client of liveClients) {
-    if (client.channel !== channel) continue;
-    if (channel === 'archive' && client.subscriptionId !== subscriptionId) continue;
-    writeSse(client, channel, channel === 'archive' ? { subscriptionId } : { at: new Date().toISOString() });
-  }
+  for (const item of expandedLiveChannels(channel)) queueLive(item, subscriptionId);
 }
 
 async function pollLiveChanges() {
   if (!liveClients.size) return;
-  const watchesLogs = [...liveClients].some((client) => client.channel === 'logs');
-  const watchesArchive = [...liveClients].some((client) => client.channel === 'archive');
-  const watchesSubscriptions = [...liveClients].some((client) => client.channel === 'subscriptions');
-  const watchesTasks = [...liveClients].some((client) => client.channel === 'tasks');
+  const watchesLogs = [...liveClients].some((client) => client.topics.has('logs'));
+  const watchesArchive = [...liveClients].some((client) => client.topics.has('archive'));
+  const watchesSubscriptions = [...liveClients].some((client) => client.topics.has('subscriptions'));
+  const watchesTasks = [...liveClients].some((client) => client.topics.has('tasks') || client.topics.has('task-summary') || client.topics.has('task-active'));
   const [latestLog, versions, subscriptionVersion, taskVersion] = await Promise.all([
     watchesLogs ? db.get<{ id: number }>('SELECT COALESCE(MAX(id), 0) AS id FROM runtime_logs') : Promise.resolve(undefined),
     watchesArchive ? db.all<{ subscription_id: number; version: string }>(`SELECT subscription_id, MAX(updated_at) AS version
       FROM archive_entries GROUP BY subscription_id`) : Promise.resolve([]),
     watchesSubscriptions ? db.get<{ version: string }>(`SELECT SHA2(CONCAT(COALESCE((SELECT MAX(updated_at) FROM subscriptions), ''), ':', COALESCE((SELECT MAX(updated_at) FROM archive_entries), ''), ':', COALESCE((SELECT MAX(requested_at) FROM jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM release_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM magnet_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM library_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM library_sync_jobs WHERE status IN ('queued','running')), ''), ':', COALESCE((SELECT MAX(requested_at) FROM download_jobs WHERE status IN ('queued','running')), '')), 256) AS version`) : Promise.resolve(undefined),
     watchesTasks ? db.get<{ version: string }>(`SELECT SHA2(CONCAT(
-      COALESCE((SELECT MAX(last_seen_at) FROM worker_heartbeats), ''), ':',
       COALESCE((SELECT MAX(requested_at) FROM jobs), ''), ':', COALESCE((SELECT MAX(started_at) FROM jobs), ''), ':', COALESCE((SELECT MAX(finished_at) FROM jobs), ''), ':', COALESCE((SELECT MAX(retry_after) FROM jobs), ''), ':',
       COALESCE((SELECT MAX(requested_at) FROM release_jobs), ''), ':', COALESCE((SELECT MAX(started_at) FROM release_jobs), ''), ':', COALESCE((SELECT MAX(finished_at) FROM release_jobs), ''), ':', COALESCE((SELECT MAX(retry_after) FROM release_jobs), ''), ':',
       COALESCE((SELECT MAX(requested_at) FROM magnet_jobs), ''), ':', COALESCE((SELECT MAX(started_at) FROM magnet_jobs), ''), ':', COALESCE((SELECT MAX(finished_at) FROM magnet_jobs), ''), ':', COALESCE((SELECT MAX(retry_after) FROM magnet_jobs), ''), ':',
@@ -102,27 +202,37 @@ async function pollLiveChanges() {
   for (const client of liveClients) {
     if (!client.needsSnapshot) continue;
     client.needsSnapshot = false;
-    writeSse(client, client.channel, client.channel === 'archive' ? { subscriptionId: client.subscriptionId } : client.channel === 'logs' ? { latestId: nextLogId } : { version: client.channel === 'tasks' ? tasksVersion : subscriptionsVersion });
+    for (const topic of client.topics) {
+      if (topic === 'archive') {
+        for (const subscriptionId of client.archiveSubscriptionIds) writeSse(client, 'archive', { subscriptionId, version: liveVersions.get('archive') ?? 0 });
+      } else if (topic === 'logs') {
+        writeSse(client, 'logs', { latestId: nextLogId, version: liveVersions.get('logs') ?? 0 });
+      } else if (topic === 'subscriptions') {
+        writeSse(client, topic, { version: subscriptionsVersion });
+      } else if (topic === 'tasks' || topic === 'task-summary' || topic === 'task-active') {
+        writeSse(client, topic, { version: tasksVersion });
+      } else {
+        writeSse(client, topic, { version: liveVersions.get(topic) ?? 0 });
+      }
+    }
   }
   if (hadPreviousSnapshot) {
     if (nextLogId > latestLogId) {
       latestLogId = nextLogId;
-      for (const client of liveClients) if (client.channel === 'logs') writeSse(client, 'logs', { latestId: nextLogId });
+      emitLive('logs');
     }
     for (const [subscriptionId, version] of nextVersions) {
       if (archiveVersions.get(subscriptionId) === version) continue;
       archiveVersions.set(subscriptionId, version);
-      for (const client of liveClients) {
-        if (client.channel === 'archive' && client.subscriptionId === subscriptionId) writeSse(client, 'archive', { subscriptionId, version });
-      }
+      emitLive('archive', subscriptionId);
     }
     if (subscriptionVersion && subscriptionVersion.version !== subscriptionsVersion) {
       subscriptionsVersion = subscriptionVersion.version;
-      for (const client of liveClients) if (client.channel === 'subscriptions') writeSse(client, 'subscriptions', { version: subscriptionsVersion });
+      emitLive('subscriptions');
     }
     if (taskVersion && taskVersion.version !== tasksVersion) {
       tasksVersion = taskVersion.version;
-      for (const client of liveClients) if (client.channel === 'tasks') writeSse(client, 'tasks', { version: tasksVersion });
+      emitLive('tasks');
     }
   }
   if (Date.now() - lastSseKeepAliveAt >= 20_000) {
@@ -293,14 +403,14 @@ async function normalizePayload(payload: SubscriptionPayload) {
 
 async function listSubscriptions() {
   return db.all(`SELECT s.*,
-    (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id) AS archive_count,
-    (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.jellyfin_status = 'available') AS jellyfin_available_count,
+    COALESCE(p.archive_total, 0) AS archive_count,
+    COALESCE(p.jellyfin_available, 0) AS jellyfin_available_count,
     JSON_OBJECT(
       'check', JSON_OBJECT('done', 0, 'total', (SELECT COUNT(*) FROM jobs j WHERE j.subscription_id = s.id AND j.status IN ('queued','running'))),
-      'release', JSON_OBJECT('done', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.release_status IN ('found','unavailable','failed','unsearched')), 'total', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.release_status <> 'unsearched')),
-      'magnet', JSON_OBJECT('done', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.magnet_status IN ('found','not_found','failed','skipped')), 'total', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.magnet_status <> 'unsearched')),
-      'library', JSON_OBJECT('done', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.jellyfin_status IN ('available','not_found','failed')), 'total', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.jellyfin_status <> 'unconfigured')),
-      'download', JSON_OBJECT('done', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.download_status IN ('completed','removed','failed','filtered','not_queued')), 'total', (SELECT COUNT(*) FROM archive_entries a WHERE a.subscription_id = s.id AND a.download_status <> 'not_queued'))
+      'release', JSON_OBJECT('done', COALESCE(p.release_done, 0), 'total', COALESCE(p.release_total, 0)),
+      'magnet', JSON_OBJECT('done', COALESCE(p.magnet_done, 0), 'total', COALESCE(p.magnet_total, 0)),
+      'library', JSON_OBJECT('done', COALESCE(p.library_done, 0), 'total', COALESCE(p.library_total, 0)),
+      'download', JSON_OBJECT('done', COALESCE(p.download_done, 0), 'total', COALESCE(p.download_total, 0))
     ) AS queue_summary,
     CASE
       WHEN s.pagination_selector IS NOT NULL
@@ -308,7 +418,7 @@ async function listSubscriptions() {
         AND (s.initial_scan_run_id IS NOT NULL OR EXISTS(SELECT 1 FROM jobs j WHERE j.subscription_id = s.id AND j.status IN ('queued', 'running')))
       THEN 1 ELSE NULL
     END AS full_scan_active
-    FROM subscriptions s ORDER BY s.updated_at DESC, s.id DESC`);
+    FROM subscriptions s LEFT JOIN subscription_progress p ON p.subscription_id = s.id ORDER BY s.updated_at DESC, s.id DESC`);
 }
 
 app.get('/api/health', async () => ({ ok: true }));
@@ -316,28 +426,33 @@ app.post('/api/internal/events', async (request, reply) => {
   const token = process.env.WORKER_EVENT_TOKEN;
   if (!token || request.headers['x-page-watch-worker-token'] !== token) return reply.code(403).send({ error: '内部事件令牌无效。' });
   const body = request.body as { channel?: unknown; subscriptionId?: unknown };
-  if (body.channel !== 'logs' && body.channel !== 'subscriptions' && body.channel !== 'archive' && body.channel !== 'tasks' && body.channel !== 'metrics') return reply.code(400).send({ error: '内部事件类型无效。' });
+  if (typeof body.channel !== 'string' || !liveChannels.has(body.channel as LiveChannel)) return reply.code(400).send({ error: '内部事件类型无效。' });
+  const channel = body.channel as LiveChannel;
   const subscriptionId = Number(body.subscriptionId);
-  if (body.channel === 'archive' && (!Number.isInteger(subscriptionId) || subscriptionId < 1)) return reply.code(400).send({ error: '归档事件缺少订阅标识。' });
-  emitLive(body.channel, body.channel === 'archive' ? subscriptionId : undefined);
-  if (body.channel !== 'logs') emitLive('subscriptions');
+  if (channel === 'archive' && (!Number.isInteger(subscriptionId) || subscriptionId < 1)) return reply.code(400).send({ error: '归档事件缺少订阅标识。' });
+  emitLive(channel, channel === 'archive' ? subscriptionId : undefined);
   return { ok: true };
 });
 app.get('/api/events', async (request, reply) => {
-  const query = request.query as { channel?: string; subscriptionId?: string };
-  const channel: LiveChannel | null = query.channel === 'archive' || query.channel === 'logs' || query.channel === 'subscriptions' || query.channel === 'tasks' || query.channel === 'metrics' ? query.channel : null;
-  const subscriptionId = Number(query.subscriptionId);
-  if (!channel || (channel === 'archive' && (!Number.isInteger(subscriptionId) || subscriptionId < 1))) {
+  const query = request.query as { channel?: string; topics?: string; subscriptionId?: string };
+  const legacyChannel = query.channel && liveChannels.has(query.channel as LiveChannel) ? query.channel as LiveChannel : null;
+  const requestedTopics = (query.topics ?? '').split(',').map((item) => item.trim()).filter((item): item is LiveChannel => liveChannels.has(item as LiveChannel));
+  const topics = new Set<LiveChannel>(legacyChannel ? [legacyChannel] : requestedTopics);
+  const archiveIds = (query.subscriptionId ?? '').split(',').map((item) => Number(item)).filter((item) => Number.isInteger(item) && item > 0);
+  if (!topics.size || (topics.has('archive') && !archiveIds.length)) {
     return reply.code(400).send({ error: '实时订阅参数无效。' });
   }
   reply.hijack();
   reply.raw.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
+    // Never compress SSE: compressed streams can be buffered by a reverse
+    // proxy and make otherwise tiny state changes look delayed.
+    'Content-Encoding': 'identity',
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no'
   });
-  const client: LiveClient = { response: reply.raw, channel, subscriptionId: channel === 'archive' ? subscriptionId : null, needsSnapshot: true };
+  const client: LiveClient = { response: reply.raw, topics, archiveSubscriptionIds: new Set(archiveIds), needsSnapshot: true, blockedAt: null };
   liveClients.add(client);
   reply.raw.write('retry: 4000\n\n');
   writeSse(client, 'ready');
@@ -377,7 +492,7 @@ app.post('/api/auth/logout', async (_request, reply) => {
 });
 type HeartbeatRow = {
   worker_name: string;
-  status: 'ready' | 'busy' | 'error';
+  status: 'ready' | 'busy' | 'sleeping' | 'error';
   detail: string;
   last_seen_at: string;
   task_kind: string | null;
@@ -458,9 +573,9 @@ app.get('/api/ready', async (_request, reply) => {
   }
 });
 
-app.get('/api/system/status', async () => {
+app.get('/api/system/status', async (request, reply) => {
   const [{ generatedAt, services }, integrations] = await Promise.all([getSystemStatus(), getIntegrationStatuses()]);
-  return { generatedAt, services, external: summarizeExternalIntegrations(integrations) };
+  return privateJson(request, reply, { generatedAt, services, external: summarizeExternalIntegrations(integrations) });
 });
 
 type TaskQueueRow = {
@@ -519,51 +634,52 @@ function taskStatus(row: Pick<TaskQueueRow, 'status' | 'retry_after'>) {
   return row.status === 'queued' && row.retry_after && Date.parse(row.retry_after) > Date.now() ? 'retrying' : row.status;
 }
 
-app.get('/api/tasks', async (request) => {
-  const query = request.query as { historyLimit?: string };
-  const requestedHistoryLimit = Number(query.historyLimit ?? 50);
-  // The overview only needs a compact history. The operations drill-down asks
-  // for more so each service can retain a useful recent history of its own.
-  const historyLimit = Number.isInteger(requestedHistoryLimit) ? Math.min(Math.max(requestedHistoryLimit, 1), 300) : 50;
-  const [{ generatedAt, services, heartbeats }, activeRows, historyRows, progressRows, activeDownloads, integrations] = await Promise.all([
+function historyLimitFrom(value: unknown, fallback = 50) {
+  const limit = Number(value ?? fallback);
+  return Number.isInteger(limit) ? Math.min(Math.max(limit, 1), 100) : fallback;
+}
+
+async function taskProgressBySubscription() {
+  const rows = await db.all<Record<string, number | string | null>>(`SELECT subscription_id, release_total, release_done, magnet_total, magnet_done, library_total, library_done
+    FROM subscription_progress`);
+  return new Map(rows.map((row) => [Number(row.subscription_id), row]));
+}
+
+function serializeTask(row: TaskQueueRow, progressBySubscription: Map<number, Record<string, number | string | null>>) {
+  const kind = row.kind;
+  const source = progressBySubscription.get(Number(row.subscription_id));
+  let current = row.progress_current === null ? null : Number(row.progress_current);
+  let total = row.progress_total === null ? null : Number(row.progress_total);
+  let label = row.progress_label;
+  if (source && (kind === 'release' || kind === 'magnet' || kind === 'library')) {
+    current = Number(source[`${kind}_done`] ?? 0);
+    total = Number(source[`${kind}_total`] ?? 0);
+  }
+  if (kind === 'download' && row.download_progress !== null) {
+    const value = Number(row.download_progress);
+    if (Number.isFinite(value)) { current = Math.round(value * 100); total = 100; label = `下载 ${current}%`; }
+  }
+  return {
+    id: `${kind}-${row.task_id}`, kind, status: taskStatus(row), priority: Number(row.priority ?? 0),
+    subscriptionId: row.subscription_id, subscriptionName: row.subscription_name, content: row.content, title: row.title,
+    requestedAt: row.requested_at, startedAt: row.started_at, finishedAt: row.finished_at, retryAfter: row.retry_after,
+    attemptCount: Number(row.attempt_count ?? 0), error: row.error,
+    progress: current !== null || total !== null || label ? { current, total, label } : null
+  };
+}
+
+async function getTaskOverview() {
+  const [{ generatedAt, services }, activeRows, progressBySubscription, activeDownloads, integrations, failed] = await Promise.all([
     getSystemStatus(),
     db.all<TaskQueueRow>(`SELECT * FROM (${taskQueueUnion}) AS queue_tasks WHERE status IN ('queued', 'running')`),
-    db.all<TaskQueueRow>(`SELECT * FROM (${taskQueueUnion}) AS queue_tasks WHERE status IN ('completed', 'failed') ORDER BY finished_at DESC, task_id DESC LIMIT ?`, [historyLimit]),
-    db.all<Record<string, number | string | null>>(`SELECT subscription_id,
-      SUM(release_status <> 'unsearched') AS release_total, SUM(release_status IN ('found','unavailable','failed')) AS release_done,
-      SUM(magnet_status <> 'unsearched') AS magnet_total, SUM(magnet_status IN ('found','not_found','failed','skipped')) AS magnet_done,
-      SUM(jellyfin_status <> 'unconfigured') AS library_total, SUM(jellyfin_status IN ('available','not_found','failed')) AS library_done
-      FROM archive_entries GROUP BY subscription_id`),
+    taskProgressBySubscription(),
     db.all<ActiveDownloadRow>(`SELECT a.id, a.subscription_id, s.name AS subscription_name, a.content, a.title, a.download_status, a.download_progress,
-      a.download_queued_at, a.download_added_at, a.download_error
-      FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
+      a.download_queued_at, a.download_added_at, a.download_error FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
       WHERE a.download_status IN ('queued', 'running', 'added', 'waiting', 'downloading', 'paused')`),
-    getIntegrationStatuses()
+    getIntegrationStatuses(),
+    db.get<{ count: number }>(`SELECT COUNT(*) AS count FROM (${taskQueueUnion}) AS queue_tasks WHERE status = 'failed'`)
   ]);
-  const progressBySubscription = new Map(progressRows.map((row) => [Number(row.subscription_id), row]));
-  const serialize = (row: TaskQueueRow) => {
-    const kind = row.kind;
-    const source = progressBySubscription.get(Number(row.subscription_id));
-    let current = row.progress_current === null ? null : Number(row.progress_current);
-    let total = row.progress_total === null ? null : Number(row.progress_total);
-    let label = row.progress_label;
-    if (source && (kind === 'release' || kind === 'magnet' || kind === 'library')) {
-      current = Number(source[`${kind}_done`] ?? 0);
-      total = Number(source[`${kind}_total`] ?? 0);
-    }
-    if (kind === 'download' && row.download_progress !== null) {
-      const value = Number(row.download_progress);
-      if (Number.isFinite(value)) { current = Math.round(value * 100); total = 100; label = `下载 ${current}%`; }
-    }
-    return {
-      id: `${kind}-${row.task_id}`, kind, status: taskStatus(row), priority: Number(row.priority ?? 0),
-      subscriptionId: row.subscription_id, subscriptionName: row.subscription_name, content: row.content, title: row.title,
-      requestedAt: row.requested_at, startedAt: row.started_at, finishedAt: row.finished_at, retryAfter: row.retry_after,
-      attemptCount: Number(row.attempt_count ?? 0), error: row.error,
-      progress: current !== null || total !== null || label ? { current, total, label } : null
-    };
-  };
-  const active = activeRows.map(serialize);
+  const active = activeRows.map((row) => serializeTask(row, progressBySubscription));
   for (const download of activeDownloads) {
     if (active.some((task) => task.kind === 'download' && task.content === download.content && task.subscriptionId === download.subscription_id)) continue;
     const numericProgress = download.download_progress === null ? null : Number(download.download_progress);
@@ -576,44 +692,57 @@ app.get('/api/tasks', async (request) => {
   }
   const statusOrder: Record<string, number> = { running: 0, queued: 1, retrying: 2 };
   active.sort((left, right) => (statusOrder[left.status] ?? 9) - (statusOrder[right.status] ?? 9) || right.priority - left.priority || String(left.requestedAt ?? '').localeCompare(String(right.requestedAt ?? '')));
-  const history = historyRows.map(serialize);
   return {
     generatedAt,
-    summary: {
-      servicesOnline: services.filter((service) => service.healthy).length,
-      running: active.filter((task) => task.status === 'running').length,
-      queued: active.filter((task) => task.status === 'queued').length,
-      retrying: active.filter((task) => task.status === 'retrying').length,
-      failed: history.filter((task) => task.status === 'failed').length
-    },
+    summary: { servicesOnline: services.filter((service) => service.healthy).length, running: active.filter((task) => task.status === 'running').length, queued: active.filter((task) => task.status === 'queued').length, retrying: active.filter((task) => task.status === 'retrying').length, failed: Number(failed?.count ?? 0) },
     services,
     integrations: summarizeExternalIntegrations(integrations),
-    active,
-    history
+    active
   };
+}
+
+async function getTaskHistory(limit: number, offset = 0) {
+  const [rows, progressBySubscription] = await Promise.all([
+    db.all<TaskQueueRow>(`SELECT * FROM (${taskQueueUnion}) AS queue_tasks WHERE status IN ('completed', 'failed') ORDER BY finished_at DESC, task_id DESC LIMIT ? OFFSET ?`, [limit, offset]),
+    taskProgressBySubscription()
+  ]);
+  const items = rows.map((row) => serializeTask(row, progressBySubscription));
+  return { items, nextCursor: items.length === limit ? String(offset + items.length) : null };
+}
+
+app.get('/api/tasks/summary', async (request, reply) => privateJson(request, reply, await getTaskOverview().then(({ active: _active, ...summary }) => summary)));
+app.get('/api/tasks/active', async (request, reply) => privateJson(request, reply, await getTaskOverview().then(({ generatedAt, active }) => ({ generatedAt, active }))));
+app.get('/api/tasks/history', async (request, reply) => {
+  const query = request.query as { limit?: string; cursor?: string };
+  const offset = Math.max(0, Number.parseInt(query.cursor ?? '0', 10) || 0);
+  return privateJson(request, reply, await getTaskHistory(historyLimitFrom(query.limit), offset));
 });
-app.get('/api/subscriptions', async () => await listSubscriptions());
+app.get('/api/tasks', async (request, reply) => {
+  const query = request.query as { historyLimit?: string };
+  const [overview, history] = await Promise.all([getTaskOverview(), getTaskHistory(historyLimitFrom(query.historyLimit))]);
+  return privateJson(request, reply, { ...overview, history: history.items });
+});
+app.get('/api/subscriptions', async (request, reply) => privateJson(request, reply, await listSubscriptions()));
 
 type PerformanceSummaryRow = { scope: string; metric: string; dimension: string; sample_count: number; duration_ms: number };
 type ThroughputRow = { bucket_start: string; scope: string; sample_count: number };
 
-app.get('/api/metrics', async (request, reply) => {
-  const range = (request.query as { range?: string }).range;
-  const hoursByRange: Record<string, number> = { '24h': 24, '7d': 7 * 24, '30d': 30 * 24, '180d': 180 * 24 };
-  if (!range || !(range in hoursByRange)) return reply.code(400).send({ error: '指标时间范围无效。' });
+const metricHoursByRange: Record<string, number> = { '24h': 24, '7d': 7 * 24, '30d': 30 * 24, '180d': 180 * 24 };
+
+function metricRangeFrom(range: string | undefined) {
+  return range && range in metricHoursByRange ? range : null;
+}
+
+async function getMetricsSummary(range: string) {
   const now = Date.now();
-  const rangeStart = new Date(now - hoursByRange[range] * 60 * 60_000).toISOString().slice(0, 19).replace('T', ' ');
-  const minuteStart = new Date(Math.max(now - 30 * 24 * 60 * 60_000, now - hoursByRange[range] * 60 * 60_000)).toISOString().slice(0, 19).replace('T', ' ');
-  const [summaryRows, throughput, runtimeRows] = await Promise.all([
+  const hours = metricHoursByRange[range];
+  const rangeStart = new Date(now - hours * 60 * 60_000).toISOString().slice(0, 19).replace('T', ' ');
+  const minuteStart = new Date(Math.max(now - 30 * 24 * 60 * 60_000, now - hours * 60 * 60_000)).toISOString().slice(0, 19).replace('T', ' ');
+  const [summaryRows, runtimeRows] = await Promise.all([
     db.all<PerformanceSummaryRow>(`SELECT scope, metric, dimension, SUM(sample_count) AS sample_count, SUM(duration_ms) AS duration_ms
       FROM performance_metrics
       WHERE (granularity = 'hour' AND bucket_start >= ?) OR (granularity = 'minute' AND bucket_start >= ?)
       GROUP BY scope, metric, dimension`, [rangeStart, minuteStart]),
-    db.all<ThroughputRow>(`SELECT DATE_FORMAT(bucket_start, '%Y-%m-%d %H:%i:00') AS bucket_start, scope, SUM(sample_count) AS sample_count
-      FROM performance_metrics
-      WHERE granularity = 'minute' AND metric = 'processed' AND bucket_start >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 60 MINUTE)
-      GROUP BY DATE_FORMAT(bucket_start, '%Y-%m-%d %H:%i:00'), scope
-      ORDER BY bucket_start ASC, scope ASC`),
     getRuntimeMetrics()
   ]);
   const metric = (scope: string, name: string, dimension?: string) => summaryRows
@@ -637,11 +766,13 @@ app.get('/api/metrics', async (request, reply) => {
     }),
     retries: summaryRows.filter((row) => row.metric === 'retry').map((row) => ({ scope: row.scope, reason: row.dimension, count: Number(row.sample_count) })),
     chromiumRebuilds: summaryRows.filter((row) => row.metric === 'chromium_rebuild').map((row) => ({ scope: row.scope, reason: row.dimension, count: Number(row.sample_count) })),
-    throughput: throughput.map((row) => ({ minute: `${row.bucket_start.replace(' ', 'T')}Z`, scope: row.scope, count: Number(row.sample_count) })),
     runtime: {
       containerMemoryBytes: numberMetric('container_memory_bytes'),
       apiRssBytes: numberMetric('api_rss_bytes'),
       runnerRssBytes: numberMetric('runner_rss_bytes'),
+      engineState: runtime.get('engine_state')?.text_value ?? 'sleeping',
+      engineLastStartedAt: runtime.get('engine_last_started_at')?.text_value || null,
+      engineStartCount: numberMetric('engine_start_count') ?? 0,
       webExecutorRssBytes: numberMetric('web_executor_rss_bytes'),
       webExecutorState: runtime.get('web_executor_state')?.text_value ?? 'offline',
       librarySyncRssBytes: numberMetric('library_sync_rss_bytes'),
@@ -659,6 +790,26 @@ app.get('/api/metrics', async (request, reply) => {
       }
     }
   };
+}
+
+async function getMetricsTimeseries() {
+  const throughput = await db.all<ThroughputRow>(`SELECT DATE_FORMAT(bucket_start, '%Y-%m-%d %H:%i:00') AS bucket_start, scope, SUM(sample_count) AS sample_count
+    FROM performance_metrics WHERE granularity = 'minute' AND metric = 'processed' AND bucket_start >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 60 MINUTE)
+    GROUP BY DATE_FORMAT(bucket_start, '%Y-%m-%d %H:%i:00'), scope ORDER BY bucket_start ASC, scope ASC`);
+  return { generatedAt: new Date().toISOString(), throughput: throughput.map((row) => ({ minute: `${row.bucket_start.replace(' ', 'T')}Z`, scope: row.scope, count: Number(row.sample_count) })) };
+}
+
+app.get('/api/metrics/summary', async (request, reply) => {
+  const range = metricRangeFrom((request.query as { range?: string }).range);
+  if (!range) return reply.code(400).send({ error: '指标时间范围无效。' });
+  return privateJson(request, reply, await getMetricsSummary(range));
+});
+app.get('/api/metrics/timeseries', async (request, reply) => privateJson(request, reply, await getMetricsTimeseries()));
+app.get('/api/metrics', async (request, reply) => {
+  const range = metricRangeFrom((request.query as { range?: string }).range);
+  if (!range) return reply.code(400).send({ error: '指标时间范围无效。' });
+  const [summary, timeseries] = await Promise.all([getMetricsSummary(range), getMetricsTimeseries()]);
+  return privateJson(request, reply, { ...summary, ...timeseries });
 });
 
 type RuntimeLogScope = 'system' | 'check' | 'release' | 'magnet' | 'download' | 'library';
@@ -1225,6 +1376,7 @@ app.post('/api/subscriptions', async (request, reply) => {
       (name, url, selector, render_mode, content_source, attribute_name, match_pattern, title_selector, title_content_source, title_attribute_name, title_match_pattern, result_mode, interval_minutes, schedule_type, schedule_interval_hours, schedule_time, schedule_weekday, is_active, pagination_selector, pagination_parameter, pagination_match_pattern, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [values.name, values.url, values.selector, values.renderMode, values.contentSource, values.attributeName, values.matchPattern, values.titleSelector, values.titleContentSource, values.titleAttributeName, values.titleMatchPattern, values.resultMode, values.interval, values.scheduleType, values.scheduleIntervalHours, values.scheduleTime, values.scheduleWeekday, values.isActive, values.paginationSelector, values.paginationParameter, values.paginationMatchPattern, now, now]);
+    await rebuildSubscriptionProgress(result.lastInsertRowid);
     return reply.code(201).send(await getSubscription(result.lastInsertRowid));
   } catch (error) {
     return reply.code(400).send({ error: error instanceof Error ? error.message : '无法创建订阅。' });
@@ -1254,6 +1406,7 @@ app.delete('/api/subscriptions/:id', async (request, reply) => {
     await tx.run('DELETE FROM initial_scan_items WHERE subscription_id = ?', [id]);
     await tx.run('DELETE FROM archive_entries WHERE subscription_id = ?', [id]);
     await tx.run('DELETE FROM jobs WHERE subscription_id = ?', [id]);
+    await tx.run('DELETE FROM subscription_progress WHERE subscription_id = ?', [id]);
     await tx.run('UPDATE runtime_logs SET subscription_id = NULL WHERE subscription_id = ?', [id]);
     await tx.run('DELETE FROM subscriptions WHERE id = ?', [id]);
   });
@@ -1271,6 +1424,10 @@ app.delete('/api/subscriptions/:id/archive', async (request, reply) => {
     await tx.run('DELETE l FROM library_jobs l JOIN archive_entries a ON a.id = l.archive_entry_id WHERE a.subscription_id = ?', [id]);
     await tx.run('DELETE FROM initial_scan_items WHERE subscription_id = ?', [id]);
     await tx.run('DELETE FROM archive_entries WHERE subscription_id = ?', [id]);
+    await tx.run(`INSERT INTO subscription_progress
+      (subscription_id, archive_total, jellyfin_available, release_total, release_done, magnet_total, magnet_done, library_total, library_done, download_total, download_done, updated_at)
+      VALUES (?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ?)
+      ON DUPLICATE KEY UPDATE archive_total=0, jellyfin_available=0, release_total=0, release_done=0, magnet_total=0, magnet_done=0, library_total=0, library_done=0, download_total=0, download_done=0, updated_at=VALUES(updated_at)`, [id, now]);
     await tx.run("DELETE FROM jobs WHERE subscription_id = ? AND status = 'queued'", [id]);
     await tx.run(`UPDATE subscriptions
       SET last_checked_at = NULL, last_hash = NULL, last_content = NULL, last_error = NULL,
@@ -1286,6 +1443,7 @@ app.post('/api/subscriptions/preview', async (request, reply) => {
     const values = await normalizePayload(request.body as SubscriptionPayload);
     const token = process.env.WORKER_EVENT_TOKEN || (process.env.NODE_ENV === 'production' ? '' : 'page-watch-dev-runner');
     if (!token) throw new Error('统一执行引擎尚未就绪，请稍后重试。');
+    await engineWakeScheduler.wake('规则预览');
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 60_000);
     try {
@@ -1331,19 +1489,67 @@ app.post('/api/subscriptions/:id/full-scan', async (request, reply) => {
 
 const dist = path.resolve(process.cwd(), 'dist');
 if (process.env.NODE_ENV === 'production') {
-  await app.register(fastifyStatic, { root: dist, wildcard: false });
-  app.get('/*', async (_request, reply) => reply.sendFile('index.html'));
+  await app.register(fastifyStatic, {
+    root: dist,
+    wildcard: false,
+    setHeaders(response, filePath) {
+      if (/[/\\]assets[/\\].*-[A-Za-z0-9_-]{8,}\./.test(filePath)) response.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      else response.setHeader('Cache-Control', 'no-cache');
+    }
+  });
+  app.get('/*', async (_request, reply) => {
+    reply.header('Cache-Control', 'no-cache');
+    return reply.sendFile('index.html');
+  });
 }
 
 app.listen({ port, host: '0.0.0.0' }).then(() => {
-  const beat = () => void reportWorkerHeartbeat('api', `网页服务监听端口 ${port}`).catch((error) => app.log.warn(`Unable to save API heartbeat: ${error instanceof Error ? error.message : String(error)}`));
-  beat();
-  setInterval(beat, 15_000);
+  const beat = async () => {
+    await reportWorkerHeartbeat('api', `网页服务监听端口 ${port}`).catch((error) => app.log.warn(`Unable to save API heartbeat: ${error instanceof Error ? error.message : String(error)}`));
+    if (engineController.snapshot().state === 'sleeping') {
+      await Promise.all(([
+        ['capture', '检查 Worker 按需休眠'],
+        ['release', '发行日期 Worker 按需休眠'],
+        ['magnet', '磁力检索 Worker 按需休眠'],
+        ['download', '下载提交 Worker 按需休眠'],
+        ['library', '影视库同步 Worker 按需休眠']
+      ] as const).map(([name, detail]) => reportWorkerHeartbeat(name, detail, 'sleeping'))).catch(() => undefined);
+    }
+  };
+  void beat();
+  setInterval(() => void beat(), 30_000).unref();
+  engineWakeScheduler.start();
+  engineController.onChange(() => { void beat(); });
+
+  let downloadObserverTimer: NodeJS.Timeout | null = null;
+  const scheduleDownloadObserver = async () => {
+    try {
+      const active = await db.get<{ count: number }>(`SELECT COUNT(*) AS count FROM archive_entries
+        WHERE download_status IN ('added', 'waiting', 'downloading', 'paused')`);
+      const delay = Number(active?.count ?? 0) > 0 ? 10_000 : 60_000;
+      if (Number(active?.count ?? 0) > 0) {
+        await reportWorkerHeartbeat('download', `正在轻量同步 ${active?.count ?? 0} 个 qBittorrent 下载状态`, 'busy');
+        process.env.PAGE_WATCH_WORKER_AUTOSTART = '0';
+        const observer = await import('./download-worker.js');
+        await observer.observeQbittorrentDownloads();
+      }
+      downloadObserverTimer = setTimeout(() => void scheduleDownloadObserver(), delay);
+      downloadObserverTimer.unref();
+    } catch (error) {
+      app.log.warn(`Unable to synchronize qBittorrent downloads: ${error instanceof Error ? error.message : String(error)}`);
+      downloadObserverTimer = setTimeout(() => void scheduleDownloadObserver(), 60_000);
+      downloadObserverTimer.unref();
+    }
+  };
+  void scheduleDownloadObserver();
   startRuntimeMemoryReporter('api');
   void appendRuntimeLog({ level: 'info', source: 'system', message: `网页服务已启动，监听端口 ${port}。` })
     .catch((error) => app.log.warn(`Unable to save service startup log: ${error instanceof Error ? error.message : String(error)}`));
   const maintainMetrics = async () => {
-    try { await maintainPerformanceMetrics(); }
+    try {
+      await maintainPerformanceMetrics();
+      await rebuildSubscriptionProgress();
+    }
     catch (error) {
       const detail = error instanceof Error ? error.message : '未知数据库错误';
       await appendRuntimeLog({ level: 'error', source: 'system', message: `长期性能指标维护失败：${detail}` }).catch(() => undefined);
@@ -1356,3 +1562,14 @@ app.listen({ port, host: '0.0.0.0' }).then(() => {
   app.log.error(error);
   process.exit(1);
 });
+
+let apiStopping = false;
+async function stopApi() {
+  if (apiStopping) return;
+  apiStopping = true;
+  engineWakeScheduler.stop();
+  await engineController.stop().catch(() => undefined);
+  await app.close().catch(() => undefined);
+}
+process.once('SIGTERM', () => { void stopApi(); });
+process.once('SIGINT', () => { void stopApi(); });

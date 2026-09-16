@@ -1,10 +1,14 @@
-import { refreshSettings, reportRuntimeMetrics } from './db.js';
+import { flushTelemetry, refreshSettings, reportRuntimeMetrics } from './db.js';
 import { syncJellyfinLibrary, type JellyfinSyncProgress } from './jellyfin-sync.js';
 import { startRuntimeMemoryReporter } from './runtime-observability.js';
 
 function send(message: unknown) { if (process.send) process.send(message); }
 
 function finish(message: unknown, code: number) {
+  void flushTelemetry().catch(() => undefined).finally(() => finishAfterFlush(message, code));
+}
+
+function finishAfterFlush(message: unknown, code: number) {
   if (process.send) {
     process.send(message, () => process.exit(code));
     return;

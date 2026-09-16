@@ -97,7 +97,10 @@ export class BrowserPool {
       const executable = executablePath();
       this.launching = chromium.launch({
         headless: process.env.PLAYWRIGHT_HEADLESS !== 'false',
-        args: ['--no-first-run', '--disable-background-networking', '--disable-component-update', '--disable-default-apps', '--disable-sync'],
+        args: [
+          '--no-first-run', '--disable-background-networking', '--disable-component-update', '--disable-default-apps', '--disable-sync',
+          '--disable-extensions', '--disable-features=Translate,MediaRouter,OptimizationHints'
+        ],
         ...(executable ? { executablePath: executable } : {}),
         ...(proxyUrl ? { proxy: { server: proxyUrl } } : {})
       }).then((browser) => {

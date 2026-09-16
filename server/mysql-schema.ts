@@ -112,6 +112,95 @@ export async function ensureMySqlSchema(pool: Pool) {
     KEY idx_archive_entries_seen (first_seen_at DESC)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 
+  // Read models for the subscription and operations pages. Keeping these
+  // compact counters avoids grouping the complete archive table for every
+  // SSE-triggered refresh.
+  await pool.query(`CREATE TABLE IF NOT EXISTS subscription_progress (
+    subscription_id INT NOT NULL,
+    archive_total INT NOT NULL DEFAULT 0,
+    jellyfin_available INT NOT NULL DEFAULT 0,
+    release_total INT NOT NULL DEFAULT 0,
+    release_done INT NOT NULL DEFAULT 0,
+    magnet_total INT NOT NULL DEFAULT 0,
+    magnet_done INT NOT NULL DEFAULT 0,
+    library_total INT NOT NULL DEFAULT 0,
+    library_done INT NOT NULL DEFAULT 0,
+    download_total INT NOT NULL DEFAULT 0,
+    download_done INT NOT NULL DEFAULT 0,
+    updated_at VARCHAR(40) NOT NULL,
+    PRIMARY KEY (subscription_id),
+    KEY idx_subscription_progress_updated (updated_at)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+
+  // Keep the subscription-page counters current at the point archive state is
+  // changed. This avoids re-grouping every archive row after each release,
+  // magnet, library or download update. A full application-side reconciliation
+  // still runs after migration and once per day as a safety net.
+  //
+  // These deliberately use one statement per trigger: mysql2 does not enable
+  // multi-statements, and a single INSERT .. SELECT .. ON DUPLICATE KEY UPDATE
+  // is atomic with the archive change that caused it.
+  for (const trigger of [
+    'archive_entries_progress_after_insert',
+    'archive_entries_progress_after_update',
+    'archive_entries_progress_after_delete'
+  ]) await pool.query(`DROP TRIGGER IF EXISTS \`${trigger}\``);
+
+  const progressColumns = `subscription_id, archive_total, jellyfin_available, release_total, release_done,
+    magnet_total, magnet_done, library_total, library_done, download_total, download_done, updated_at`;
+  const progressUpdate = `archive_total = GREATEST(0, archive_total + VALUES(archive_total)),
+    jellyfin_available = GREATEST(0, jellyfin_available + VALUES(jellyfin_available)),
+    release_total = GREATEST(0, release_total + VALUES(release_total)),
+    release_done = GREATEST(0, release_done + VALUES(release_done)),
+    magnet_total = GREATEST(0, magnet_total + VALUES(magnet_total)),
+    magnet_done = GREATEST(0, magnet_done + VALUES(magnet_done)),
+    library_total = GREATEST(0, library_total + VALUES(library_total)),
+    library_done = GREATEST(0, library_done + VALUES(library_done)),
+    download_total = GREATEST(0, download_total + VALUES(download_total)),
+    download_done = GREATEST(0, download_done + VALUES(download_done)),
+    updated_at = VALUES(updated_at)`;
+  const deltaValues = (record: 'NEW' | 'OLD', multiplier: 1 | -1) => `${record}.subscription_id,
+    ${multiplier},
+    ${multiplier} * (${record}.jellyfin_status = 'available'),
+    ${multiplier} * (${record}.release_status <> 'unsearched'),
+    ${multiplier} * (${record}.release_status IN ('found', 'unavailable', 'failed')),
+    ${multiplier} * (${record}.magnet_status <> 'unsearched'),
+    ${multiplier} * (${record}.magnet_status IN ('found', 'not_found', 'failed', 'skipped')),
+    ${multiplier} * (${record}.jellyfin_status <> 'unconfigured'),
+    ${multiplier} * (${record}.jellyfin_status IN ('available', 'not_found', 'failed')),
+    ${multiplier} * (${record}.download_status <> 'not_queued'),
+    ${multiplier} * (${record}.download_status IN ('completed', 'removed', 'failed', 'filtered', 'not_queued')),
+    ${record}.updated_at`;
+  // Archive rows never move between subscriptions in the application, so an
+  // UPDATE trigger can apply its before/after difference directly. Keeping it
+  // as VALUES (rather than a derived SELECT) is compatible with both MySQL 8
+  // and the MariaDB versions commonly shipped by NAS appliances.
+  const updateDelta = `NEW.subscription_id,
+    0,
+    (NEW.jellyfin_status = 'available') - (OLD.jellyfin_status = 'available'),
+    (NEW.release_status <> 'unsearched') - (OLD.release_status <> 'unsearched'),
+    (NEW.release_status IN ('found', 'unavailable', 'failed')) - (OLD.release_status IN ('found', 'unavailable', 'failed')),
+    (NEW.magnet_status <> 'unsearched') - (OLD.magnet_status <> 'unsearched'),
+    (NEW.magnet_status IN ('found', 'not_found', 'failed', 'skipped')) - (OLD.magnet_status IN ('found', 'not_found', 'failed', 'skipped')),
+    (NEW.jellyfin_status <> 'unconfigured') - (OLD.jellyfin_status <> 'unconfigured'),
+    (NEW.jellyfin_status IN ('available', 'not_found', 'failed')) - (OLD.jellyfin_status IN ('available', 'not_found', 'failed')),
+    (NEW.download_status <> 'not_queued') - (OLD.download_status <> 'not_queued'),
+    (NEW.download_status IN ('completed', 'removed', 'failed', 'filtered', 'not_queued')) - (OLD.download_status IN ('completed', 'removed', 'failed', 'filtered', 'not_queued')),
+    NEW.updated_at`;
+
+  await pool.query(`CREATE TRIGGER \`archive_entries_progress_after_insert\`
+    AFTER INSERT ON archive_entries FOR EACH ROW
+    INSERT INTO subscription_progress (${progressColumns}) VALUES (${deltaValues('NEW', 1)})
+    ON DUPLICATE KEY UPDATE ${progressUpdate}`);
+  await pool.query(`CREATE TRIGGER \`archive_entries_progress_after_delete\`
+    AFTER DELETE ON archive_entries FOR EACH ROW
+    INSERT INTO subscription_progress (${progressColumns}) VALUES (${deltaValues('OLD', -1)})
+    ON DUPLICATE KEY UPDATE ${progressUpdate}`);
+  await pool.query(`CREATE TRIGGER \`archive_entries_progress_after_update\`
+    AFTER UPDATE ON archive_entries FOR EACH ROW
+    INSERT INTO subscription_progress (${progressColumns}) VALUES (${updateDelta})
+    ON DUPLICATE KEY UPDATE ${progressUpdate}`);
+
   await pool.query(`CREATE TABLE IF NOT EXISTS release_jobs (
     id INT NOT NULL AUTO_INCREMENT,
     archive_entry_id INT NOT NULL,

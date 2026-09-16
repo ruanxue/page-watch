@@ -29,7 +29,8 @@ RUN apt-get update \
 COPY --from=build /app/build ./build
 COPY --from=build /app/dist ./dist
 COPY deploy/docker-entrypoint.sh ./docker-entrypoint.sh
-RUN chmod 755 ./docker-entrypoint.sh
+RUN find ./build -name '*.map' -delete \
+  && chmod 755 ./docker-entrypoint.sh
 
 ENV NODE_ENV=production
 ENV PORT=3030

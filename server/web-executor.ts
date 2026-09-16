@@ -1,6 +1,6 @@
 import { browserPool } from './browser-pool.js';
 import { captureSubscription, previewCapture } from './capture.js';
-import { getRuntimeSettings, refreshSettings, reportRuntimeMetrics, type Subscription } from './db.js';
+import { flushTelemetry, getRuntimeSettings, refreshSettings, reportRuntimeMetrics, type Subscription } from './db.js';
 import { getInspectionRules, type ReleaseDateRule } from './inspection-rules.js';
 import { lookupMagnet } from './magnet.js';
 import { lookupReleaseDate } from './release-date.js';
@@ -60,7 +60,7 @@ async function execute(request: ExecutorRequest) {
   await refreshSettings();
   switch (request.operation) {
     case 'capture': return captureSubscription(request.payload.subscription, request.payload.priority);
-    case 'release': return lookupReleaseDate(request.payload.detailUrl, request.payload.rule, undefined, request.payload.priority);
+    case 'release': return lookupReleaseDate(request.payload.detailUrl, request.payload.rule, request.payload.priority);
     case 'magnet': return lookupMagnet(request.payload.content, request.payload.rule);
     case 'preview': return previewCapture(request.payload);
   }
@@ -91,6 +91,7 @@ console.log('Page Watch web executor started');
 async function shutdown() {
   if (idleTimer) clearTimeout(idleTimer);
   await browserPool.close();
+  await flushTelemetry().catch(() => undefined);
   process.exit(0);
 }
 

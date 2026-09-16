@@ -104,7 +104,6 @@ async function runNextReleaseJob() {
     await recordPerformanceMetric({ scope: 'release', metric: 'processed', dimension: result.status, durationMs: Date.now() - startedAtMs }).catch(() => undefined);
     activeTask = null;
     notifyLive('archive', job.subscription_id);
-    notifyLive('subscriptions');
     notifyLive('tasks');
   } catch (error) {
     const message = error instanceof Error ? error.message : '未知发行日期读取错误';
@@ -125,7 +124,6 @@ async function runNextReleaseJob() {
     await logProgress(job.subscription_id);
     console.error(`Release-date job ${job.id} failed: ${message}`);
     notifyLive('archive', job.subscription_id);
-    notifyLive('subscriptions');
     notifyLive('tasks');
     activeTask = null;
   }
@@ -172,10 +170,15 @@ async function tick() {
   } finally { working = false; }
 }
 
-void appendRuntimeLog({ level: 'info', source: 'system', message: '发行日期 Worker 已启动（单线程，按检查规则读取详情页字段）。' })
-  .catch((error) => console.error(`Unable to save release-date startup log: ${error instanceof Error ? error.message : String(error)}`));
-console.log('Page Watch release-date worker started');
-void tick();
-setInterval(() => void tick(), POLL_MS);
-const heartbeatTimer = setInterval(() => void heartbeat(), 15_000);
-heartbeatTimer.unref();
+export async function runReleaseWorkerTick() { await tick(); }
+export function isReleaseWorkerBusy() { return working; }
+
+if (process.env.PAGE_WATCH_WORKER_AUTOSTART !== '0') {
+  void appendRuntimeLog({ level: 'info', source: 'system', message: '发行日期 Worker 已启动（单线程，按检查规则读取详情页字段）。' })
+    .catch((error) => console.error(`Unable to save release-date startup log: ${error instanceof Error ? error.message : String(error)}`));
+  console.log('Page Watch release-date worker started');
+  void tick();
+  setInterval(() => void tick(), POLL_MS);
+  const heartbeatTimer = setInterval(() => void heartbeat(), 15_000);
+  heartbeatTimer.unref();
+}

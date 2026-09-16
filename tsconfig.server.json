@@ -5,7 +5,7 @@
     "outDir": "./build/server",
     "rootDir": "./server",
     "declaration": false,
-    "sourceMap": true
+    "sourceMap": false
   },
   "include": ["server"]
 }

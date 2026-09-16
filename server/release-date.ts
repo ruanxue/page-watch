@@ -145,77 +145,6 @@ async function fetchDetail(url: URL, requestGapMs: number, redirectsLeft = 3): P
   }
 }
 
-export class ReleaseDateBrowserSession {
-  async close() { await browserPool.close(); }
-
-  async fetch(url: URL, rule: ReleaseDateRule, priority = 0): Promise<string> {
-    await waitForRequestSlot(rule.requestIntervalMs);
-    const proxyUrl = getOutboundProxyUrl();
-    return browserPool.use('release', async (page) => {
-      const response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 30_000 });
-      await assertSafeUrl(page.url());
-      const initialHtml = response && !response.ok() ? await page.content() : null;
-      if (response && !response.ok()) {
-        const challengeReason = securityChallengeReason(initialHtml ?? '');
-        throw new Error(challengeReason ? `${challengeReason}（HTTP ${response.status()}）。` : `详情页返回 HTTP ${response.status()}。`);
-      }
-      await page.waitForFunction((config) => {
-        const normalizeLabel = (value: string) => value.replace(/\s+/g, ' ').trim().replace(/[：:]/g, '');
-        const expectedLabel = normalizeLabel(config.labelText);
-        return Array.from(document.querySelectorAll(config.containerSelector)).some((container) => {
-          const label = container.querySelector(config.labelSelector)?.textContent ?? '';
-          if (normalizeLabel(label) !== expectedLabel) return false;
-          const valueElement = container.querySelector(config.valueSelector);
-          return Boolean(valueElement && (config.valueSource === 'attribute' ? valueElement.getAttribute(config.valueAttribute)?.trim() : valueElement.textContent?.trim()));
-        });
-      }, { containerSelector: rule.containerSelector, labelSelector: rule.labelSelector, labelText: rule.labelText, valueSelector: rule.valueSelector, valueSource: rule.valueSource, valueAttribute: rule.valueAttribute }, { timeout: 12_000 }).catch(() => undefined);
-      return await page.content();
-    }, priority).catch((error) => {
-      if (error instanceof Error && /timeout/i.test(error.message)) throw new Error(describeError(error, { action: '发行日期详情页浏览器读取', target: url.hostname, proxyUrl }));
-      throw new Error(describeError(error, { action: '发行日期详情页浏览器读取', target: url.hostname, proxyUrl }));
-    });
-  }
-}
-
-async function fetchDetailInBrowser(url: URL, rule: ReleaseDateRule, session?: ReleaseDateBrowserSession, priority = 0): Promise<string> {
-  if (session) return session.fetch(url, rule, priority);
-  await waitForRequestSlot(rule.requestIntervalMs);
-  const proxyUrl = getOutboundProxyUrl();
-  return browserPool.use('release', async (page) => {
-    const response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    await assertSafeUrl(page.url());
-    const initialHtml = response && !response.ok() ? await page.content() : null;
-    if (response && !response.ok()) {
-      const challengeReason = securityChallengeReason(initialHtml ?? '');
-      throw new Error(challengeReason ? `${challengeReason}（HTTP ${response.status()}）。` : `详情页返回 HTTP ${response.status()}。`);
-    }
-    await page.waitForFunction((config) => {
-      const normalizeLabel = (value: string) => value.replace(/\s+/g, ' ').trim().replace(/[：:]/g, '');
-      const expectedLabel = normalizeLabel(config.labelText);
-      return Array.from(document.querySelectorAll(config.containerSelector)).some((container) => {
-        const label = container.querySelector(config.labelSelector)?.textContent ?? '';
-        if (normalizeLabel(label) !== expectedLabel) return false;
-        const valueElement = container.querySelector(config.valueSelector);
-        if (!valueElement) return false;
-        return config.valueSource === 'attribute'
-          ? Boolean(valueElement.getAttribute(config.valueAttribute)?.trim())
-          : Boolean(valueElement.textContent?.trim());
-      });
-    }, {
-      containerSelector: rule.containerSelector,
-      labelSelector: rule.labelSelector,
-      labelText: rule.labelText,
-      valueSelector: rule.valueSelector,
-      valueSource: rule.valueSource,
-      valueAttribute: rule.valueAttribute
-    }, { timeout: 12_000 }).catch(() => undefined);
-    return await page.content();
-  }, priority).catch((error) => {
-    if (error instanceof Error && /timeout/i.test(error.message)) throw new Error(describeError(error, { action: '发行日期详情页浏览器读取', target: url.hostname, proxyUrl }));
-    throw new Error(describeError(error, { action: '发行日期详情页浏览器读取', target: url.hostname, proxyUrl }));
-  });
-}
-
 /**
  * Successful dynamic lookups stay inside Chromium's DOM. Returning a full
  * HTML document and then parsing it with Cheerio briefly kept two DOM-sized
@@ -279,7 +208,7 @@ async function inspectReleaseDateInBrowser(url: URL, rule: ReleaseDateRule, prio
   }
 }
 
-export async function lookupReleaseDate(rawUrl: string, rule: ReleaseDateRule, session?: ReleaseDateBrowserSession, priority = 0): Promise<ReleaseDateLookupResult> {
+export async function lookupReleaseDate(rawUrl: string, rule: ReleaseDateRule, priority = 0): Promise<ReleaseDateLookupResult> {
   const url = await assertSafeUrl(rawUrl);
   const read = async (target: URL) => {
     const result = rule.renderMode === 'dynamic'

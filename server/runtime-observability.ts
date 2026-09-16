@@ -26,7 +26,10 @@ export async function reportRuntimeMemory(role: RuntimeProcessRole, browser?: Br
   const cgroupBytes = await readFirstNumber(['/sys/fs/cgroup/memory.current', '/sys/fs/cgroup/memory/memory.usage_in_bytes']);
   const metrics: RuntimeMetric[] = [
     { key: `${role}_rss_bytes`, value: process.memoryUsage().rss },
-    ...(role === 'runner' ? [{ key: 'container_memory_bytes', value: cgroupBytes }] : [])
+    // The runner disappears during a true idle period, so the persistent API
+    // must keep this cgroup gauge fresh instead of leaving the last peak on
+    // the performance page.
+    ...((role === 'runner' || role === 'api') ? [{ key: 'container_memory_bytes', value: cgroupBytes }] : [])
   ];
   if (browser) {
     metrics.push(
@@ -42,7 +45,10 @@ export async function reportRuntimeMemory(role: RuntimeProcessRole, browser?: Br
 export function startRuntimeMemoryReporter(role: RuntimeProcessRole, browser?: () => BrowserSnapshot | undefined) {
   const report = () => void reportRuntimeMemory(role, browser?.()).catch(() => undefined);
   report();
-  const timer = setInterval(report, 15_000);
+  // Gauges are for an operational overview, not a per-second graph. A slower
+  // cadence keeps idle API↔MySQL traffic negligible while meaningful changes
+  // still publish immediately through reportRuntimeMetrics.
+  const timer = setInterval(report, 30_000);
   timer.unref();
   return report;
 }

@@ -173,13 +173,80 @@ export type WorkerTaskContext = {
   label?: string | null;
 };
 
+const heartbeatCache = new Map<WorkerName, { signature: string; persistedAt: number; hadTask: boolean }>();
+const heartbeatPersistIntervalMs = 60_000;
+
 /** A tiny, DB-backed heartbeat is reliable across the separate Docker services. */
-export async function reportWorkerHeartbeat(workerName: WorkerName, detail: string, status: 'ready' | 'busy' | 'error' = 'ready', task: WorkerTaskContext | null = null) {
+export async function reportWorkerHeartbeat(workerName: WorkerName, detail: string, status: 'ready' | 'busy' | 'sleeping' | 'error' = 'ready', task: WorkerTaskContext | null = null) {
+  const normalized = {
+    status,
+    detail: detail.slice(0, 255),
+    kind: task?.kind?.slice(0, 32) ?? null,
+    subscriptionId: task?.subscriptionId ?? null,
+    archiveEntryId: task?.archiveEntryId ?? null,
+    content: task?.content?.slice(0, 255) ?? null,
+    current: task?.current ?? null,
+    total: task?.total ?? null,
+    label: task?.label?.slice(0, 128) ?? null
+  };
+  const signature = JSON.stringify(normalized);
+  const nowMs = Date.now();
+  const previous = heartbeatCache.get(workerName);
+  const changed = previous?.signature !== signature;
+  // Identical heartbeats only renew readiness in MySQL. They deliberately do
+  // not wake SSE clients or force the task centre to download its queues.
+  if (!changed && previous && nowMs - previous.persistedAt < heartbeatPersistIntervalMs) return;
   await db.run(`INSERT INTO worker_heartbeats (worker_name, status, detail, task_kind, subscription_id, archive_entry_id, task_content, progress_current, progress_total, progress_label, last_seen_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON DUPLICATE KEY UPDATE status = VALUES(status), detail = VALUES(detail), task_kind = VALUES(task_kind), subscription_id = VALUES(subscription_id), archive_entry_id = VALUES(archive_entry_id), task_content = VALUES(task_content), progress_current = VALUES(progress_current), progress_total = VALUES(progress_total), progress_label = VALUES(progress_label), last_seen_at = VALUES(last_seen_at)`,
-  [workerName, status, detail.slice(0, 255), task?.kind?.slice(0, 32) ?? null, task?.subscriptionId ?? null, task?.archiveEntryId ?? null, task?.content?.slice(0, 255) ?? null, task?.current ?? null, task?.total ?? null, task?.label?.slice(0, 128) ?? null, new Date().toISOString()]);
-  notifyLive('tasks');
+  [workerName, normalized.status, normalized.detail, normalized.kind, normalized.subscriptionId, normalized.archiveEntryId, normalized.content, normalized.current, normalized.total, normalized.label, new Date(nowMs).toISOString()]);
+  heartbeatCache.set(workerName, { signature, persistedAt: nowMs, hadTask: Boolean(normalized.kind || normalized.archiveEntryId || normalized.subscriptionId) });
+  if (changed) {
+    notifyLive('services');
+    if (Boolean(normalized.kind || normalized.archiveEntryId || normalized.subscriptionId) || previous?.hadTask) notifyLive('tasks');
+  }
+}
+
+export type SubscriptionProgress = {
+  subscription_id: number;
+  archive_total: number;
+  jellyfin_available: number;
+  release_total: number;
+  release_done: number;
+  magnet_total: number;
+  magnet_done: number;
+  library_total: number;
+  library_done: number;
+  download_total: number;
+  download_done: number;
+  updated_at: string;
+};
+
+/** Rebuild one compact read-model row after an archive-state transition. */
+export async function rebuildSubscriptionProgress(subscriptionId?: number, client: DatabaseClient = db) {
+  const now = new Date().toISOString();
+  const where = subscriptionId === undefined ? '' : 'WHERE s.id = ?';
+  const params = subscriptionId === undefined ? [now] : [now, subscriptionId];
+  await client.run(`INSERT INTO subscription_progress
+    (subscription_id, archive_total, jellyfin_available, release_total, release_done, magnet_total, magnet_done, library_total, library_done, download_total, download_done, updated_at)
+    SELECT s.id,
+      COUNT(a.id),
+      COALESCE(SUM(a.jellyfin_status = 'available'), 0),
+      COALESCE(SUM(a.release_status <> 'unsearched'), 0),
+      COALESCE(SUM(a.release_status IN ('found','unavailable','failed')), 0),
+      COALESCE(SUM(a.magnet_status <> 'unsearched'), 0),
+      COALESCE(SUM(a.magnet_status IN ('found','not_found','failed','skipped')), 0),
+      COALESCE(SUM(a.jellyfin_status <> 'unconfigured'), 0),
+      COALESCE(SUM(a.jellyfin_status IN ('available','not_found','failed')), 0),
+      COALESCE(SUM(a.download_status <> 'not_queued'), 0),
+      COALESCE(SUM(a.download_status IN ('completed','removed','failed','filtered','not_queued')), 0),
+      ?
+    FROM subscriptions s LEFT JOIN archive_entries a ON a.subscription_id = s.id
+    ${where}
+    GROUP BY s.id
+    ON DUPLICATE KEY UPDATE archive_total=VALUES(archive_total), jellyfin_available=VALUES(jellyfin_available),
+      release_total=VALUES(release_total), release_done=VALUES(release_done), magnet_total=VALUES(magnet_total), magnet_done=VALUES(magnet_done),
+      library_total=VALUES(library_total), library_done=VALUES(library_done), download_total=VALUES(download_total), download_done=VALUES(download_done), updated_at=VALUES(updated_at)`, params);
 }
 
 export async function queueMagnetJob(archiveEntryId: number, client: DatabaseClient = db, priority: JobPriority = JOB_PRIORITY.normal) {
@@ -271,13 +338,37 @@ type RuntimeLogInput = {
   jobId?: number | null;
 };
 
-export async function appendRuntimeLog(input: RuntimeLogInput) {
+const telemetryBuffered = process.env.PAGE_WATCH_TELEMETRY_BUFFERED === '1';
+const bufferedLogs: RuntimeLogInput[] = [];
+const bufferedMetrics = new Map<string, { bucket: string; input: PerformanceMetricInput; count: number; durationMs: number }>();
+let telemetryFlushTimer: NodeJS.Timeout | null = null;
+let telemetryFlushing: Promise<void> | null = null;
+
+function scheduleTelemetryFlush() {
+  if (telemetryFlushTimer) return;
+  telemetryFlushTimer = setTimeout(() => { void flushTelemetry(); }, 200);
+  telemetryFlushTimer.unref();
+}
+
+async function appendRuntimeLogNow(input: RuntimeLogInput) {
   const result = await db.run(`INSERT INTO runtime_logs
     (level, source, subscription_id, job_id, message, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
   [input.level, input.source, input.subscriptionId ?? null, input.jobId ?? null, input.message, new Date().toISOString()]);
   await db.run('DELETE FROM runtime_logs WHERE id <= (SELECT cutoff.id FROM (SELECT COALESCE(MAX(id), 0) - 1000 AS id FROM runtime_logs) AS cutoff)');
   notifyLive('logs');
   return result.lastInsertRowid;
+}
+
+/**
+ * Worker success/info noise is safe to coalesce. Failures and user-triggered
+ * queue entries remain durable before their caller continues, so a crash
+ * never hides the reason a task failed or a manual action was accepted.
+ */
+export async function appendRuntimeLog(input: RuntimeLogInput) {
+  if (!telemetryBuffered || input.level === 'error' || input.source === 'queue') return appendRuntimeLogNow(input);
+  bufferedLogs.push(input);
+  if (bufferedLogs.length >= 50) void flushTelemetry(); else scheduleTelemetryFlush();
+  return 0;
 }
 
 export function getSetting(key: string) {
@@ -344,16 +435,69 @@ function metricBucketStart(date = new Date()) {
   return date.toISOString().slice(0, 19).replace('T', ' ');
 }
 
-/** Persist only aggregate operational counters; never call this with user content or raw errors. */
-export async function recordPerformanceMetric(input: PerformanceMetricInput) {
+async function recordPerformanceMetricNow(input: PerformanceMetricInput, bucket = metricBucketStart()) {
   const dimension = (input.dimension ?? 'all').slice(0, 64) || 'all';
   const count = Math.max(1, Math.floor(input.count ?? 1));
   const duration = Math.max(0, Math.floor(input.durationMs ?? 0));
   await db.run(`INSERT INTO performance_metrics (granularity, bucket_start, scope, metric, dimension, sample_count, duration_ms)
     VALUES ('minute', ?, ?, ?, ?, ?, ?)
     ON DUPLICATE KEY UPDATE sample_count = sample_count + VALUES(sample_count), duration_ms = duration_ms + VALUES(duration_ms)`,
-  [metricBucketStart(), input.scope, input.metric, dimension, count, duration]);
+  [bucket, input.scope, input.metric, dimension, count, duration]);
   notifyLive('metrics');
+}
+
+/** Persist only aggregate operational counters; never call this with user content or raw errors. */
+export async function recordPerformanceMetric(input: PerformanceMetricInput) {
+  if (!telemetryBuffered) return recordPerformanceMetricNow(input);
+  const bucket = metricBucketStart();
+  const dimension = (input.dimension ?? 'all').slice(0, 64) || 'all';
+  const key = `${bucket}\u0000${input.scope}\u0000${input.metric}\u0000${dimension}`;
+  const current = bufferedMetrics.get(key);
+  if (current) {
+    current.count += Math.max(1, Math.floor(input.count ?? 1));
+    current.durationMs += Math.max(0, Math.floor(input.durationMs ?? 0));
+  } else {
+    bufferedMetrics.set(key, { bucket, input: { ...input, dimension }, count: Math.max(1, Math.floor(input.count ?? 1)), durationMs: Math.max(0, Math.floor(input.durationMs ?? 0)) });
+  }
+  if (bufferedMetrics.size + bufferedLogs.length >= 50) void flushTelemetry(); else scheduleTelemetryFlush();
+}
+
+/** Flushes process-local success telemetry before a disposable engine exits. */
+export async function flushTelemetry() {
+  if (telemetryFlushTimer) clearTimeout(telemetryFlushTimer);
+  telemetryFlushTimer = null;
+  if (telemetryFlushing) return telemetryFlushing;
+  const logs = bufferedLogs.splice(0);
+  const metrics = [...bufferedMetrics.values()];
+  bufferedMetrics.clear();
+  if (!logs.length && !metrics.length) return;
+  telemetryFlushing = (async () => {
+    try {
+      if (logs.length) {
+        const now = new Date().toISOString();
+        const placeholders = logs.map(() => '(?, ?, ?, ?, ?, ?)').join(', ');
+        await db.run(`INSERT INTO runtime_logs (level, source, subscription_id, job_id, message, created_at) VALUES ${placeholders}`,
+          logs.flatMap((input) => [input.level, input.source, input.subscriptionId ?? null, input.jobId ?? null, input.message, now]));
+        await db.run('DELETE FROM runtime_logs WHERE id <= (SELECT cutoff.id FROM (SELECT COALESCE(MAX(id), 0) - 1000 AS id FROM runtime_logs) AS cutoff)');
+        notifyLive('logs');
+      }
+      for (const metric of metrics) await recordPerformanceMetricNow({ ...metric.input, count: metric.count, durationMs: metric.durationMs }, metric.bucket);
+    } catch (error) {
+      // The operational path must not fail because telemetry is unavailable.
+      // Restore unpersisted values so a later flush has another chance.
+      bufferedLogs.unshift(...logs);
+      for (const metric of metrics) {
+        const dimension = (metric.input.dimension ?? 'all').slice(0, 64) || 'all';
+        const key = `${metric.bucket}\u0000${metric.input.scope}\u0000${metric.input.metric}\u0000${dimension}`;
+        const previous = bufferedMetrics.get(key);
+        if (previous) { previous.count += metric.count; previous.durationMs += metric.durationMs; }
+        else bufferedMetrics.set(key, metric);
+      }
+      console.warn(`Unable to flush buffered telemetry: ${error instanceof Error ? error.message : String(error)}`);
+      scheduleTelemetryFlush();
+    } finally { telemetryFlushing = null; }
+  })();
+  return telemetryFlushing;
 }
 
 /** Compact old minute buckets to hourly totals, then expire long-lived telemetry. */
@@ -373,16 +517,35 @@ export async function maintainPerformanceMetrics() {
 }
 
 export type RuntimeMetric = { key: string; value?: number | null; text?: string | null };
+const runtimeMetricCache = new Map<string, { value: number | null; text: string | null; persistedAt: number }>();
+
+function runtimeMetricChanged(previous: { value: number | null; text: string | null } | undefined, metric: RuntimeMetric) {
+  const value = metric.value ?? null;
+  const text = metric.text?.slice(0, 64) ?? null;
+  if (!previous) return true;
+  if (previous.text !== text) return true;
+  if (previous.value === value) return false;
+  // RSS/cgroup gauges naturally move a few pages while idle. Persist and
+  // publish only material shifts; a periodic renewal still keeps the page
+  // truthful without producing a stream of tiny memory updates.
+  if (metric.key.endsWith('_bytes')) return Math.abs((previous.value ?? 0) - (value ?? 0)) >= 1024 * 1024;
+  return true;
+}
 
 /** Persist current, safe-to-display process gauges. These are snapshots, not logs. */
 export async function reportRuntimeMetrics(metrics: RuntimeMetric[]) {
   if (!metrics.length) return;
-  const now = new Date().toISOString();
+  const nowMs = Date.now();
+  const changed = metrics.some((metric) => runtimeMetricChanged(runtimeMetricCache.get(metric.key.slice(0, 64)), metric));
+  const stale = metrics.some((metric) => nowMs - (runtimeMetricCache.get(metric.key.slice(0, 64))?.persistedAt ?? 0) >= 60_000);
+  if (!changed && !stale) return;
+  const now = new Date(nowMs).toISOString();
   const values = metrics.flatMap((metric) => [metric.key.slice(0, 64), metric.value ?? null, metric.text?.slice(0, 64) ?? null, now]);
   const placeholders = metrics.map(() => '(?, ?, ?, ?)').join(', ');
   await db.run(`INSERT INTO runtime_metrics (metric_key, numeric_value, text_value, updated_at) VALUES ${placeholders}
     ON DUPLICATE KEY UPDATE numeric_value = VALUES(numeric_value), text_value = VALUES(text_value), updated_at = VALUES(updated_at)`, values);
-  notifyLive('metrics');
+  for (const metric of metrics) runtimeMetricCache.set(metric.key.slice(0, 64), { value: metric.value ?? null, text: metric.text?.slice(0, 64) ?? null, persistedAt: nowMs });
+  if (changed) notifyLive('metrics');
 }
 
 export async function getRuntimeMetrics() {
@@ -392,11 +555,19 @@ export async function getRuntimeMetrics() {
 }
 
 export type IntegrationService = 'jellyfin' | 'qbittorrent';
+const integrationCache = new Map<IntegrationService, { signature: string; persistedAt: number }>();
 export async function reportIntegrationStatus(service: IntegrationService, status: 'healthy' | 'degraded' | 'disabled', detail: string | null = null) {
+  const normalizedDetail = detail?.slice(0, 255) ?? null;
+  const signature = `${status}\u0000${normalizedDetail ?? ''}`;
+  const nowMs = Date.now();
+  const previous = integrationCache.get(service);
+  const changed = previous?.signature !== signature;
+  if (!changed && previous && nowMs - previous.persistedAt < 60_000) return;
   await db.run(`INSERT INTO integration_status (service_name, status, detail, checked_at) VALUES (?, ?, ?, ?)
     ON DUPLICATE KEY UPDATE status = VALUES(status), detail = VALUES(detail), checked_at = VALUES(checked_at)`,
-  [service, status, detail?.slice(0, 255) ?? null, new Date().toISOString()]);
-  notifyLive('tasks');
+  [service, status, normalizedDetail, new Date(nowMs).toISOString()]);
+  integrationCache.set(service, { signature, persistedAt: nowMs });
+  if (changed) notifyLive('services');
 }
 
 export async function getIntegrationStatuses() {
@@ -538,9 +709,25 @@ async function seedDefaultInspectionRules() {
   await setSetting('inspection_rules', inspectionRulesJson(defaultInspectionRules));
 }
 
-await ensureMySqlSchema(pool);
-await encryptLegacySensitiveSettings();
-await preloadSettings();
-await seedDefaultSubscriptionPresets();
-await backfillMissavPaginationDefaults();
-await seedDefaultInspectionRules();
+let initialization: Promise<void> | null = null;
+
+/**
+ * Schema setup, seed repair and legacy-secret conversion belong to the API
+ * lifecycle only. The disposable engine and its child executors merely join
+ * the already-initialized database, avoiding an expensive migration pass on
+ * every event-driven wake-up.
+ */
+export function initializeDatabase() {
+  if (!initialization) initialization = (async () => {
+    await ensureMySqlSchema(pool);
+    await encryptLegacySensitiveSettings();
+    await preloadSettings();
+    await seedDefaultSubscriptionPresets();
+    await backfillMissavPaginationDefaults();
+    await seedDefaultInspectionRules();
+    await rebuildSubscriptionProgress();
+  })();
+  return initialization;
+}
+
+if (process.env.PAGE_WATCH_DATABASE_INITIALIZE !== '0') await initializeDatabase();

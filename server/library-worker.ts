@@ -56,6 +56,12 @@ async function runNextLibrarySync() {
     syncing = false;
     syncTask = null;
   }
+  if (!syncing) {
+    const subscriptions = await db.all<{ id: number }>('SELECT id FROM subscriptions');
+    for (const subscription of subscriptions) notifyLive('archive', subscription.id);
+    notifyLive('subscriptions');
+    notifyLive('tasks');
+  }
   return true;
 }
 
@@ -125,6 +131,8 @@ async function runNextLibraryJob() {
     if (usedRemoteLookup) await reportIntegrationStatus('jellyfin', 'degraded', '最近一次 Jellyfin 查询失败').catch(() => undefined);
   }
   notifyLive('archive', job.subscription_id);
+  // Jellyfin availability is shown in the compact subscription summary, so
+  // this is one of the few per-entry transitions that merits that refresh.
   notifyLive('subscriptions');
   notifyLive('tasks');
   return true;
@@ -198,14 +206,19 @@ async function tick() {
     syncing = false;
     syncTask = null;
     working = false;
-    if (scheduleImmediateTick) setTimeout(() => void tick(), LOCAL_MATCH_BATCH_YIELD_MS);
+    if (scheduleImmediateTick && process.env.PAGE_WATCH_WORKER_AUTOSTART !== '0') setTimeout(() => void tick(), LOCAL_MATCH_BATCH_YIELD_MS);
   }
 }
 
-void appendRuntimeLog({ level: 'info', source: 'system', message: 'Jellyfin 影视库同步 Worker 已启动。' })
-  .catch((error) => console.error(`Unable to save Jellyfin startup log: ${error instanceof Error ? error.message : String(error)}`));
-console.log('Page Watch Jellyfin library worker started');
-void tick();
-setInterval(() => void tick(), POLL_MS);
-const heartbeatTimer = setInterval(() => void syncHeartbeat(), 15_000);
-heartbeatTimer.unref();
+export async function runLibraryWorkerTick() { await tick(); }
+export function isLibraryWorkerBusy() { return working || syncing; }
+
+if (process.env.PAGE_WATCH_WORKER_AUTOSTART !== '0') {
+  void appendRuntimeLog({ level: 'info', source: 'system', message: 'Jellyfin 影视库同步 Worker 已启动。' })
+    .catch((error) => console.error(`Unable to save Jellyfin startup log: ${error instanceof Error ? error.message : String(error)}`));
+  console.log('Page Watch Jellyfin library worker started');
+  void tick();
+  setInterval(() => void tick(), POLL_MS);
+  const heartbeatTimer = setInterval(() => void syncHeartbeat(), 15_000);
+  heartbeatTimer.unref();
+}

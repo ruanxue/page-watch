@@ -86,7 +86,6 @@ async function runNextMagnetJob() {
     await recordPerformanceMetric({ scope: 'magnet', metric: 'processed', dimension: result.status, durationMs: Date.now() - startedAtMs }).catch(() => undefined);
     activeTask = null;
     notifyLive('archive', job.subscription_id);
-    notifyLive('subscriptions');
     notifyLive('tasks');
   } catch (error) {
     const message = error instanceof Error ? error.message : '未知磁力检索错误';
@@ -107,7 +106,6 @@ async function runNextMagnetJob() {
     await logProgress(job.subscription_id);
     console.error(`Magnet job ${job.id} failed: ${message}`);
     notifyLive('archive', job.subscription_id);
-    notifyLive('subscriptions');
     notifyLive('tasks');
     activeTask = null;
   }
@@ -154,10 +152,15 @@ async function tick() {
   finally { working = false; }
 }
 
-void appendRuntimeLog({ level: 'info', source: 'system', message: '磁力检索 Worker 已启动（单线程，按检查规则的请求间隔执行）。' })
-  .catch((error) => console.error(`Unable to save magnet startup log: ${error instanceof Error ? error.message : String(error)}`));
-console.log('Page Watch magnet lookup worker started');
-void tick();
-setInterval(() => void tick(), POLL_MS);
-const heartbeatTimer = setInterval(() => void heartbeat(), 15_000);
-heartbeatTimer.unref();
+export async function runMagnetWorkerTick() { await tick(); }
+export function isMagnetWorkerBusy() { return working; }
+
+if (process.env.PAGE_WATCH_WORKER_AUTOSTART !== '0') {
+  void appendRuntimeLog({ level: 'info', source: 'system', message: '磁力检索 Worker 已启动（单线程，按检查规则的请求间隔执行）。' })
+    .catch((error) => console.error(`Unable to save magnet startup log: ${error instanceof Error ? error.message : String(error)}`));
+  console.log('Page Watch magnet lookup worker started');
+  void tick();
+  setInterval(() => void tick(), POLL_MS);
+  const heartbeatTimer = setInterval(() => void heartbeat(), 15_000);
+  heartbeatTimer.unref();
+}

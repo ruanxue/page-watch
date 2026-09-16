@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { resetLiveUpdates, subscribeLive } from './live-updates';
 
 type Subscription = {
   id: number;
@@ -120,7 +121,7 @@ type RuntimeLog = {
 };
 
 type AuthStatus = { setupRequired: boolean; authenticated: boolean };
-type SystemService = { name: string; label: string; status: 'ready' | 'busy' | 'error' | 'missing'; detail: string; lastSeenAt: string | null; healthy: boolean };
+type SystemService = { name: string; label: string; status: 'ready' | 'busy' | 'sleeping' | 'error' | 'missing'; detail: string; lastSeenAt: string | null; healthy: boolean };
 type SystemStatus = { generatedAt: string; services: SystemService[] };
 type TaskStatus = 'queued' | 'running' | 'retrying' | 'completed' | 'failed';
 type TaskItem = {
@@ -160,6 +161,9 @@ type PerformanceMetrics = {
     containerMemoryBytes: number | null;
     apiRssBytes: number | null;
     runnerRssBytes: number | null;
+    engineState: string;
+    engineLastStartedAt: string | null;
+    engineStartCount: number;
     webExecutorRssBytes: number | null;
     webExecutorState: string;
     librarySyncRssBytes: number | null;
@@ -219,16 +223,39 @@ const defaultMissavPresetForm: PresetForm = {
   paginationMatchPattern: '/\\s*(\\d+)'
 };
 
+const responseCache = new Map<string, { etag: string; value: unknown }>();
+const pendingRequests = new Map<string, Promise<unknown>>();
+
+function clearResponseCache() {
+  responseCache.clear();
+  pendingRequests.clear();
+}
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const headers = new Headers(options?.headers);
   if (options?.body && !headers.has('content-type')) headers.set('content-type', 'application/json');
-  const response = await fetch(url, { ...options, headers, credentials: 'same-origin' });
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    throw new Error(data.error ?? '请求失败，请稍后再试。');
-  }
-  if (response.status === 204) return undefined as T;
-  return response.json();
+  const cacheable = (options?.method ?? 'GET').toUpperCase() === 'GET' && !options?.body;
+  const key = cacheable ? url : '';
+  const cached = cacheable ? responseCache.get(key) : undefined;
+  if (cached) headers.set('if-none-match', cached.etag);
+  if (cacheable && pendingRequests.has(key)) return pendingRequests.get(key) as Promise<T>;
+  const execute = async () => {
+    const response = await fetch(url, { ...options, headers, credentials: 'same-origin' });
+    if (response.status === 304 && cached) return cached.value as T;
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error ?? '请求失败，请稍后再试。');
+    }
+    if (response.status === 204) return undefined as T;
+    const value = await response.json() as T;
+    const etag = response.headers.get('etag');
+    if (cacheable && etag) responseCache.set(key, { etag, value });
+    return value;
+  };
+  const promise = execute();
+  if (cacheable) pendingRequests.set(key, promise);
+  try { return await promise; }
+  finally { if (cacheable) pendingRequests.delete(key); }
 }
 
 function formatTime(value: string | null) {
@@ -293,26 +320,23 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
       } catch { if (alive) setSystemStatus(null); }
     };
     void loadStatus();
-    const timer = window.setInterval(() => void loadStatus(), 15_000);
-    return () => { alive = false; window.clearInterval(timer); };
+    const unsubscribe = subscribeLive('services', () => void loadStatus());
+    return () => { alive = false; unsubscribe(); };
   }, []);
   useEffect(() => {
-    const stream = new EventSource('/api/events?channel=subscriptions');
-    stream.addEventListener('subscriptions', () => void load());
-    return () => stream.close();
+    return subscribeLive('subscriptions', () => void load());
   }, []);
   useEffect(() => {
     let alive = true;
     const loadTasks = async () => {
       try {
-        const tasks = await request<TasksResponse>('/api/tasks');
+        const tasks = await request<Pick<TasksResponse, 'summary'>>('/api/tasks/summary');
         if (alive) setTaskSummary(tasks.summary);
       } catch { if (alive) setTaskSummary(null); }
     };
     void loadTasks();
-    const stream = new EventSource('/api/events?channel=tasks');
-    stream.addEventListener('tasks', () => void loadTasks());
-    return () => { alive = false; stream.close(); };
+    const unsubscribe = subscribeLive('task-summary', () => void loadTasks());
+    return () => { alive = false; unsubscribe(); };
   }, []);
   useEffect(() => {
     const syncView = () => {
@@ -471,7 +495,12 @@ export default function App() {
   useEffect(() => { void loadAuth(); }, []);
   if (!auth) return <main className="access-gate"><div className="access-card access-loading">正在读取访问状态…</div></main>;
   if (!auth.authenticated) return <AccessGate setupRequired={auth.setupRequired} onAuthenticated={loadAuth} />;
-  return <AppShell onLogout={async () => { await request('/api/auth/logout', { method: 'POST' }); await loadAuth(); }} />;
+  return <AppShell onLogout={async () => {
+    await request('/api/auth/logout', { method: 'POST' });
+    clearResponseCache();
+    resetLiveUpdates();
+    await loadAuth();
+  }} />;
 }
 
 function Empty({ onCreate }: { onCreate: () => void }) {
@@ -626,10 +655,9 @@ function ArchivePage({ subscriptions, onNotice }: { subscriptions: Subscription[
   }, [selected?.id, archivePage, archivePageSize, archiveQuery, releaseFrom, releaseTo]);
   useEffect(() => {
     if (!selected) return;
-    const stream = new EventSource(`/api/events?channel=archive&subscriptionId=${selected.id}`);
-    const refresh = () => void loadArchive(selected, true);
-    stream.addEventListener('archive', refresh);
-    return () => stream.close();
+    return subscribeLive('archive', (event) => {
+      if (event.subscriptionId === selected.id) void loadArchive(selected, true);
+    }, selected.id);
   }, [selected?.id, archivePage, archivePageSize, archiveQuery, releaseFrom, releaseTo]);
   const backfillReleaseDates = async () => {
     if (!selected) return;
@@ -755,7 +783,7 @@ function TaskCenterPage({ data, error, scope }: { data: TasksResponse | null; er
       {task.error && <p className="task-error" title={task.error}>{task.error}</p>}
     </article>;
   };
-  const serviceState = !service ? '状态读取中' : service.status === 'busy' ? '正在执行' : service.healthy ? '在线待命' : service.status === 'missing' ? '未启动' : '需要注意';
+  const serviceState = !service ? '状态读取中' : service.status === 'busy' ? '正在执行' : service.status === 'sleeping' ? '在线休眠' : service.healthy ? '在线待命' : service.status === 'missing' ? '未启动' : '需要注意';
   return <section className="task-center-page operation-task-panel">
     <div className="section-head"><div><p className="eyebrow">{definition.label}</p><h2>{definition.label}任务</h2><p>{definition.description}</p></div></div>
     <section className={`operation-worker-state ${service?.healthy ? service.status : 'error'}`}><div><strong>{serviceState}</strong><span>{service?.detail ?? '正在读取 Worker 心跳。'}</span></div><small>{service?.lastSeenAt ? `最近心跳 ${formatTime(service.lastSeenAt)}` : '尚未收到心跳'}</small></section>
@@ -791,9 +819,7 @@ function ServiceOperationsPage({ data, error, scope }: { data: TasksResponse | n
   useEffect(() => {
     setLogsLoading(true);
     void loadLogs();
-    const stream = new EventSource('/api/events?channel=logs');
-    stream.addEventListener('logs', () => void loadLogs());
-    return () => stream.close();
+    return subscribeLive('logs', () => void loadLogs());
   }, [scope]);
   const active = (data?.active ?? []).filter((task) => taskMatchesScope(task, scope));
   const history = (data?.history ?? []).filter((task) => taskMatchesScope(task, scope));
@@ -847,9 +873,11 @@ function PerformanceOverview({ metrics, error, integrations, range, onRange }: {
   const max = Math.max(1, ...trend.map(([, count]) => count));
   const retries = (metrics?.retries ?? []).sort((left, right) => right.count - left.count);
   const rebuilds = (metrics?.chromiumRebuilds ?? []).sort((left, right) => right.count - left.count);
-  const runtime = metrics?.runtime ?? { containerMemoryBytes: null, apiRssBytes: null, runnerRssBytes: null, webExecutorRssBytes: null, webExecutorState: 'offline', librarySyncRssBytes: null, librarySyncState: 'offline', browser: { state: 'unknown', activePages: null, queuedPages: null, navigationCount: null }, engineMemoryReclaim: { state: 'waiting', gcBeforeBytes: null, gcAfterBytes: null } };
+  const runtime = metrics?.runtime ?? { containerMemoryBytes: null, apiRssBytes: null, runnerRssBytes: null, engineState: 'sleeping', engineLastStartedAt: null, engineStartCount: 0, webExecutorRssBytes: null, webExecutorState: 'offline', librarySyncRssBytes: null, librarySyncState: 'offline', browser: { state: 'unknown', activePages: null, queuedPages: null, navigationCount: null }, engineMemoryReclaim: { state: 'waiting', gcBeforeBytes: null, gcAfterBytes: null } };
   const reclaimState = runtime.engineMemoryReclaim.state === 'restarting'
     ? '正在安全重启执行引擎以回收内存'
+    : runtime.engineMemoryReclaim.state === 'process_exit'
+      ? '执行引擎已按空闲策略退出，RSS 已释放'
     : runtime.engineMemoryReclaim.state === 'gc_complete'
       ? `已执行受控 GC${runtime.engineMemoryReclaim.gcBeforeBytes !== null && runtime.engineMemoryReclaim.gcAfterBytes !== null ? `：${formatBytes(runtime.engineMemoryReclaim.gcBeforeBytes)} → ${formatBytes(runtime.engineMemoryReclaim.gcAfterBytes)}` : ''}`
       : runtime.engineMemoryReclaim.state === 'gc_unavailable'
@@ -871,6 +899,7 @@ function PerformanceOverview({ metrics, error, integrations, range, onRange }: {
       </div>
       <p className="browser-runtime-state">网页执行器：{runtime.webExecutorState === 'offline' ? '已回收（Chromium 不存在）' : runtime.webExecutorState === 'busy' ? '正在执行' : runtime.webExecutorState === 'browser_idle' ? '浏览器空闲待命' : '正在启动'}{runtime.webExecutorState === 'offline' ? '' : ` · RSS ${formatBytes(runtime.webExecutorRssBytes)}`} · 浏览器池：{runtime.browser.state === 'active' ? '正在渲染' : runtime.browser.state === 'idle' ? '空闲待命' : runtime.browser.state === 'closed' ? '已回收' : '状态读取中'} · {runtime.browser.activePages ?? 0} 页面执行中 · {runtime.browser.queuedPages ?? 0} 页面排队 · 本轮 {runtime.browser.navigationCount ?? 0} 次导航</p>
       <p className="browser-runtime-state">Jellyfin 同步器：{runtime.librarySyncState === 'offline' ? '已回收' : runtime.librarySyncState === 'running' ? '正在同步' : runtime.librarySyncState === 'starting' ? '正在启动' : runtime.librarySyncState}{runtime.librarySyncState === 'offline' ? '' : ` · RSS ${formatBytes(runtime.librarySyncRssBytes)}`}</p>
+      <p className="browser-runtime-state">统一执行引擎：{runtime.engineState === 'sleeping' ? '在线休眠（有任务会立即启动）' : runtime.engineState === 'starting' ? '正在启动' : runtime.engineState === 'running' ? '正在执行或等待队列' : runtime.engineState === 'error' ? '最近一次异常退出，等待下一次唤醒' : runtime.engineState} · 本次运行已启动 {runtime.engineStartCount} 次{runtime.engineLastStartedAt ? ` · 最近启动 ${formatTime(runtime.engineLastStartedAt)}` : ''}</p>
       <p className="browser-runtime-state">空闲内存回收：{reclaimState}</p>
       <section className="throughput-chart"><header><strong>每分钟处理量</strong><small>最近 60 分钟</small></header><div className="throughput-bars" aria-label="最近 60 分钟处理量趋势">{trend.length ? trend.map(([minute, count]) => <i key={minute} title={`${formatTime(minute)}：${count} 项`} style={{ height: `${Math.max(4, Math.round(count / max * 100))}%` }} />) : <span>尚无处理记录</span>}</div></section>
       <div className="worker-performance-list">{metrics.workers.map((worker) => <article key={worker.scope}><strong>{metricWorkerLabel[worker.scope]}</strong><span>{worker.processed} 项</span><small>平均 {formatDuration(worker.averageDurationMs)}</small></article>)}</div>
@@ -887,26 +916,43 @@ function OperationsCenterPage({ onSummary }: { onSummary: (summary: TasksRespons
   const [metricRange, setMetricRange] = useState<PerformanceMetrics['range']>('24h');
   const load = async () => {
     try {
-      const next = await request<TasksResponse>('/api/tasks?historyLimit=300');
+      const [summary, active, history] = await Promise.all([
+        request<Omit<TasksResponse, 'active' | 'history'>>('/api/tasks/summary'),
+        request<Pick<TasksResponse, 'generatedAt' | 'active'>>('/api/tasks/active'),
+        request<{ items: TaskItem[] }>('/api/tasks/history?limit=50')
+      ]);
+      const next: TasksResponse = { ...summary, active: active.active, history: history.items };
       setData(next); onSummary(next.summary); setError('');
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法读取运行状态。'); }
   };
   useEffect(() => {
     void load();
-    const stream = new EventSource('/api/events?channel=tasks');
-    stream.addEventListener('tasks', () => void load());
-    return () => stream.close();
+    let timer: number | null = null;
+    const refresh = () => {
+      if (timer !== null) return;
+      timer = window.setTimeout(() => { timer = null; void load(); }, 250);
+    };
+    const unsubscribers = [subscribeLive('task-summary', refresh), subscribeLive('task-active', refresh), subscribeLive('services', refresh)];
+    return () => { if (timer !== null) window.clearTimeout(timer); unsubscribers.forEach((unsubscribe) => unsubscribe()); };
   }, []);
   useEffect(() => {
-    const loadMetrics = () => void request<PerformanceMetrics>(`/api/metrics?range=${metricRange}`).then((next) => { setMetrics(next); setMetricsError(''); }).catch(() => {
+    if (scope) return;
+    const loadMetrics = () => void Promise.all([
+      request<Omit<PerformanceMetrics, 'throughput'>>(`/api/metrics/summary?range=${metricRange}`),
+      request<Pick<PerformanceMetrics, 'throughput'>>('/api/metrics/timeseries')
+    ]).then(([summary, timeseries]) => { setMetrics({ ...summary, ...timeseries }); setMetricsError(''); }).catch(() => {
       setMetrics(null);
       setMetricsError('性能指标接口暂不可用。请确认网页服务已更新并重新启动。');
     });
     loadMetrics();
-    const stream = new EventSource('/api/events?channel=metrics');
-    stream.addEventListener('metrics', loadMetrics);
-    return () => stream.close();
-  }, [metricRange]);
+    let timer: number | null = null;
+    const refresh = () => {
+      if (timer !== null) return;
+      timer = window.setTimeout(() => { timer = null; loadMetrics(); }, 1_000);
+    };
+    const unsubscribe = subscribeLive('metrics', refresh);
+    return () => { if (timer !== null) window.clearTimeout(timer); unsubscribe(); };
+  }, [metricRange, scope]);
   const summary = data?.summary;
   return <section id="operations" className="operations-center-page">
     <div className="section-head"><div><h2>运行中心</h2><p>选择一项服务，查看它自己的实时队列、任务进度和运行日志。</p></div><button type="button" className="quiet" onClick={() => void load()}>↻ 刷新</button></div>
@@ -922,7 +968,7 @@ function OperationsCenterPage({ onSummary }: { onSummary: (summary: TasksRespons
       const progress = tasks.find((task) => task.progress?.total && task.progress.current !== null)?.progress ?? null;
       const percent = progress?.total && progress.current !== null ? Math.max(0, Math.min(100, Math.round(progress.current / progress.total * 100))) : null;
       return <button type="button" key={definition.scope} className={`operation-service ${scope === definition.scope ? 'selected' : ''} ${service?.healthy ? service.status : 'error'}`} onClick={() => setScope(definition.scope)}>
-        <span className="operation-service-top"><strong>{definition.label}</strong><em>{service?.status === 'busy' ? '执行中' : service?.healthy ? '在线' : service?.status === 'missing' ? '未启动' : '注意'}</em></span>
+        <span className="operation-service-top"><strong>{definition.label}</strong><em>{service?.status === 'busy' ? '执行中' : service?.status === 'sleeping' ? '休眠' : service?.healthy ? '在线' : service?.status === 'missing' ? '未启动' : '注意'}</em></span>
         <small title={service?.detail}>{service?.detail ?? '正在读取服务状态。'}</small>
         {percent !== null && <div className="operation-service-progress" title={progress?.label ?? undefined}><i style={{ width: `${percent}%` }} /><span>{progress?.current} / {progress?.total}</span></div>}
         <footer>{definition.kinds.length ? <>{running} 执行中 · {waiting} 排队</> : '系统事件与网页接口状态'}<span>→</span></footer>
@@ -946,10 +992,7 @@ function RuntimeLogsPage({ scope }: { scope: OperationScope }) {
   useEffect(() => {
     setLoading(true);
     void loadLogs();
-    const stream = new EventSource('/api/events?channel=logs');
-    const refresh = () => void loadLogs();
-    stream.addEventListener('logs', refresh);
-    return () => stream.close();
+    return subscribeLive('logs', () => void loadLogs());
   }, [scope]);
   const visibleLogs = filter === 'all' ? logs : logs.filter((entry) => entry.level === filter);
   const levelLabel: Record<RuntimeLog['level'], string> = { info: '信息', success: '完成', error: '失败' };
