@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { resetLiveUpdates, subscribeLive } from './live-updates';
+import { resetLiveUpdates, subscribeLive, type LiveEvent } from './live-updates.js';
 
 type Subscription = {
   id: number;
@@ -655,7 +655,7 @@ function ArchivePage({ subscriptions, onNotice }: { subscriptions: Subscription[
   }, [selected?.id, archivePage, archivePageSize, archiveQuery, releaseFrom, releaseTo]);
   useEffect(() => {
     if (!selected) return;
-    return subscribeLive('archive', (event) => {
+    return subscribeLive('archive', (event: LiveEvent) => {
       if (event.subscriptionId === selected.id) void loadArchive(selected, true);
     }, selected.id);
   }, [selected?.id, archivePage, archivePageSize, archiveQuery, releaseFrom, releaseTo]);
