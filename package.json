@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently -k \"npm:dev:api\" \"npm:dev:web\"",
-    "dev:api": "tsx server/index.ts",
+    "dev:wsl": "bash scripts/dev-wsl.sh",
+    "dev:api": "tsx watch server/index.ts",
     "dev:worker": "tsx server/worker.ts",
     "dev:release-worker": "tsx server/release-worker.ts",
     "dev:magnet-worker": "tsx server/magnet-worker.ts",

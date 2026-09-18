@@ -1,4 +1,3 @@
-import fs from 'node:fs';
 import { chromium, type Browser, type Page } from 'playwright';
 import { getOutboundProxyUrl, getRuntimeSettings, recordPerformanceMetric } from './db.js';
 
@@ -16,17 +15,8 @@ export type BrowserPoolSnapshot = {
   openedAt: string | null;
 };
 
-const localBrowserCandidates = [
-  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-  'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-  'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
-];
-
 function executablePath() {
-  if (process.env.PLAYWRIGHT_EXECUTABLE_PATH) return process.env.PLAYWRIGHT_EXECUTABLE_PATH;
-  if (process.platform !== 'win32') return undefined;
-  return localBrowserCandidates.find((candidate) => fs.existsSync(candidate));
+  return process.env.PLAYWRIGHT_EXECUTABLE_PATH || undefined;
 }
 
 /**
