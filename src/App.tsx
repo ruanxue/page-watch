@@ -120,6 +120,42 @@ type RuntimeLog = {
   scope: 'system' | 'check' | 'release' | 'magnet' | 'download' | 'library';
 };
 
+type NotificationChannel = 'wecom' | 'dingtalk' | 'webhook';
+type NotificationEvents = { content_discovered: boolean; operation_failed: boolean; magnet_found: boolean; download_completed: boolean };
+type NotificationSettings = {
+  enabled: boolean;
+  channel: NotificationChannel;
+  events: NotificationEvents;
+  wecomWebhookConfigured: boolean;
+  dingtalkWebhookConfigured: boolean;
+  dingtalkSecretConfigured: boolean;
+  webhookUrlConfigured: boolean;
+  webhookHmacSecretConfigured: boolean;
+};
+type NotificationForm = NotificationSettings & {
+  wecomWebhook: string;
+  dingtalkWebhook: string;
+  dingtalkSecret: string;
+  webhookUrl: string;
+  webhookHmacSecret: string;
+};
+
+const blankNotificationForm: NotificationForm = {
+  enabled: false,
+  channel: 'wecom',
+  events: { content_discovered: true, operation_failed: true, magnet_found: false, download_completed: false },
+  wecomWebhookConfigured: false,
+  dingtalkWebhookConfigured: false,
+  dingtalkSecretConfigured: false,
+  webhookUrlConfigured: false,
+  webhookHmacSecretConfigured: false,
+  wecomWebhook: '',
+  dingtalkWebhook: '',
+  dingtalkSecret: '',
+  webhookUrl: '',
+  webhookHmacSecret: ''
+};
+
 type AuthStatus = { setupRequired: boolean; authenticated: boolean; databaseSetupRequired?: boolean };
 type IntegrationOnboarding = {
   pending: boolean;
@@ -303,6 +339,7 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const [loading, setLoading] = useState(true);
   const [editor, setEditor] = useState<Subscription | null | 'new'>(null);
   const [networkSettingsOpen, setNetworkSettingsOpen] = useState(false);
+  const [notificationSettingsOpen, setNotificationSettingsOpen] = useState(false);
   const [notice, setNotice] = useState('');
   const [view, setView] = useState<View>(viewFromHash);
   const [rulesOpen, setRulesOpen] = useState(() => window.location.hash === '#rules');
@@ -434,6 +471,7 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
         <a className={`nav-item ${view === 'archive' ? 'active' : ''}`} href="#archive"><span>◌</span> 内容档案</a>
         <a className={`nav-item ${view === 'downloads' ? 'active' : ''}`} href="#downloads"><span>⇩</span> 下载与影视库</a>
         <button className="nav-item nav-button" onClick={() => setNetworkSettingsOpen(true)}><span>⌁</span> 网络代理</button>
+        <button className="nav-item nav-button" onClick={() => setNotificationSettingsOpen(true)}><span>✦</span> 通知设置</button>
       </nav>
       <div className={`sidebar-note ${servicesHealthy ? '' : 'needs-attention'}`} title={serviceAttention}>
         <span className="pulse" /> {servicesHealthy ? '后台服务运行正常' : systemStatus ? `服务需要注意（${unhealthyServices.length}）` : '正在确认服务状态…'}
@@ -467,6 +505,7 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
     </section>
     {editor && <Editor item={editor === 'new' ? null : editor} onClose={() => setEditor(null)} onSaved={async () => { setEditor(null); await load(); setNotice('订阅已保存。'); }} onFullScan={async () => { await load(); setNotice('已加入全量检查队列。'); }} onArchiveCleared={async () => { setEditor(null); await load(); setNotice('订阅数据已重置。'); }} />}
     {networkSettingsOpen && <NetworkSettings onClose={() => setNetworkSettingsOpen(false)} onSaved={(message) => { setNetworkSettingsOpen(false); setNotice(message); }} />}
+    {notificationSettingsOpen && <NotificationSettingsModal onClose={() => setNotificationSettingsOpen(false)} onNotice={setNotice} />}
     {integrationOnboarding?.pending && <IntegrationOnboardingGuide
       status={integrationOnboarding}
       onComplete={async () => {
@@ -1540,5 +1579,74 @@ function NetworkSettings({ onClose, onSaved }: { onClose: () => void; onSaved: (
     <section className="runtime-settings-card"><div><strong>运行性能</strong><small>MissAV 始终优先浏览器渲染；不会自动切换为高并发 HTTP 抓取。</small></div><div className="two-col"><label>浏览器模式<select disabled={busy} value={runtime.profile} onChange={(event) => setRuntime((current) => ({ ...current, profile: event.target.value as RuntimeSettings['profile'] }))}><option value="safe">稳妥：单页并发</option><option value="performance">性能：最多两页并发</option></select><span className="field-note">性能模式会提高内存占用和站点访问风险。</span></label><label>空闲回收<select disabled={busy} value={runtime.browserIdleMinutes} onChange={(event) => setRuntime((current) => ({ ...current, browserIdleMinutes: Number(event.target.value) as RuntimeSettings['browserIdleMinutes'] }))}><option value={5}>5 分钟</option><option value={10}>10 分钟（默认）</option><option value={20}>20 分钟</option></select><span className="field-note">没有浏览器任务时，Chromium 会自动退出。</span></label></div></section>
     {error && <p className="form-error">{error}</p>}
     <footer><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" disabled={busy} type="submit">{busy ? '读取中…' : '保存设置'}</button></footer>
+  </form></div>;
+}
+
+function NotificationSettingsModal({ onClose, onNotice }: { onClose: () => void; onNotice: (message: string) => void }) {
+  const [form, setForm] = useState<NotificationForm>(blankNotificationForm);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    void request<NotificationSettings>('/api/settings/notifications')
+      .then((settings) => setForm({ ...settings, wecomWebhook: '', dingtalkWebhook: '', dingtalkSecret: '', webhookUrl: '', webhookHmacSecret: '' }))
+      .catch((reason) => setError(reason instanceof Error ? reason.message : '无法读取通知设置。'))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const update = <K extends keyof NotificationForm>(key: K, value: NotificationForm[K]) => setForm((current) => ({ ...current, [key]: value }));
+  const updateEvent = <K extends keyof NotificationEvents>(key: K, value: boolean) => setForm((current) => ({ ...current, events: { ...current.events, [key]: value } }));
+  const configuredLabel = (configured: boolean) => configured ? '已保存；留空则不修改' : '尚未配置';
+  function payload() {
+    const { wecomWebhook, dingtalkWebhook, dingtalkSecret, webhookUrl, webhookHmacSecret, ...settings } = form;
+    return {
+      ...settings,
+      ...(wecomWebhook.trim() ? { wecomWebhook: wecomWebhook.trim() } : {}),
+      ...(dingtalkWebhook.trim() ? { dingtalkWebhook: dingtalkWebhook.trim() } : {}),
+      ...(dingtalkSecret.trim() ? { dingtalkSecret: dingtalkSecret.trim() } : {}),
+      ...(webhookUrl.trim() ? { webhookUrl: webhookUrl.trim() } : {}),
+      ...(webhookHmacSecret.trim() ? { webhookHmacSecret: webhookHmacSecret.trim() } : {})
+    };
+  }
+  async function save(showNotice = true) {
+    const settings = await request<NotificationSettings>('/api/settings/notifications', { method: 'PUT', body: JSON.stringify(payload()) });
+    setForm({ ...settings, wecomWebhook: '', dingtalkWebhook: '', dingtalkSecret: '', webhookUrl: '', webhookHmacSecret: '' });
+    if (showNotice) onNotice(settings.enabled ? '通知设置已保存并启用。' : '通知设置已保存，通知当前关闭。');
+  }
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true); setError('');
+    try { await save(); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存通知设置。'); }
+    finally { setBusy(false); }
+  }
+  async function test() {
+    setBusy(true); setError('');
+    try {
+      await save(false);
+      await request('/api/settings/notifications/test', { method: 'POST' });
+      onNotice('测试通知已发送。');
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '测试通知发送失败。'); }
+    finally { setBusy(false); }
+  }
+  const channelConfigured = form.channel === 'wecom' ? form.wecomWebhookConfigured : form.channel === 'dingtalk' ? form.dingtalkWebhookConfigured : form.webhookUrlConfigured;
+  const channelInputPresent = form.channel === 'wecom' ? Boolean(form.wecomWebhook.trim()) : form.channel === 'dingtalk' ? Boolean(form.dingtalkWebhook.trim()) : Boolean(form.webhookUrl.trim());
+  return <div className="overlay" role="dialog" aria-modal="true" aria-labelledby="notification-title"><form className="editor notification-settings" onSubmit={(event) => void submit(event)}>
+    <header><div><p className="eyebrow">通知与告警</p><h2 id="notification-title">通知设置</h2></div><button type="button" className="close" onClick={onClose}>×</button></header>
+    <p className="network-copy">默认只提醒新内容与任务最终失败；中间重试不会发送。相同失败会在 30 分钟内合并。</p>
+    <label className="toggle"><input type="checkbox" checked={form.enabled} disabled={loading || busy} onChange={(event) => update('enabled', event.target.checked)} /><span />启用通知</label>
+    <label>主通知渠道<select disabled={loading || busy} value={form.channel} onChange={(event) => update('channel', event.target.value as NotificationChannel)}><option value="wecom">企业微信机器人</option><option value="dingtalk">钉钉机器人</option><option value="webhook">通用 Webhook</option></select><span className="field-note">一次只向一个主渠道发送；切换不会删除其他渠道的已保存地址。</span></label>
+    <section className="runtime-settings-card"><div><strong>通知事件</strong><small>成功类进展默认关闭，需要时可单独开启。</small></div>
+      <label className="toggle"><input type="checkbox" checked={form.events.content_discovered} disabled={loading || busy} onChange={(event) => updateEvent('content_discovered', event.target.checked)} /><span />发现新内容</label>
+      <label className="toggle"><input type="checkbox" checked={form.events.operation_failed} disabled={loading || busy} onChange={(event) => updateEvent('operation_failed', event.target.checked)} /><span />任务最终失败</label>
+      <label className="toggle"><input type="checkbox" checked={form.events.magnet_found} disabled={loading || busy} onChange={(event) => updateEvent('magnet_found', event.target.checked)} /><span />已找到磁力链接</label>
+      <label className="toggle"><input type="checkbox" checked={form.events.download_completed} disabled={loading || busy} onChange={(event) => updateEvent('download_completed', event.target.checked)} /><span />qBittorrent 下载完成</label>
+    </section>
+    {form.channel === 'wecom' && <section className="runtime-settings-card"><div><strong>企业微信机器人</strong><small>在群聊中添加机器人后，粘贴其 Webhook 地址。</small></div><label>Webhook 地址<input type="password" autoComplete="off" disabled={loading || busy} value={form.wecomWebhook} onChange={(event) => update('wecomWebhook', event.target.value)} placeholder={configuredLabel(form.wecomWebhookConfigured)} /><span className="field-note">地址仅保存在服务端并加密存储，不会回显。</span></label></section>}
+    {form.channel === 'dingtalk' && <section className="runtime-settings-card"><div><strong>钉钉机器人</strong><small>可选填写“加签”安全设置中的签名密钥。</small></div><label>Webhook 地址<input type="password" autoComplete="off" disabled={loading || busy} value={form.dingtalkWebhook} onChange={(event) => update('dingtalkWebhook', event.target.value)} placeholder={configuredLabel(form.dingtalkWebhookConfigured)} /></label><label>签名密钥（可选）<input type="password" autoComplete="off" disabled={loading || busy} value={form.dingtalkSecret} onChange={(event) => update('dingtalkSecret', event.target.value)} placeholder={configuredLabel(form.dingtalkSecretConfigured)} /><span className="field-note">若机器人未启用“加签”，请留空。</span></label></section>}
+    {form.channel === 'webhook' && <section className="runtime-settings-card"><div><strong>通用 Webhook</strong><small>以 JSON POST 发送；可选 HMAC-SHA256 签名。</small></div><label>Webhook 地址<input type="password" autoComplete="off" disabled={loading || busy} value={form.webhookUrl} onChange={(event) => update('webhookUrl', event.target.value)} placeholder={configuredLabel(form.webhookUrlConfigured)} /></label><label>HMAC 密钥（可选）<input type="password" autoComplete="off" disabled={loading || busy} value={form.webhookHmacSecret} onChange={(event) => update('webhookHmacSecret', event.target.value)} placeholder={configuredLabel(form.webhookHmacSecretConfigured)} /><span className="field-note">签名在 <code>X-Page-Watch-Signature</code>，时间戳在 <code>X-Page-Watch-Timestamp</code>。</span></label></section>}
+    {!channelConfigured && <p className="field-note">保存并填写当前渠道地址后，才能发送测试通知或启用通知。</p>}
+    {error && <p className="form-error">{error}</p>}
+    <footer><button type="button" className="secondary" onClick={onClose}>关闭</button><button type="button" className="secondary" disabled={loading || busy || (!channelConfigured && !channelInputPresent)} onClick={() => void test()}>{busy ? '处理中…' : '保存并发送测试'}</button><button className="primary" disabled={loading || busy} type="submit">{busy ? '保存中…' : '保存通知设置'}</button></footer>
   </form></div>;
 }

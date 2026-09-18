@@ -41,6 +41,7 @@ export class EngineWakeScheduler {
       UNION ALL SELECT MIN(COALESCE(retry_after, requested_at)) FROM library_jobs WHERE status = 'queued'
       UNION ALL SELECT MIN(COALESCE(retry_after, requested_at)) FROM download_jobs WHERE status = 'queued'
       UNION ALL SELECT MIN(requested_at) FROM library_sync_jobs WHERE status = 'queued'
+      UNION ALL SELECT MIN(next_attempt_at) FROM notification_outbox WHERE status = 'queued'
       UNION ALL SELECT MIN(COALESCE(next_scheduled_at, updated_at)) FROM subscriptions WHERE is_active = 1
     ) AS candidates`);
     let next = queue?.wake_at ? Date.parse(queue.wake_at) : Number.POSITIVE_INFINITY;

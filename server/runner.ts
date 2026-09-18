@@ -15,7 +15,7 @@ let dispatchTimer: NodeJS.Timeout | null = null;
 let idleSince: number | null = null;
 let dispatching = false;
 let shuttingDown = false;
-type HandlerName = 'capture' | 'release' | 'magnet' | 'download' | 'library';
+type HandlerName = 'capture' | 'release' | 'magnet' | 'download' | 'library' | 'notification';
 const activeHandlers = new Set<HandlerName>();
 
 function send(message: unknown) { if (process.send) process.send(message); }
@@ -28,10 +28,18 @@ async function runnableHandlers() {
     EXISTS(SELECT 1 FROM release_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) AS \`release\`,
     EXISTS(SELECT 1 FROM magnet_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) AS magnet,
     EXISTS(SELECT 1 FROM download_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) AS download,
-    EXISTS(SELECT 1 FROM library_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) OR EXISTS(SELECT 1 FROM library_sync_jobs WHERE status = 'queued') AS library`, [now, now, now, now, now, now]);
+    EXISTS(SELECT 1 FROM library_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) OR EXISTS(SELECT 1 FROM library_sync_jobs WHERE status = 'queued') AS library,
+    EXISTS(SELECT 1 FROM notification_outbox WHERE status = 'queued' AND next_attempt_at <= ?) AS notification`, [now, now, now, now, now, now, now]);
   const jellyfin = getJellyfinSettings();
   const dueLibrarySync = jellyfin.enabled && jellyfin.libraryIds.length && (!Date.parse(getSetting('jellyfin_last_synced_at')) || Date.now() - Date.parse(getSetting('jellyfin_last_synced_at')) >= jellyfin.syncIntervalMinutes * 60_000);
-  return { capture: Boolean(rows?.capture), release: Boolean(rows?.release), magnet: Boolean(rows?.magnet), download: Boolean(rows?.download), library: Boolean(rows?.library) || dueLibrarySync };
+  return {
+    capture: Boolean(rows?.capture),
+    release: Boolean(rows?.release),
+    magnet: Boolean(rows?.magnet),
+    download: Boolean(rows?.download),
+    library: Boolean(rows?.library) || dueLibrarySync,
+    notification: Boolean(rows?.notification)
+  };
 }
 
 async function runHandler(name: HandlerName) {
@@ -43,6 +51,7 @@ async function runHandler(name: HandlerName) {
     if (name === 'magnet') await (await import('./magnet-worker.js')).runMagnetWorkerTick();
     if (name === 'download') await (await import('./download-worker.js')).runDownloadWorkerTick();
     if (name === 'library') await (await import('./library-worker.js')).runLibraryWorkerTick();
+    if (name === 'notification') await (await import('./notifications.js')).runNotificationWorkerTick();
   } catch (error) {
     console.error(`Execution handler ${name} failed: ${error instanceof Error ? error.message : String(error)}`);
   } finally {

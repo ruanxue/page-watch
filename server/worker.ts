@@ -3,6 +3,7 @@ import { appendRuntimeLog, db, getSubscription, JOB_PRIORITY, queueJob, recordPe
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { notifyLive } from './live-events.js';
 import { isExecutionEngineDraining } from './engine-drain.js';
+import { createOperationFailureNotification, enqueueNotification } from './notifications.js';
 
 const POLL_MS = 10_000;
 
@@ -112,7 +113,11 @@ async function runNextJob() {
       await appendRuntimeLog({ level: 'info', source: 'worker', subscriptionId: job.subscription_id, jobId: job.id, message: `检查暂时失败，${retryDescription(attempt)}：${message}` });
       await recordPerformanceMetric({ scope: 'capture', metric: 'retry', dimension: retryReason(error) }).catch(() => undefined);
     } else {
-      await db.run("UPDATE jobs SET status = 'failed', finished_at = ?, error = ?, attempt_count = ?, retry_after = NULL WHERE id = ?", [new Date().toISOString(), message, attempt, job.id]);
+      const failedAt = new Date().toISOString();
+      await db.transaction(async (tx) => {
+        await tx.run("UPDATE jobs SET status = 'failed', finished_at = ?, error = ?, attempt_count = ?, retry_after = NULL WHERE id = ?", [failedAt, message, attempt, job.id]);
+        if (subscription) await enqueueNotification(createOperationFailureNotification({ operation: '网页检查', error: message, subscription, jobId: job.id, occurredAt: failedAt }), tx);
+      });
       await appendRuntimeLog({ level: 'error', source: 'worker', subscriptionId: job.subscription_id, jobId: job.id, message: `检查失败：${message}` });
       await recordPerformanceMetric({ scope: 'capture', metric: 'processed', dimension: 'failed', durationMs: Date.now() - startedAtMs }).catch(() => undefined);
     }

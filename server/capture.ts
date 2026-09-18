@@ -9,6 +9,7 @@ import { archiveKey } from './jellyfin-match.js';
 import { missavBackupUrl, missavFallbackFailure, shouldTryMissavBackup } from './site-fallback.js';
 import { assertSafeUrl as validateSafeUrl } from './url-safety.js';
 import { readResponseText } from './bounded-body.js';
+import { createContentDiscoveredNotification, enqueueNotification } from './notifications.js';
 
 
 export type CaptureResult = {
@@ -174,6 +175,7 @@ async function archiveNewItems(subscription: Subscription, items: CapturedItem[]
   const archivedCount = await client.get<{ count: number }>('SELECT COUNT(*) AS count FROM archive_entries WHERE subscription_id = ?', [subscription.id]);
   const previousItems = new Set(archiveItems(subscription.last_content ?? ''));
   const additions = (archivedCount?.count ?? 0) === 0 ? currentItems : currentItems.filter((item) => !previousItems.has(item.content));
+  const insertedItems: CapturedItem[] = [];
   for (const item of additions) {
     const detailUrl = item.detailUrl;
     const releaseUrl = rules.releaseDate.enabled ? expandReleaseUrl(rules.releaseDate.urlTemplate, { detailUrl, subscriptionUrl: subscription.url, content: item.content }) : null;
@@ -182,6 +184,7 @@ async function archiveNewItems(subscription: Subscription, items: CapturedItem[]
       (subscription_id, content, title, archive_code, content_hash, first_seen_at, detail_url, release_status, magnet_status, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [subscription.id, item.content, item.title, archiveKey(item.content), hash(item.content), capturedAt, detailUrl, releaseUrl ? 'pending' : 'unsearched', rules.magnet.enabled && !shouldCheckLibraryFirst ? 'pending' : 'unsearched', capturedAt]);
     if (result.changes) {
+      insertedItems.push(item);
       if (rules.magnet.enabled) {
         if (shouldCheckLibraryFirst) {
           await client.run(`UPDATE archive_entries SET jellyfin_status = 'pending', jellyfin_error = NULL, updated_at = ? WHERE id = ?`, [capturedAt, result.lastInsertRowid]);
@@ -195,7 +198,7 @@ async function archiveNewItems(subscription: Subscription, items: CapturedItem[]
     if (item.title) await client.run(`UPDATE archive_entries SET title = ?, updated_at = ?
       WHERE subscription_id = ? AND content_hash = ? AND (title IS NULL OR title <> ?)`, [item.title, capturedAt, subscription.id, hash(item.content), item.title]);
   }
-  return additions.length;
+  return insertedItems;
 }
 
 async function captureWithFallback<T>(url: URL, read: (target: URL) => Promise<T>) {
@@ -235,13 +238,17 @@ export async function captureSubscription(subscription: Subscription, browserPri
   const content = contentForItems(items);
   const result = { ...first, items, content, hash: hash(content) };
   const changed = Boolean(subscription.last_hash && subscription.last_hash !== result.hash);
+  const hadBaseline = Boolean(subscription.last_hash);
   const now = new Date().toISOString();
   const stored = await db.transaction(async (tx) => {
     const write = await tx.run(`UPDATE subscriptions
       SET last_checked_at = ?, last_hash = ?, last_content = ?, last_error = NULL, updated_at = ?
       WHERE id = ? AND updated_at = ?`, [now, result.hash, result.content, now, subscription.id, subscription.updated_at]);
-    const addedCount = write.changes ? await archiveNewItems(subscription, result.items, now, tx) : 0;
-    return { stored: Boolean(write.changes), addedCount };
+    const addedItems = write.changes ? await archiveNewItems(subscription, result.items, now, tx) : [];
+    if (write.changes && hadBaseline && addedItems.length) {
+      await enqueueNotification(createContentDiscoveredNotification({ subscription, count: addedItems.length, items: addedItems, occurredAt: now }), tx);
+    }
+    return { stored: Boolean(write.changes), addedCount: addedItems.length };
   });
   if (stored.addedCount) scheduleSubscriptionProgressRebuild(subscription.id);
   return { ...result, changed, capturedAt: now, ...stored, itemCount: result.items.length, totalPages: 1 };
@@ -296,6 +303,7 @@ async function captureInitialFullScan(subscription: Subscription, browserPriorit
   let content = '';
   const contentHash = crypto.createHash('sha256');
   let addedCount = 0;
+  const addedItems: CapturedItem[] = [];
   let stored = false;
   await db.transaction(async (tx) => {
     // Keep the staged archive invisible until all pages have arrived and this
@@ -328,7 +336,12 @@ async function captureInitialFullScan(subscription: Subscription, browserPriorit
         WHERE subscription_id = ? AND scan_id = ? AND id > ? ORDER BY page_number ASC, item_position ASC, id ASC LIMIT 200`, [subscription.id, scanId, cursor]);
       if (!batch.length) break;
       cursor = batch[batch.length - 1].id;
-      addedCount += await archiveNewItems(subscription, batch.map((item) => ({ content: item.content, title: item.title, detailUrl: item.detail_url })), now, tx);
+      const inserted = await archiveNewItems(subscription, batch.map((item) => ({ content: item.content, title: item.title, detailUrl: item.detail_url })), now, tx);
+      addedCount += inserted.length;
+      if (addedItems.length < 5) addedItems.push(...inserted.slice(0, 5 - addedItems.length));
+    }
+    if (subscription.last_hash && addedCount) {
+      await enqueueNotification(createContentDiscoveredNotification({ subscription, count: addedCount, items: addedItems, occurredAt: now }), tx);
     }
     await tx.run('DELETE FROM initial_scan_items WHERE subscription_id = ? AND scan_id = ?', [subscription.id, scanId]);
   });

@@ -6,6 +6,7 @@ import { findCachedJellyfinMedia } from './jellyfin-cache.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { notifyLive } from './live-events.js';
 import { isExecutionEngineDraining } from './engine-drain.js';
+import { createOperationFailureNotification, enqueueNotification } from './notifications.js';
 
 // An idle worker only needs a modest polling cadence. Once a complete local
 // Jellyfin index exists, however, individual matches are indexed MySQL reads
@@ -49,7 +50,11 @@ async function runNextLibrarySync() {
     await appendRuntimeLog({ level: 'success', source: 'library', message: `Jellyfin 影视库${job.trigger_type === 'manual' ? '手动' : '定时'}同步任务完成：扫描 ${result.scanned} 个媒体项目，${result.matched} 条已入库。` });
   } catch (error) {
     const message = error instanceof Error ? error.message : '未知 Jellyfin 同步错误';
-    await db.run("UPDATE library_sync_jobs SET status = 'failed', finished_at = ?, error = ?, progress_phase = 'failed', progress_label = ? WHERE id = ?", [new Date().toISOString(), message, '同步失败', job.id]);
+    const failedAt = new Date().toISOString();
+    await db.transaction(async (tx) => {
+      await tx.run("UPDATE library_sync_jobs SET status = 'failed', finished_at = ?, error = ?, progress_phase = 'failed', progress_label = ? WHERE id = ?", [failedAt, message, '同步失败', job.id]);
+      await enqueueNotification(createOperationFailureNotification({ operation: 'Jellyfin 影视库同步', error: message, jobId: job.id, occurredAt: failedAt }), tx);
+    });
     await reportIntegrationStatus('jellyfin', 'degraded', '最近一次媒体库同步失败').catch(() => undefined);
     await appendRuntimeLog({ level: 'error', source: 'library', message: `Jellyfin 影视库${job.trigger_type === 'manual' ? '手动' : '定时'}同步失败：${message}` });
   } finally {

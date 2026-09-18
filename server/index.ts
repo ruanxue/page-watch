@@ -14,6 +14,7 @@ import { authenticate, clearSessionCookie, configurePassword, createSession, ses
 import { getInspectionRules, inspectionRulesJson, normalizeInspectionRules } from './inspection-rules.js';
 import { ExecutionEngineController } from './engine-controller.js';
 import { EngineWakeScheduler } from './engine-wake-scheduler.js';
+import { createTestNotification, deliverNotification, getNotificationSettings, normalizeNotificationSettings, publicNotificationSettings, saveNotificationSettings, type NotificationSettingsPayload } from './notifications.js';
 
 // Docker creates a random private token in its entry script. Keep a fixed,
 // loopback-only fallback for `npm run dev`, so the on-demand child can still
@@ -1308,6 +1309,29 @@ app.put('/api/settings/runtime', async (request, reply) => {
   return settings;
 });
 
+app.get('/api/settings/notifications', async () => publicNotificationSettings());
+app.put('/api/settings/notifications', async (request, reply) => {
+  try {
+    const settings = normalizeNotificationSettings(request.body as NotificationSettingsPayload);
+    await saveNotificationSettings(settings);
+    await appendRuntimeLog({ level: 'info', source: 'system', message: settings.enabled ? '通知设置已保存并启用。' : '通知设置已保存，通知当前处于关闭状态。' });
+    return publicNotificationSettings(settings);
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : '无法保存通知设置。' });
+  }
+});
+app.post('/api/settings/notifications/test', async (_request, reply) => {
+  try {
+    await deliverNotification(createTestNotification(), getNotificationSettings());
+    await appendRuntimeLog({ level: 'success', source: 'system', message: '通知测试发送成功。' });
+    return { ok: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '通知测试发送失败。';
+    await appendRuntimeLog({ level: 'error', source: 'system', message: `通知测试发送失败：${message}` });
+    return reply.code(400).send({ error: message });
+  }
+});
+
 app.get('/api/settings/qbittorrent', async () => publicQbittorrentSettings());
 app.put('/api/settings/qbittorrent', async (request, reply) => {
   try {
@@ -1584,7 +1608,7 @@ function startOperationalServices() {
         await reportWorkerHeartbeat('download', `正在轻量同步 ${active?.count ?? 0} 个 qBittorrent 下载状态`, 'busy');
         process.env.PAGE_WATCH_WORKER_AUTOSTART = '0';
         const observer = await import('./download-worker.js');
-        await observer.observeQbittorrentDownloads();
+        if (await observer.observeQbittorrentDownloads()) await engineWakeScheduler.wake('下载完成通知已入队');
       }
       downloadObserverTimer = setTimeout(() => void scheduleDownloadObserver(), delay);
       downloadObserverTimer.unref();

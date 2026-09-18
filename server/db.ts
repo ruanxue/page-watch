@@ -8,7 +8,11 @@ import { decryptSecret, encryptSecret, isEncryptedSecret, readApplicationEncrypt
 import { defaultRuntimeSettings, normalizeRuntimeSettings, type RuntimeSettings } from './runtime-settings.js';
 
 const applicationEncryptionKey = readApplicationEncryptionKey();
-const sensitiveSettingKeys = new Set(['jellyfin_api_key', 'qbit_api_key', 'qbit_password', 'app_auth_session_secret']);
+const sensitiveSettingKeys = new Set([
+  'jellyfin_api_key', 'qbit_api_key', 'qbit_password', 'app_auth_session_secret',
+  'notification_wecom_webhook', 'notification_dingtalk_webhook', 'notification_dingtalk_secret',
+  'notification_webhook_url', 'notification_webhook_hmac_secret'
+]);
 
 let pool: Pool | null = null;
 let databaseSource: 'environment' | 'saved' | null = null;
@@ -418,6 +422,7 @@ export async function getExecutionEngineQueueState() {
       UNION ALL SELECT status FROM library_jobs
       UNION ALL SELECT status FROM download_jobs
       UNION ALL SELECT status FROM library_sync_jobs
+      UNION ALL SELECT status FROM notification_outbox
     ) AS execution_queue`);
   return { queued: Number(row?.queued ?? 0), running: Number(row?.running ?? 0), busyWorkers: Number(row?.busy_workers ?? 0) };
 }

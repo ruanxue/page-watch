@@ -200,6 +200,36 @@ export async function ensureMySqlSchema(pool: Pool) {
     PRIMARY KEY (\`key\`)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 
+  // Notification events are durable independently from the work that created
+  // them. The single execution engine can leave memory while retries wait,
+  // then resume from this outbox without re-running the original task.
+  await pool.query(`CREATE TABLE IF NOT EXISTS notification_outbox (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    event_type VARCHAR(32) NOT NULL,
+    payload MEDIUMTEXT NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'queued',
+    attempt_count INT NOT NULL DEFAULT 0,
+    next_attempt_at VARCHAR(40) NOT NULL,
+    created_at VARCHAR(40) NOT NULL,
+    started_at VARCHAR(40) NULL,
+    sent_at VARCHAR(40) NULL,
+    failed_at VARCHAR(40) NULL,
+    last_error TEXT NULL,
+    PRIMARY KEY (id),
+    KEY idx_notification_outbox_due (status, next_attempt_at, id),
+    KEY idx_notification_outbox_created (created_at DESC, id DESC)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+
+  // A 30-minute lease is stronger than an in-memory debounce and continues
+  // to suppress the same final failure after a restart or worker hand-off.
+  await pool.query(`CREATE TABLE IF NOT EXISTS notification_dedupes (
+    dedupe_key CHAR(64) NOT NULL,
+    expires_at VARCHAR(40) NOT NULL,
+    created_at VARCHAR(40) NOT NULL,
+    PRIMARY KEY (dedupe_key),
+    KEY idx_notification_dedupes_expiry (expires_at)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+
   await pool.query(`CREATE TABLE IF NOT EXISTS subscription_presets (
     id INT NOT NULL AUTO_INCREMENT,
     name VARCHAR(255) NOT NULL,

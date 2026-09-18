@@ -3,6 +3,7 @@ import { addMagnetToQbittorrent, getQbittorrentTorrentFiles, getQbittorrentTorre
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { notifyLive } from './live-events.js';
 import { isExecutionEngineDraining } from './engine-drain.js';
+import { createDownloadCompletedNotification, createOperationFailureNotification, enqueueNotification } from './notifications.js';
 
 const POLL_MS = 1_000;
 const STATUS_SYNC_MS = 10_000;
@@ -22,11 +23,13 @@ type DownloadJob = {
   download_torrent_hash: string | null;
   attempt_count: number;
   priority: number;
+  subscription_name: string;
 };
 
 type TrackedDownload = {
   id: number;
   subscription_id: number;
+  subscription_name: string;
   content: string;
   download_status: string;
   download_added_at: string | null;
@@ -49,8 +52,8 @@ function displaySize(bytes: number) {
 
 async function runNextDownloadJob() {
   if (isExecutionEngineDraining()) return;
-  const job = await db.get<DownloadJob>(`SELECT j.id, j.archive_entry_id, j.attempt_count, j.priority, a.subscription_id, a.content, a.magnet_value, a.download_status, a.download_torrent_hash
-    FROM download_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id
+  const job = await db.get<DownloadJob>(`SELECT j.id, j.archive_entry_id, j.attempt_count, j.priority, a.subscription_id, a.content, a.magnet_value, a.download_status, a.download_torrent_hash, s.name AS subscription_name
+    FROM download_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id
     WHERE j.status = 'queued' AND (j.retry_after IS NULL OR j.retry_after <= ?) ORDER BY j.priority DESC, j.requested_at ASC, j.id ASC LIMIT 1`, [new Date().toISOString()]);
   if (!job) return;
   if (isExecutionEngineDraining()) return;
@@ -128,6 +131,7 @@ async function runNextDownloadJob() {
         await tx.run("UPDATE download_jobs SET status = 'queued', started_at = NULL, finished_at = NULL, error = ?, attempt_count = ?, retry_after = ? WHERE id = ?", [message, attempt, new Date(Date.now() + retryDelayMs(attempt)).toISOString(), job.id]);
       } else {
         await tx.run("UPDATE download_jobs SET status = 'failed', finished_at = ?, error = ?, attempt_count = ?, retry_after = NULL WHERE id = ?", [finishedAt, message, attempt, job.id]);
+        await enqueueNotification(createOperationFailureNotification({ operation: 'qBittorrent 下载提交', error: message, subscription: { id: job.subscription_id, name: job.subscription_name }, jobId: job.id, content: job.content, occurredAt: finishedAt }), tx);
       }
     });
     await appendRuntimeLog({ level: shouldRetry ? 'info' : 'error', source: 'download', subscriptionId: job.subscription_id, jobId: job.id, message: shouldRetry ? `qBittorrent 提交“${job.content}”暂时失败，${retryDescription(attempt)}：${message}` : `qBittorrent 提交“${job.content}”失败：${message}` });
@@ -225,21 +229,21 @@ async function stopCompletedTorrents(settings: ReturnType<typeof getQbittorrentS
  * states for submitted magnets and never sends another add request here.
  */
 async function syncDownloadStates() {
-  if (Date.now() - lastStatusSyncAt < STATUS_SYNC_MS) return;
+  if (Date.now() - lastStatusSyncAt < STATUS_SYNC_MS) return false;
   lastStatusSyncAt = Date.now();
   const settings = getQbittorrentSettings();
-  if (!settings.enabled) return;
-  const entries = await db.all<TrackedDownload>(`SELECT id, subscription_id, content, download_status, download_added_at, download_checked_at, download_torrent_hash, magnet_value,
-    download_progress, download_speed, download_size, downloaded_bytes, download_save_path, download_content_path, download_filter_min_size_bytes
-    FROM archive_entries
-    WHERE download_status IN ('added', 'waiting', 'downloading', 'paused', 'completed')`);
-  if (!entries.length) return;
+  if (!settings.enabled) return false;
+  const entries = await db.all<TrackedDownload>(`SELECT a.id, a.subscription_id, s.name AS subscription_name, a.content, a.download_status, a.download_added_at, a.download_checked_at, a.download_torrent_hash, a.magnet_value,
+    a.download_progress, a.download_speed, a.download_size, a.downloaded_bytes, a.download_save_path, a.download_content_path, a.download_filter_min_size_bytes
+    FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
+    WHERE a.download_status IN ('added', 'waiting', 'downloading', 'paused', 'completed')`);
+  if (!entries.length) return false;
 
   const tracked = entries.map((entry) => ({
     ...entry,
     hash: entry.download_torrent_hash?.toLowerCase() || torrentHashFromMagnet(entry.magnet_value ?? '')
   })).filter((entry): entry is TrackedDownload & { hash: string } => Boolean(entry.hash));
-  if (!tracked.length) return;
+  if (!tracked.length) return false;
 
   const remote = await getQbittorrentTorrentStates(settings, tracked.map((entry) => entry.hash));
   const byHash = new Map(remote.map((torrent) => [torrent.hash, torrent]));
@@ -289,12 +293,13 @@ async function syncDownloadStates() {
   });
   const stoppedIds = await stopCompletedTorrents(settings, stopCandidates);
   const checkedAt = new Date().toISOString();
-  const completed: Array<Pick<TrackedDownload, 'id' | 'subscription_id' | 'content'>> = [];
+  const completed: Array<Pick<TrackedDownload, 'id' | 'subscription_id' | 'subscription_name' | 'content'>> = [];
   const removed: Array<Pick<TrackedDownload, 'subscription_id' | 'content'>> = [];
   const filtered: Array<{ subscription_id: number; content: string; skippedCount: number; minimum: number }> = [];
   const accepted: Array<{ subscription_id: number; content: string; selectedCount: number; skippedCount: number; selectedBytes: number; minimum: number }> = [];
   const changedSubscriptionIds = new Set<number>();
   const checkedAtMs = Date.parse(checkedAt);
+  let notificationQueued = false;
   await db.transaction(async (tx) => {
     for (const entry of tracked) {
       const torrent = byHash.get(entry.hash);
@@ -356,7 +361,11 @@ async function syncDownloadStates() {
             selectedBytes: plan.selectedFiles.reduce((total, file) => total + file.size, 0),
             minimum
           });
-          if (status === 'completed' && entry.download_status !== 'completed') completed.push({ id: entry.id, subscription_id: entry.subscription_id, content: entry.content });
+          if (status === 'completed' && entry.download_status !== 'completed') {
+            completed.push({ id: entry.id, subscription_id: entry.subscription_id, subscription_name: entry.subscription_name, content: entry.content });
+            const queued = await enqueueNotification(createDownloadCompletedNotification({ subscription: { id: entry.subscription_id, name: entry.subscription_name }, content: entry.content, occurredAt: checkedAt }), tx);
+            notificationQueued ||= queued.queued;
+          }
           changedSubscriptionIds.add(entry.subscription_id);
           continue;
         }
@@ -369,7 +378,9 @@ async function syncDownloadStates() {
         changedSubscriptionIds.add(entry.subscription_id);
       }
       if (next === 'completed' && entry.download_status !== 'completed') {
-        completed.push({ id: entry.id, subscription_id: entry.subscription_id, content: entry.content });
+        completed.push({ id: entry.id, subscription_id: entry.subscription_id, subscription_name: entry.subscription_name, content: entry.content });
+        const queued = await enqueueNotification(createDownloadCompletedNotification({ subscription: { id: entry.subscription_id, name: entry.subscription_name }, content: entry.content, occurredAt: checkedAt }), tx);
+        notificationQueued ||= queued.queued;
       }
     }
   });
@@ -395,6 +406,7 @@ async function syncDownloadStates() {
     notifyLive('archive', subscriptionId);
   }
   if (completed.length || removed.length || filtered.length || accepted.length) notifyLive('tasks');
+  return notificationQueued;
 }
 
 async function tick(observe = true) {
@@ -427,7 +439,7 @@ export async function runDownloadWorkerTick() { await tick(false); }
 export function isDownloadWorkerBusy() { return working; }
 export async function observeQbittorrentDownloads() {
   await refreshSettings();
-  await syncDownloadStates();
+  return syncDownloadStates();
 }
 
 if (process.env.PAGE_WATCH_WORKER_AUTOSTART !== '0') {
