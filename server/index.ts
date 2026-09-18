@@ -429,7 +429,7 @@ async function listSubscriptions() {
         AND (s.initial_scan_run_id IS NOT NULL OR EXISTS(SELECT 1 FROM jobs j WHERE j.subscription_id = s.id AND j.status IN ('queued', 'running')))
       THEN 1 ELSE NULL
     END AS full_scan_active
-    FROM subscriptions s LEFT JOIN subscription_progress p ON p.subscription_id = s.id ORDER BY s.updated_at DESC, s.id DESC`);
+    FROM subscriptions s LEFT JOIN subscription_progress p ON p.subscription_id = s.id ORDER BY s.id ASC`);
 }
 
 app.get('/api/health', async () => ({ ok: true }));

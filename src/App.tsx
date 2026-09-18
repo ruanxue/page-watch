@@ -316,7 +316,7 @@ type View = 'subscriptions' | 'archive' | 'settings' | 'operations';
 function viewFromHash(): View {
   if (window.location.hash === '#logs' || window.location.hash === '#tasks' || window.location.hash === '#operations') return 'operations';
   if (window.location.hash === '#archive' || window.location.hash === '#activity') return 'archive';
-  if (['#settings', '#downloads', '#network', '#notifications'].includes(window.location.hash)) return 'settings';
+  if (['#settings', '#downloads', '#network', '#runtime', '#notifications'].includes(window.location.hash)) return 'settings';
   return 'subscriptions';
 }
 
@@ -465,8 +465,8 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
       <div className="brand"><span className="brand-mark">⌁</span><span>PAGE WATCH</span></div>
       <nav aria-label="主导航">
         <a className={`nav-item ${view === 'subscriptions' ? 'active' : ''}`} href="#subscriptions"><span>◉</span> 订阅中心 <b>{stats.total}</b></a>
-        <a className={`nav-item ${view === 'operations' ? 'active' : ''}`} href="#operations"><span>◫</span> 运行中心 {taskCount ? <b>{taskCount}</b> : null}</a>
         <a className={`nav-item ${view === 'archive' ? 'active' : ''}`} href="#archive"><span>◌</span> 内容档案</a>
+        <a className={`nav-item ${view === 'operations' ? 'active' : ''}`} href="#operations"><span>◫</span> 运行中心 {taskCount ? <b>{taskCount}</b> : null}</a>
         <a className={`nav-item ${view === 'settings' ? 'active' : ''}`} href="#settings"><span>⚙</span> 设置</a>
       </nav>
       <div className={`sidebar-note ${servicesHealthy ? '' : 'needs-attention'}`} title={serviceAttention}>
@@ -1350,8 +1350,8 @@ function QbittorrentSettingsPage({ onNotice }: { onNotice: (message: string) => 
       <section className="qbit-card"><div className="qbit-card-head"><div><h3>连接设置</h3><p>填写 qBittorrent 的 Web UI 地址，而不是下载端口。</p></div><label className="toggle"><input type="checkbox" checked={form.enabled} disabled={loading || busy} onChange={(event) => update('enabled', event.target.checked)} /><span />启用下载</label></div>
       <label>Web UI 地址<input disabled={loading || busy} value={form.url} onChange={(event) => update('url', event.target.value)} placeholder="例如 http://192.168.1.20:8080" /><span className="field-note">若 qBittorrent 在 NAS 上，请填写 NAS 可访问的局域网地址和 Web UI 端口。</span></label>
       <label>认证方式<select disabled={loading || busy} value={form.authMode} onChange={(event) => update('authMode', event.target.value as QbittorrentForm['authMode'])}><option value="api_key">API 密钥（推荐，qBittorrent 5.2+）</option><option value="password">用户名与密码（旧版兼容）</option></select></label>
-      {form.authMode === 'api_key' ? <label>API 密钥<input type="password" autoComplete="off" disabled={loading || busy} value={form.apiKey} onChange={(event) => update('apiKey', event.target.value)} placeholder={apiKeyConfigured ? '已保存；留空则不修改' : '以 qbt_ 开头的 API 密钥'} /><span className="field-note">在 qBittorrent 的“设置 → Web UI → API Key”生成。密钥仅保存于服务端，不会再返回或显示。</span></label> : <div className="two-col"><label>用户名<input autoComplete="username" disabled={loading || busy} value={form.username} onChange={(event) => update('username', event.target.value)} placeholder="qBittorrent 用户名" /></label><label>密码<input type="password" autoComplete="current-password" disabled={loading || busy} value={form.password} onChange={(event) => update('password', event.target.value)} placeholder={passwordConfigured ? '已保存；留空则不修改' : 'qBittorrent 密码'} /><span className="field-note">密码仅保存于服务端，不会再返回或显示。</span></label></div>}</section>
-      <section className="qbit-card"><div className="qbit-card-head"><div><h3>下载规则</h3><p>这些选项会在 qBittorrent 接收任务时一并带上。</p></div></div><div className="two-col"><label>分类<input disabled={loading || busy} value={form.category} onChange={(event) => update('category', event.target.value)} placeholder="可选，例如 movies" /></label><label>标签<input disabled={loading || busy} value={form.tags} onChange={(event) => update('tags', event.target.value)} placeholder="可选，多个标签用逗号分隔" /></label></div><label>保存路径<input disabled={loading || busy} value={form.savePath} onChange={(event) => update('savePath', event.target.value)} placeholder="可选，使用 qBittorrent 容器内可见的路径" /><span className="field-note">Docker 中的路径必须是 qBittorrent 容器已经挂载的目录，例如 <code>/downloads</code>。</span></label><label className="toggle qbit-auto-toggle"><input type="checkbox" checked={form.autoDownload} disabled={loading || busy || !form.enabled} onChange={(event) => update('autoDownload', event.target.checked)} /><span />新找到磁力链接后自动提交下载</label><label>最小单文件大小（MB）<input type="number" min="0" max="1048576" step="1" disabled={loading || busy || !form.enabled} value={form.autoDownloadMinSizeMb} onChange={(event) => update('autoDownloadMinSizeMb', Number(event.target.value))} /><span className="field-note">设为 0 不筛选。大于 0 时，Page Watch 提交给 qBittorrent 的任务会先读取种子文件列表，将小于该大小的广告、图片等文件设为“不下载”，仅下载达到该大小的文件。</span></label><label className="toggle qbit-auto-toggle"><input type="checkbox" checked={form.stopAfterDownload} disabled={loading || busy || !form.enabled} onChange={(event) => update('stopAfterDownload', event.target.checked)} /><span />下载完成后停止做种<span className="field-note">仅停止由本网站提交且已完成的任务。</span></label></section>
+      {form.authMode === 'api_key' ? <label>API 密钥<input type="password" autoComplete="off" disabled={loading || busy} value={form.apiKey} onChange={(event) => update('apiKey', event.target.value)} placeholder={apiKeyConfigured ? '已保存；留空则不修改' : '以 qbt_ 开头的 API 密钥'} /><span className="field-note">在 qBittorrent 的“设置 → Web UI → API Key”生成。密钥仅保存于服务端，不会再返回或显示。</span></label> : <div className="two-col"><label>用户名<input autoComplete="username" disabled={loading || busy} value={form.username} onChange={(event) => update('username', event.target.value)} placeholder="qBittorrent 用户名" /></label><label>密码<input type="password" autoComplete="current-password" disabled={loading || busy} value={form.password} onChange={(event) => update('password', event.target.value)} placeholder={passwordConfigured ? '已保存；留空则不修改' : 'qBittorrent 密码'} /><span className="field-note">密码仅保存于服务端，不会再返回或显示。</span></label></div>}<div className="qbit-card-divider" />
+      <div className="qbit-card-section"><div className="qbit-card-head"><div><h3>下载规则</h3><p>这些选项会在 qBittorrent 接收任务时一并带上。</p></div></div><div className="two-col"><label>分类<input disabled={loading || busy} value={form.category} onChange={(event) => update('category', event.target.value)} placeholder="可选，例如 movies" /></label><label>标签<input disabled={loading || busy} value={form.tags} onChange={(event) => update('tags', event.target.value)} placeholder="可选，多个标签用逗号分隔" /></label></div><label>保存路径<input disabled={loading || busy} value={form.savePath} onChange={(event) => update('savePath', event.target.value)} placeholder="可选，使用 qBittorrent 容器内可见的路径" /><span className="field-note">Docker 中的路径必须是 qBittorrent 容器已经挂载的目录，例如 <code>/downloads</code>。</span></label><label className="toggle qbit-auto-toggle"><input type="checkbox" checked={form.autoDownload} disabled={loading || busy || !form.enabled} onChange={(event) => update('autoDownload', event.target.checked)} /><span />新找到磁力链接后自动提交下载</label><label>最小单文件大小（MB）<input type="number" min="0" max="1048576" step="1" disabled={loading || busy || !form.enabled} value={form.autoDownloadMinSizeMb} onChange={(event) => update('autoDownloadMinSizeMb', Number(event.target.value))} /><span className="field-note">设为 0 不筛选。大于 0 时，Page Watch 提交给 qBittorrent 的任务会先读取种子文件列表，将小于该大小的广告、图片等文件设为“不下载”，仅下载达到该大小的文件。</span></label><label className="toggle qbit-auto-toggle"><input type="checkbox" checked={form.stopAfterDownload} disabled={loading || busy || !form.enabled} onChange={(event) => update('stopAfterDownload', event.target.checked)} /><span />下载完成后停止做种<span className="field-note">仅停止由本网站提交且已完成的任务。</span></label></div></section>
       {error && <p className="form-error">{error}</p>}
       <div className="qbit-form-actions"><button type="button" className="secondary" disabled={loading || busy} onClick={() => void testConnection()}>{busy ? '处理中…' : '保存并测试连接'}</button><button className="primary" disabled={loading || busy} type="submit">{busy ? '保存中…' : '保存下载设置'}</button></div>
     </form>
@@ -1360,12 +1360,9 @@ function QbittorrentSettingsPage({ onNotice }: { onNotice: (message: string) => 
 
 function SettingsPage({ onNotice }: { onNotice: (message: string) => void }) {
   return <section id="settings" className="settings-page">
-    <div className="settings-intro">
-      <div><h2>外部服务与通知</h2><p>在这里统一管理下载、影视库、网络连接和消息通知。密钥与地址仅保存在服务端，不会在页面中回显。</p></div>
-      <nav className="settings-jump-links" aria-label="设置分区"><a href="#downloads">下载与影视库</a><a href="#network">网络代理</a><a href="#notifications">通知设置</a></nav>
-    </div>
     <QbittorrentSettingsPage onNotice={onNotice} />
     <NetworkSettings embedded onSaved={onNotice} />
+    <RuntimeSettingsPanel onNotice={onNotice} />
     <NotificationSettingsModal embedded onNotice={onNotice} />
   </section>;
 }
@@ -1555,38 +1552,57 @@ function PresetManager({ presets, onClose, onChanged, embedded = false, register
 function NetworkSettings({ onClose, onSaved, embedded = false }: { onClose?: () => void; onSaved: (message: string) => void; embedded?: boolean }) {
   const [proxyUrl, setProxyUrl] = useState('');
   const [fromEnvironment, setFromEnvironment] = useState(false);
-  const [runtime, setRuntime] = useState<RuntimeSettings>({ profile: 'safe', browserIdleMinutes: 10 });
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState('');
   useEffect(() => {
-    void Promise.all([
-      request<{ proxyUrl: string; fromEnvironment: boolean }>('/api/settings/network'),
-      request<RuntimeSettings>('/api/settings/runtime')
-    ])
-      .then(([network, nextRuntime]) => { setProxyUrl(network.proxyUrl); setFromEnvironment(network.fromEnvironment); setRuntime(nextRuntime); })
+    void request<{ proxyUrl: string; fromEnvironment: boolean }>('/api/settings/network')
+      .then((network) => { setProxyUrl(network.proxyUrl); setFromEnvironment(network.fromEnvironment); })
       .catch((reason) => setError(reason.message))
       .finally(() => setBusy(false));
   }, []);
   async function save(event: FormEvent) {
     event.preventDefault(); setBusy(true); setError('');
     try {
-      const [network] = await Promise.all([
-        fromEnvironment ? Promise.resolve<{ active: boolean } | null>(null) : request<{ active: boolean }>('/api/settings/network', { method: 'PUT', body: JSON.stringify({ proxyUrl }) }),
-        request<RuntimeSettings>('/api/settings/runtime', { method: 'PUT', body: JSON.stringify(runtime) })
-      ]);
-      onSaved(network ? (network.active ? '网络代理与运行性能已保存。' : '运行性能已保存，网络代理已关闭。') : '运行性能已保存。');
+      const network = fromEnvironment ? null : await request<{ active: boolean }>('/api/settings/network', { method: 'PUT', body: JSON.stringify({ proxyUrl }) });
+      onSaved(network ? (network.active ? '网络代理已保存。' : '网络代理已关闭。') : '网络代理由环境变量管理。');
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存设置。'); }
     finally { setBusy(false); }
   }
   const form = <form className={`editor network-settings ${embedded ? 'embedded-settings-form' : ''}`} onSubmit={save}>
-    <header><div><p className="eyebrow">网络连接与运行性能</p><h2 id="network-title">网络代理</h2></div>{onClose && <button type="button" className="close" onClick={onClose}>×</button>}</header>
+    <header><div><p className="eyebrow">网络连接</p><h2 id="network-title">网络代理</h2></div>{onClose && <button type="button" className="close" onClick={onClose}>×</button>}</header>
     <p className="network-copy">配置后，普通网页抓取和浏览器渲染都会通过同一个代理连接。</p>
     {fromEnvironment ? <div className="environment-note">当前代理由 Docker 的 <code>OUTBOUND_PROXY</code> 环境变量提供。请在部署配置中修改。</div> : <label>HTTP / HTTPS 代理地址<input disabled={busy} value={proxyUrl} onChange={(event) => setProxyUrl(event.target.value)} placeholder="例如 http://192.168.1.10:7890" /><span className="field-note">留空并保存即可关闭代理。NAS 中请填写代理服务的局域网 IP，不要填写 127.0.0.1。</span></label>}
-    <section className="runtime-settings-card"><div><strong>运行性能</strong><small>MissAV 始终优先浏览器渲染；不会自动切换为高并发 HTTP 抓取。</small></div><div className="two-col"><label>浏览器模式<select disabled={busy} value={runtime.profile} onChange={(event) => setRuntime((current) => ({ ...current, profile: event.target.value as RuntimeSettings['profile'] }))}><option value="safe">稳妥：单页并发</option><option value="performance">性能：最多两页并发</option></select><span className="field-note">性能模式会提高内存占用和站点访问风险。</span></label><label>空闲回收<select disabled={busy} value={runtime.browserIdleMinutes} onChange={(event) => setRuntime((current) => ({ ...current, browserIdleMinutes: Number(event.target.value) as RuntimeSettings['browserIdleMinutes'] }))}><option value={5}>5 分钟</option><option value={10}>10 分钟（默认）</option><option value={20}>20 分钟</option></select><span className="field-note">没有浏览器任务时，Chromium 会自动退出。</span></label></div></section>
     {error && <p className="form-error">{error}</p>}
     <footer>{onClose && <button type="button" className="secondary" onClick={onClose}>取消</button>}<button className="primary" disabled={busy} type="submit">{busy ? '读取中…' : '保存设置'}</button></footer>
   </form>;
   return embedded ? <section id="network" className="settings-section">{form}</section> : <div className="overlay" role="dialog" aria-modal="true" aria-labelledby="network-title">{form}</div>;
+}
+
+function RuntimeSettingsPanel({ onNotice }: { onNotice: (message: string) => void }) {
+  const [runtime, setRuntime] = useState<RuntimeSettings>({ profile: 'safe', browserIdleMinutes: 10 });
+  const [busy, setBusy] = useState(true);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    void request<RuntimeSettings>('/api/settings/runtime')
+      .then(setRuntime)
+      .catch((reason) => setError(reason instanceof Error ? reason.message : '无法读取运行性能设置。'))
+      .finally(() => setBusy(false));
+  }, []);
+  async function save(event: FormEvent) {
+    event.preventDefault(); setBusy(true); setError('');
+    try {
+      setRuntime(await request<RuntimeSettings>('/api/settings/runtime', { method: 'PUT', body: JSON.stringify(runtime) }));
+      onNotice('运行性能已保存。');
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存运行性能设置。'); }
+    finally { setBusy(false); }
+  }
+  return <section id="runtime" className="settings-section"><form className="editor embedded-settings-form runtime-settings" onSubmit={save}>
+    <header><div><p className="eyebrow">执行引擎</p><h2>运行性能</h2></div></header>
+    <p className="network-copy">MissAV 始终优先浏览器渲染；不会自动切换为高并发 HTTP 抓取。</p>
+    <section className="runtime-settings-card"><div><strong>浏览器资源</strong><small>仅在有网页任务时启动 Chromium；空闲后会自动退出以回收内存。</small></div><div className="two-col"><label>浏览器模式<select disabled={busy} value={runtime.profile} onChange={(event) => setRuntime((current) => ({ ...current, profile: event.target.value as RuntimeSettings['profile'] }))}><option value="safe">稳妥：单页并发</option><option value="performance">性能：最多两页并发</option></select><span className="field-note">性能模式会提高内存占用和站点访问风险。</span></label><label>空闲回收<select disabled={busy} value={runtime.browserIdleMinutes} onChange={(event) => setRuntime((current) => ({ ...current, browserIdleMinutes: Number(event.target.value) as RuntimeSettings['browserIdleMinutes'] }))}><option value={5}>5 分钟</option><option value={10}>10 分钟（默认）</option><option value={20}>20 分钟</option></select><span className="field-note">没有浏览器任务时，Chromium 会自动退出。</span></label></div></section>
+    {error && <p className="form-error">{error}</p>}
+    <footer><button className="primary" disabled={busy} type="submit">{busy ? '读取中…' : '保存运行性能'}</button></footer>
+  </form></section>;
 }
 
 function NotificationSettingsModal({ onClose, onNotice, embedded = false }: { onClose?: () => void; onNotice: (message: string) => void; embedded?: boolean }) {
