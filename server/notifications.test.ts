@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import test from 'node:test';
-import { buildNotificationRequest, dingtalkSignature, notificationMarkdown, webhookSignature } from './notification-protocol.js';
+import { buildNotificationRequest, dingtalkSignature, notificationMarkdown, notificationText, webhookSignature } from './notification-protocol.js';
 import type { NotificationPayload, NotificationSettings } from './notifications.js';
 
 const baseSettings: NotificationSettings = {
@@ -43,15 +43,24 @@ test('formats concise content digests with at most five entries', () => {
   assert.equal((markdown.match(/ITEM-/g) ?? []).length, 5);
 });
 
-test('formats enterprise WeCom and DingTalk robot requests', async () => {
+test('formats a personal-WeChat-compatible Enterprise WeCom text request and a DingTalk Markdown request', async () => {
   const wecom = buildNotificationRequest(testPayload, { ...baseSettings, channel: 'wecom' }, '1720000000000');
-  assert.equal(JSON.parse(wecom.body).msgtype, 'markdown');
+  const wecomBody = JSON.parse(wecom.body);
+  assert.equal(wecomBody.msgtype, 'text');
+  assert.match(wecomBody.text.content, /Page Watch 测试通知/);
+  assert.doesNotMatch(wecomBody.text.content, /\*\*/);
 
   const dingtalk = buildNotificationRequest(testPayload, { ...baseSettings, channel: 'dingtalk' }, '1720000000000');
   const url = new URL(dingtalk.url);
   assert.equal(JSON.parse(dingtalk.body).msgtype, 'markdown');
   assert.ok(url.searchParams.get('timestamp'));
   assert.ok(url.searchParams.get('sign'));
+});
+
+test('keeps WeCom text messages within its 2048-byte limit without splitting Chinese characters', () => {
+  const message = notificationText({ ...testPayload, summary: '新'.repeat(2_000) });
+  assert.ok(Buffer.byteLength(message, 'utf8') <= 2_048);
+  assert.doesNotMatch(message, /�/);
 });
 
 test('signs generic webhook bodies with timestamp and HMAC-SHA256', async () => {
