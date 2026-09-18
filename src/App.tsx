@@ -311,12 +311,12 @@ function shortUrl(value: string) {
 
 const weekdayLabels = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
 
-type View = 'subscriptions' | 'archive' | 'downloads' | 'operations';
+type View = 'subscriptions' | 'archive' | 'settings' | 'operations';
 
 function viewFromHash(): View {
   if (window.location.hash === '#logs' || window.location.hash === '#tasks' || window.location.hash === '#operations') return 'operations';
   if (window.location.hash === '#archive' || window.location.hash === '#activity') return 'archive';
-  if (window.location.hash === '#downloads') return 'downloads';
+  if (['#settings', '#downloads', '#network', '#notifications'].includes(window.location.hash)) return 'settings';
   return 'subscriptions';
 }
 
@@ -338,8 +338,6 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
   const [loading, setLoading] = useState(true);
   const [editor, setEditor] = useState<Subscription | null | 'new'>(null);
-  const [networkSettingsOpen, setNetworkSettingsOpen] = useState(false);
-  const [notificationSettingsOpen, setNotificationSettingsOpen] = useState(false);
   const [notice, setNotice] = useState('');
   const [view, setView] = useState<View>(viewFromHash);
   const [rulesOpen, setRulesOpen] = useState(() => window.location.hash === '#rules');
@@ -469,9 +467,7 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
         <a className={`nav-item ${view === 'subscriptions' ? 'active' : ''}`} href="#subscriptions"><span>◉</span> 订阅中心 <b>{stats.total}</b></a>
         <a className={`nav-item ${view === 'operations' ? 'active' : ''}`} href="#operations"><span>◫</span> 运行中心 {taskCount ? <b>{taskCount}</b> : null}</a>
         <a className={`nav-item ${view === 'archive' ? 'active' : ''}`} href="#archive"><span>◌</span> 内容档案</a>
-        <a className={`nav-item ${view === 'downloads' ? 'active' : ''}`} href="#downloads"><span>⇩</span> 下载与影视库</a>
-        <button className="nav-item nav-button" onClick={() => setNetworkSettingsOpen(true)}><span>⌁</span> 网络代理</button>
-        <button className="nav-item nav-button" onClick={() => setNotificationSettingsOpen(true)}><span>✦</span> 通知设置</button>
+        <a className={`nav-item ${view === 'settings' ? 'active' : ''}`} href="#settings"><span>⚙</span> 设置</a>
       </nav>
       <div className={`sidebar-note ${servicesHealthy ? '' : 'needs-attention'}`} title={serviceAttention}>
         <span className="pulse" /> {servicesHealthy ? '后台服务运行正常' : systemStatus ? `服务需要注意（${unhealthyServices.length}）` : '正在确认服务状态…'}
@@ -482,7 +478,7 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
 
     <section className="workspace">
       <header className="topbar">
-        <div><p className="eyebrow">自托管网页监测</p><h1>{view === 'archive' ? '内容档案' : view === 'downloads' ? '下载与影视库' : view === 'operations' ? '运行中心' : '订阅中心'}</h1></div>
+        <div><p className="eyebrow">自托管网页监测</p><h1>{view === 'archive' ? '内容档案' : view === 'settings' ? '设置' : view === 'operations' ? '运行中心' : '订阅中心'}</h1></div>
         {view === 'subscriptions' && <div className="topbar-actions"><button type="button" className="secondary" onClick={() => openRules()}>检查规则</button><button className="primary" onClick={() => setEditor('new')}><span>＋</span> 新建订阅</button></div>}
       </header>
 
@@ -496,16 +492,14 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
         <div className="section-head"><div><h2>你的网页订阅</h2><p>用 CSS Selector 精确读取所需内容</p></div><button className="quiet" onClick={() => void load()}>↻ 刷新</button></div>
         {loading ? <div className="empty">正在读取订阅…</div> : subscriptions.length === 0 ? <Empty onCreate={() => setEditor('new')} /> :
           <div className="subscription-grid">
-            {subscriptions.map((item) => <SubscriptionCard key={item.id} item={item} onRun={runNow} onEdit={setEditor} onConfigure={() => openRules()} onToggle={toggleSubscription} onDelete={remove} />)}
+            {subscriptions.map((item) => <SubscriptionCard key={item.id} item={item} onRun={runNow} onEdit={setEditor} onToggle={toggleSubscription} onDelete={remove} />)}
           </div>}
       </section>
       <RulesLibrary open={rulesOpen} onToggle={() => setRulesOpen((current) => !current)} onNotice={setNotice} />
-      </> : view === 'archive' ? <ArchivePage subscriptions={subscriptions} onNotice={setNotice} /> : view === 'downloads' ? <QbittorrentSettingsPage onNotice={setNotice} /> : <OperationsCenterPage onSummary={setTaskSummary} />}
+      </> : view === 'archive' ? <ArchivePage subscriptions={subscriptions} onNotice={setNotice} /> : view === 'settings' ? <SettingsPage onNotice={setNotice} /> : <OperationsCenterPage onSummary={setTaskSummary} />}
       {notice && <div className="toast" role="status">{notice}</div>}
     </section>
     {editor && <Editor item={editor === 'new' ? null : editor} onClose={() => setEditor(null)} onSaved={async () => { setEditor(null); await load(); setNotice('订阅已保存。'); }} onFullScan={async () => { await load(); setNotice('已加入全量检查队列。'); }} onArchiveCleared={async () => { setEditor(null); await load(); setNotice('订阅数据已重置。'); }} />}
-    {networkSettingsOpen && <NetworkSettings onClose={() => setNetworkSettingsOpen(false)} onSaved={(message) => { setNetworkSettingsOpen(false); setNotice(message); }} />}
-    {notificationSettingsOpen && <NotificationSettingsModal onClose={() => setNotificationSettingsOpen(false)} onNotice={setNotice} />}
     {integrationOnboarding?.pending && <IntegrationOnboardingGuide
       status={integrationOnboarding}
       onComplete={async () => {
@@ -515,7 +509,7 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
       onOpenSettings={async () => {
         await request('/api/setup/integrations/complete', { method: 'POST' });
         setIntegrationOnboarding((current) => current ? { ...current, pending: false } : current);
-        window.location.hash = '#downloads';
+        window.location.hash = '#settings';
       }}
     />}
   </main>;
@@ -617,11 +611,11 @@ function Empty({ onCreate }: { onCreate: () => void }) {
   return <div className="empty-card"><div className="empty-orbit">⌁</div><h3>还没有订阅</h3><p>添加一个网页地址，填入目标元素的 CSS Selector，<br />系统就会为你定时记录内容变化。</p><button className="primary" onClick={onCreate}>新建第一个订阅</button><small>示例：<code>#price</code>、<code>.article-body</code>、<code>[data-status]</code></small></div>;
 }
 
-function SubscriptionCard({ item, onRun, onEdit, onConfigure, onToggle, onDelete }: { item: Subscription; onRun: (item: Subscription) => void; onEdit: (item: Subscription) => void; onConfigure: (item: Subscription) => void; onToggle: (item: Subscription) => void; onDelete: (item: Subscription) => void }) {
+function SubscriptionCard({ item, onRun, onEdit, onToggle, onDelete }: { item: Subscription; onRun: (item: Subscription) => void; onEdit: (item: Subscription) => void; onToggle: (item: Subscription) => void; onDelete: (item: Subscription) => void }) {
   return <article className={`subscription-card ${item.last_error ? 'has-error' : ''}`}>
     <div className="card-top"><div className="site-ident">{shortUrl(item.url).slice(0, 1).toUpperCase()}</div><div className="card-title"><h3>{item.name}</h3><a href={item.url} target="_blank" rel="noreferrer">{shortUrl(item.url)} ↗</a></div><button className="icon-button" title="编辑订阅" onClick={() => onEdit(item)}>⋯</button></div>
     {item.last_error && <div className="error-line">上次失败：{item.last_error}</div>}
-    <footer className="card-footer"><button type="button" className={`subscription-switch ${item.is_active ? 'on' : ''}`} role="switch" aria-checked={Boolean(item.is_active)} disabled={!item.selector} title={!item.selector ? '请先配置读取规则' : item.is_active ? '暂停订阅' : '启用订阅'} onClick={() => onToggle(item)}><span aria-hidden="true" /><em>{item.is_active ? '已启用' : '已暂停'}</em></button>{item.is_active && <span>{scheduleLabel(item)}</span>}<span>上次：{formatTime(item.last_checked_at)}</span>{Boolean(item.full_scan_active) && <span className="scan-progress"><b>{item.initial_scan_total ? `全量 ${item.initial_scan_pages_completed}/${item.initial_scan_total}` : '全量准备中'}</b><i><em style={{ width: item.initial_scan_total ? `${Math.min(100, item.initial_scan_pages_completed / item.initial_scan_total * 100)}%` : '18%' }} /></i></span>}<div className="card-actions"><button type="button" onClick={() => onConfigure(item)}>{item.selector ? '规则' : '配置规则'}</button><button disabled={!item.selector} title={!item.selector ? '请先配置读取规则' : undefined} onClick={() => onRun(item)}>立即检查</button><button className="danger" onClick={() => onDelete(item)}>删除</button></div></footer>
+    <footer className="card-footer"><button type="button" className={`subscription-switch ${item.is_active ? 'on' : ''}`} role="switch" aria-checked={Boolean(item.is_active)} disabled={!item.selector} title={!item.selector ? '请先配置读取规则' : item.is_active ? '暂停订阅' : '启用订阅'} onClick={() => onToggle(item)}><span aria-hidden="true" /><em>{item.is_active ? '已启用' : '已暂停'}</em></button>{item.is_active && <span>{scheduleLabel(item)}</span>}<span>上次：{formatTime(item.last_checked_at)}</span>{Boolean(item.full_scan_active) && <span className="scan-progress"><b>{item.initial_scan_total ? `全量 ${item.initial_scan_pages_completed}/${item.initial_scan_total}` : '全量准备中'}</b><i><em style={{ width: item.initial_scan_total ? `${Math.min(100, item.initial_scan_pages_completed / item.initial_scan_total * 100)}%` : '18%' }} /></i></span>}<div className="card-actions"><button disabled={!item.selector} title={!item.selector ? '请先配置读取规则' : undefined} onClick={() => onRun(item)}>立即检查</button><button className="danger" onClick={() => onDelete(item)}>删除</button></div></footer>
   </article>;
 }
 
@@ -1364,6 +1358,18 @@ function QbittorrentSettingsPage({ onNotice }: { onNotice: (message: string) => 
   </section><JellyfinSettingsPanel onNotice={onNotice} /></>;
 }
 
+function SettingsPage({ onNotice }: { onNotice: (message: string) => void }) {
+  return <section id="settings" className="settings-page">
+    <div className="settings-intro">
+      <div><h2>外部服务与通知</h2><p>在这里统一管理下载、影视库、网络连接和消息通知。密钥与地址仅保存在服务端，不会在页面中回显。</p></div>
+      <nav className="settings-jump-links" aria-label="设置分区"><a href="#downloads">下载与影视库</a><a href="#network">网络代理</a><a href="#notifications">通知设置</a></nav>
+    </div>
+    <QbittorrentSettingsPage onNotice={onNotice} />
+    <NetworkSettings embedded onSaved={onNotice} />
+    <NotificationSettingsModal embedded onNotice={onNotice} />
+  </section>;
+}
+
 type JellyfinSettings = {
   enabled: boolean;
   url: string;
@@ -1546,7 +1552,7 @@ function PresetManager({ presets, onClose, onChanged, embedded = false, register
   return <section className={`preset-manager ${embedded ? 'embedded' : ''}`} aria-label="管理 MissAV 列表读取规则">{!embedded && <div className="preset-manager-head"><div><strong>列表读取规则</strong><small>可自由新增、编辑或删除新建订阅可套用的列表读取规则。</small></div><button type="button" className="close" onClick={onClose}>×</button></div>}{error && <p className="form-error">{error}</p>}<div className="preset-rule-list">{presets.map((preset) => <article key={preset.id}><div><strong>{preset.name}</strong><small>{preset.description || preset.selector}</small></div><code>{preset.selector}</code><div><button type="button" onClick={() => startEdit(preset)}>编辑</button><button type="button" className="danger" disabled={busy} onClick={() => void remove(preset)}>删除</button></div></article>)}</div><div className="preset-manager-actions">{!embedded && <button type="button" className="secondary" onClick={onClose}>完成</button>}<button type="button" className="primary" onClick={() => startEdit('new')}>＋ 新建规则</button></div></section>;
 }
 
-function NetworkSettings({ onClose, onSaved }: { onClose: () => void; onSaved: (message: string) => void }) {
+function NetworkSettings({ onClose, onSaved, embedded = false }: { onClose?: () => void; onSaved: (message: string) => void; embedded?: boolean }) {
   const [proxyUrl, setProxyUrl] = useState('');
   const [fromEnvironment, setFromEnvironment] = useState(false);
   const [runtime, setRuntime] = useState<RuntimeSettings>({ profile: 'safe', browserIdleMinutes: 10 });
@@ -1572,17 +1578,18 @@ function NetworkSettings({ onClose, onSaved }: { onClose: () => void; onSaved: (
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存设置。'); }
     finally { setBusy(false); }
   }
-  return <div className="overlay" role="dialog" aria-modal="true" aria-labelledby="network-title"><form className="editor network-settings" onSubmit={save}>
-    <header><div><p className="eyebrow">网络连接与运行性能</p><h2 id="network-title">网络代理</h2></div><button type="button" className="close" onClick={onClose}>×</button></header>
+  const form = <form className={`editor network-settings ${embedded ? 'embedded-settings-form' : ''}`} onSubmit={save}>
+    <header><div><p className="eyebrow">网络连接与运行性能</p><h2 id="network-title">网络代理</h2></div>{onClose && <button type="button" className="close" onClick={onClose}>×</button>}</header>
     <p className="network-copy">配置后，普通网页抓取和浏览器渲染都会通过同一个代理连接。</p>
     {fromEnvironment ? <div className="environment-note">当前代理由 Docker 的 <code>OUTBOUND_PROXY</code> 环境变量提供。请在部署配置中修改。</div> : <label>HTTP / HTTPS 代理地址<input disabled={busy} value={proxyUrl} onChange={(event) => setProxyUrl(event.target.value)} placeholder="例如 http://192.168.1.10:7890" /><span className="field-note">留空并保存即可关闭代理。NAS 中请填写代理服务的局域网 IP，不要填写 127.0.0.1。</span></label>}
     <section className="runtime-settings-card"><div><strong>运行性能</strong><small>MissAV 始终优先浏览器渲染；不会自动切换为高并发 HTTP 抓取。</small></div><div className="two-col"><label>浏览器模式<select disabled={busy} value={runtime.profile} onChange={(event) => setRuntime((current) => ({ ...current, profile: event.target.value as RuntimeSettings['profile'] }))}><option value="safe">稳妥：单页并发</option><option value="performance">性能：最多两页并发</option></select><span className="field-note">性能模式会提高内存占用和站点访问风险。</span></label><label>空闲回收<select disabled={busy} value={runtime.browserIdleMinutes} onChange={(event) => setRuntime((current) => ({ ...current, browserIdleMinutes: Number(event.target.value) as RuntimeSettings['browserIdleMinutes'] }))}><option value={5}>5 分钟</option><option value={10}>10 分钟（默认）</option><option value={20}>20 分钟</option></select><span className="field-note">没有浏览器任务时，Chromium 会自动退出。</span></label></div></section>
     {error && <p className="form-error">{error}</p>}
-    <footer><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" disabled={busy} type="submit">{busy ? '读取中…' : '保存设置'}</button></footer>
-  </form></div>;
+    <footer>{onClose && <button type="button" className="secondary" onClick={onClose}>取消</button>}<button className="primary" disabled={busy} type="submit">{busy ? '读取中…' : '保存设置'}</button></footer>
+  </form>;
+  return embedded ? <section id="network" className="settings-section">{form}</section> : <div className="overlay" role="dialog" aria-modal="true" aria-labelledby="network-title">{form}</div>;
 }
 
-function NotificationSettingsModal({ onClose, onNotice }: { onClose: () => void; onNotice: (message: string) => void }) {
+function NotificationSettingsModal({ onClose, onNotice, embedded = false }: { onClose?: () => void; onNotice: (message: string) => void; embedded?: boolean }) {
   const [form, setForm] = useState<NotificationForm>(blankNotificationForm);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -1631,8 +1638,8 @@ function NotificationSettingsModal({ onClose, onNotice }: { onClose: () => void;
   }
   const channelConfigured = form.channel === 'wecom' ? form.wecomWebhookConfigured : form.channel === 'dingtalk' ? form.dingtalkWebhookConfigured : form.webhookUrlConfigured;
   const channelInputPresent = form.channel === 'wecom' ? Boolean(form.wecomWebhook.trim()) : form.channel === 'dingtalk' ? Boolean(form.dingtalkWebhook.trim()) : Boolean(form.webhookUrl.trim());
-  return <div className="overlay" role="dialog" aria-modal="true" aria-labelledby="notification-title"><form className="editor notification-settings" onSubmit={(event) => void submit(event)}>
-    <header><div><p className="eyebrow">通知与告警</p><h2 id="notification-title">通知设置</h2></div><button type="button" className="close" onClick={onClose}>×</button></header>
+  const formContent = <form className={`editor notification-settings ${embedded ? 'embedded-settings-form' : ''}`} onSubmit={(event) => void submit(event)}>
+    <header><div><p className="eyebrow">通知与告警</p><h2 id="notification-title">通知设置</h2></div>{onClose && <button type="button" className="close" onClick={onClose}>×</button>}</header>
     <p className="network-copy">默认只提醒新内容与任务最终失败；中间重试不会发送。相同失败会在 30 分钟内合并。</p>
     <label className="toggle"><input type="checkbox" checked={form.enabled} disabled={loading || busy} onChange={(event) => update('enabled', event.target.checked)} /><span />启用通知</label>
     <label>主通知渠道<select disabled={loading || busy} value={form.channel} onChange={(event) => update('channel', event.target.value as NotificationChannel)}><option value="wecom">企业微信机器人</option><option value="dingtalk">钉钉机器人</option><option value="webhook">通用 Webhook</option></select><span className="field-note">一次只向一个主渠道发送；切换不会删除其他渠道的已保存地址。</span></label>
@@ -1647,6 +1654,7 @@ function NotificationSettingsModal({ onClose, onNotice }: { onClose: () => void;
     {form.channel === 'webhook' && <section className="runtime-settings-card"><div><strong>通用 Webhook</strong><small>以 JSON POST 发送；可选 HMAC-SHA256 签名。</small></div><label>Webhook 地址<input type="password" autoComplete="off" disabled={loading || busy} value={form.webhookUrl} onChange={(event) => update('webhookUrl', event.target.value)} placeholder={configuredLabel(form.webhookUrlConfigured)} /></label><label>HMAC 密钥（可选）<input type="password" autoComplete="off" disabled={loading || busy} value={form.webhookHmacSecret} onChange={(event) => update('webhookHmacSecret', event.target.value)} placeholder={configuredLabel(form.webhookHmacSecretConfigured)} /><span className="field-note">签名在 <code>X-Page-Watch-Signature</code>，时间戳在 <code>X-Page-Watch-Timestamp</code>。</span></label></section>}
     {!channelConfigured && <p className="field-note">保存并填写当前渠道地址后，才能发送测试通知或启用通知。</p>}
     {error && <p className="form-error">{error}</p>}
-    <footer><button type="button" className="secondary" onClick={onClose}>关闭</button><button type="button" className="secondary" disabled={loading || busy || (!channelConfigured && !channelInputPresent)} onClick={() => void test()}>{busy ? '处理中…' : '保存并发送测试'}</button><button className="primary" disabled={loading || busy} type="submit">{busy ? '保存中…' : '保存通知设置'}</button></footer>
-  </form></div>;
+    <footer>{onClose && <button type="button" className="secondary" onClick={onClose}>关闭</button>}<button type="button" className="secondary" disabled={loading || busy || (!channelConfigured && !channelInputPresent)} onClick={() => void test()}>{busy ? '处理中…' : '保存并发送测试'}</button><button className="primary" disabled={loading || busy} type="submit">{busy ? '保存中…' : '保存通知设置'}</button></footer>
+  </form>;
+  return embedded ? <section id="notifications" className="settings-section">{formContent}</section> : <div className="overlay" role="dialog" aria-modal="true" aria-labelledby="notification-title">{formContent}</div>;
 }
