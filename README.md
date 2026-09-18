@@ -21,7 +21,7 @@ docker compose up -d --build
 
 打开 `http://NAS_IP:3030`。Compose 只启动一个 Page Watch 容器；容器内常驻的只有网页 API/SSE 进程与轻量执行引擎。网页检查、发行日期、磁力检索与预览由按需网页执行器处理，并和 Chromium 一起在设定的空闲时间后退出；Jellyfin 全量同步同样由按需同步器分页写入 MySQL。任务中心仍展示六项独立逻辑服务，订阅、档案、队列、下载与影视库状态、运行日志保存在 MySQL；请按你的 NAS 备份策略备份 `page_watch` 数据库。
 
-部署前请复制 `.env.example` 为 `.env` 并填写独立的 `APP_ENCRYPTION_KEY`。首次打开网页会先要求填写 MySQL 地址、库名、账号和密码；连接测试及建表成功后，连接信息会以 AES-256-GCM 加密保存在 Docker 的 `./data/database-bootstrap.json`，容器升级不会丢失。用 `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"` 生成主密钥并长期妥善保存；遗失它后需重新填写数据库及外部服务凭据。既有部署仍可保留 `MYSQL_*` 环境变量以兼容旧方式，但网页不能覆盖由环境变量管理的连接。健康检查以 `curl /api/ready` 完成，不会周期性启动额外 Node 进程；安装引导尚未完成时它返回 503 是正常状态。
+部署前请复制 `.env.example` 为 `.env`；个人部署无需填写 `APP_ENCRYPTION_KEY`，首次启动会在 Docker 持久目录自动生成 `data/app-encryption-key` 并在后续更新复用。首次打开网页会先要求填写 MySQL 地址、库名、账号和密码；连接测试及建表成功后，连接信息会以 AES-256-GCM 加密保存在 Docker 的 `./data/database-bootstrap.json`，容器升级不会丢失。若需要让密钥独立于数据卷管理，可在 `.env` 显式填写 32 字节 Base64URL 格式的 `APP_ENCRYPTION_KEY`；已有部署务必保留原值，避免旧凭据无法解密。既有部署仍可保留 `MYSQL_*` 环境变量以兼容旧方式，但网页不能覆盖由环境变量管理的连接。健康检查以 `curl /api/ready` 完成，不会周期性启动额外 Node 进程；安装引导尚未完成时它返回 503 是正常状态。
 
 ### 首次访问与安全
 

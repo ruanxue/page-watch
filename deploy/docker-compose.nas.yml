@@ -10,7 +10,9 @@ x-page-watch-environment: &page-watch-environment
   MYSQL_USER: ${MYSQL_USER:-}
   MYSQL_PASSWORD: ${MYSQL_PASSWORD:-}
   MYSQL_CONNECTION_LIMIT: ${MYSQL_CONNECTION_LIMIT:-3}
-  APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?请在 deploy/.env 配置 APP_ENCRYPTION_KEY}
+  # Optional advanced override. When blank, a random key is generated once in
+  # the mounted data directory and survives image/container updates.
+  APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:-}
 
 x-page-watch-service: &page-watch-service
   image: ${PAGE_WATCH_IMAGE:?请在 deploy/.env 配置 PAGE_WATCH_IMAGE}
@@ -31,6 +33,7 @@ services:
       <<: *page-watch-environment
       PORT: 3030
       PAGE_WATCH_BOOTSTRAP_PATH: /data/database-bootstrap.json
+      PAGE_WATCH_ENCRYPTION_KEY_PATH: /data/app-encryption-key
       APP_SESSION_SECURE: ${APP_SESSION_SECURE:-false}
     volumes:
       - ../data:/data

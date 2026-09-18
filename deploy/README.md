@@ -32,7 +32,7 @@
    它会创建 `page-watch-backend` 共享网络和 `deploy/.env`。编辑 `deploy/.env`：
 
    - `PAGE_WATCH_IMAGE` 改成实际 GHCR 地址，例如 `ghcr.io/your-name/page-watch:stable`；
-   - 用 `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"` 生成并填入 `APP_ENCRYPTION_KEY`；此密钥只用于加密数据库中的外部服务凭据，后续升级必须保持不变；
+   - 个人部署可将 `APP_ENCRYPTION_KEY` 留空；服务会在 `data/app-encryption-key` 自动生成并持久保存密钥。高级部署可自行填写 32 字节 Base64URL 密钥，后续升级必须保持不变；
    - NAS 没有代理时保持 `OUTBOUND_PROXY=` 为空。
 
 6. 将 MySQL 与 Jellyfin 服务也加入 `page-watch-backend` 网络。长期方案是在各自 Compose 文件中声明这个 `external` 网络；临时检查可以使用：

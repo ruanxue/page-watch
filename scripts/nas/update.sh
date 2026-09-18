@@ -10,13 +10,6 @@ if [[ ! -f "$ENV_FILE" ]]; then
   exit 1
 fi
 
-APP_ENCRYPTION_KEY="$(awk -F= '/^APP_ENCRYPTION_KEY=/ { value = $2 } END { print value }' "$ENV_FILE" | tr -d '\r')"
-if [[ -z "$APP_ENCRYPTION_KEY" || "$APP_ENCRYPTION_KEY" == REPLACE_WITH_* || ! "$APP_ENCRYPTION_KEY" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
-  echo "请先在 $ENV_FILE 配置 APP_ENCRYPTION_KEY（32 字节 Base64URL 主密钥）。" >&2
-  echo "生成命令：node -e \"console.log(require('crypto').randomBytes(32).toString('base64url'))\"" >&2
-  exit 1
-fi
-
 COMPOSE=(docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE")
 
 echo "拉取 Page Watch 镜像…"

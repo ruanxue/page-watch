@@ -25,7 +25,7 @@ if ! docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
 fi
 
 if [[ "$CREATED_ENV" == true ]]; then
-  echo "已创建 $ENV_FILE。请先编辑其中的镜像地址和 APP_ENCRYPTION_KEY，再运行："
+  echo "已创建 $ENV_FILE。请先编辑其中的镜像地址，再运行："
   echo "  bash scripts/nas/update.sh"
   exit 0
 fi

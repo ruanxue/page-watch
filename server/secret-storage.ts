@@ -1,9 +1,10 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 
 const prefix = 'pwenc:v1:';
 
-export function readApplicationEncryptionKey(raw = process.env.APP_ENCRYPTION_KEY) {
-  if (!raw?.trim()) throw new Error('缺少 APP_ENCRYPTION_KEY。请在部署 .env 中配置 32 字节 Base64URL 加密主密钥。');
+function decodeApplicationEncryptionKey(raw: string) {
   const encoded = raw.trim();
   if (!/^[A-Za-z0-9_-]+$/.test(encoded)) throw new Error('APP_ENCRYPTION_KEY 必须是有效的 Base64URL 字符串。');
   let key: Buffer;
@@ -11,6 +12,36 @@ export function readApplicationEncryptionKey(raw = process.env.APP_ENCRYPTION_KE
   catch { throw new Error('APP_ENCRYPTION_KEY 必须是有效的 Base64URL 字符串。'); }
   if (key.length !== 32 || key.toString('base64url') !== encoded) throw new Error('APP_ENCRYPTION_KEY 解码后必须正好为 32 字节。');
   return key;
+}
+
+const generatedKeyPath = resolve(process.env.PAGE_WATCH_ENCRYPTION_KEY_PATH?.trim() || './data/app-encryption-key');
+
+function readOrCreateGeneratedKey() {
+  try { return readFileSync(generatedKeyPath, 'utf8').trim(); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  mkdirSync(dirname(generatedKeyPath), { recursive: true });
+  const generated = randomBytes(32).toString('base64url');
+  try {
+    // wx ensures two briefly overlapping startup processes never overwrite a
+    // usable key. The loser reads the winner's value below.
+    writeFileSync(generatedKeyPath, `${generated}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    console.info(`APP_ENCRYPTION_KEY 未提供，已在持久目录创建本地加密密钥：${generatedKeyPath}`);
+    return generated;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    return readFileSync(generatedKeyPath, 'utf8').trim();
+  }
+}
+
+/**
+ * Advanced deployments may keep the root key outside the data volume through
+ * APP_ENCRYPTION_KEY. Personal installations can omit it: a random key is
+ * then generated once inside the mounted data directory and reused on update.
+ */
+export function readApplicationEncryptionKey(raw = process.env.APP_ENCRYPTION_KEY) {
+  return decodeApplicationEncryptionKey(raw?.trim() || readOrCreateGeneratedKey());
 }
 
 export function isEncryptedSecret(value: string) {

@@ -19,7 +19,8 @@ services:
       MYSQL_USER: ${MYSQL_USER:-}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-}
       PAGE_WATCH_BOOTSTRAP_PATH: /data/database-bootstrap.json
-      APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?请在 .env 配置 APP_ENCRYPTION_KEY}
+      PAGE_WATCH_ENCRYPTION_KEY_PATH: /data/app-encryption-key
+      APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:-}
       APP_SESSION_SECURE: ${APP_SESSION_SECURE:-false}
     volumes:
       - ./data:/data
