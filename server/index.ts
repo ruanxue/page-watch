@@ -5,7 +5,7 @@ import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
 import fastifyCompress from '@fastify/compress';
 import { assertSafeUrl as validateSafeUrl } from './url-safety.js';
-import { appendRuntimeLog, db, getIntegrationStatuses, getJellyfinSettings, getOutboundProxyUrl, getQbittorrentSettings, getRuntimeMetrics, getRuntimeSettings, getSetting, getSubscription, JOB_PRIORITY, maintainPerformanceMetrics, queueDownloadJob, queueJob, queueLibrarySyncJob, queueMagnetJob, queueReleaseJob, rebuildSubscriptionProgress, refreshSettings, reportIntegrationStatus, reportRuntimeMetrics, reportWorkerHeartbeat, setRuntimeSettings, setSetting, type IntegrationService, type Subscription } from './db.js';
+import { appendRuntimeLog, configureDatabase, databaseConfigurationError, databaseConfigurationSource, db, getIntegrationStatuses, getJellyfinSettings, getOutboundProxyUrl, getQbittorrentSettings, getRuntimeMetrics, getRuntimeSettings, getSetting, getSubscription, isDatabaseConfigured, JOB_PRIORITY, maintainPerformanceMetrics, queueDownloadJob, queueJob, queueLibrarySyncJob, queueMagnetJob, queueReleaseJob, rebuildSubscriptionProgress, refreshSettings, reportIntegrationStatus, reportRuntimeMetrics, reportWorkerHeartbeat, setRuntimeSettings, setSetting, type IntegrationService, type Subscription } from './db.js';
 import { assertQbittorrentConfig, normalizeQbittorrentUrl, testQbittorrentConnection } from './qbittorrent.js';
 import { assertJellyfinConfig, listJellyfinLibraries, normalizeJellyfinUrl, testJellyfinConnection } from './jellyfin.js';
 import { startRuntimeMemoryReporter } from './runtime-observability.js';
@@ -245,12 +245,16 @@ async function pollLiveChanges() {
 
 // Direct worker notifications are the normal path. This low-frequency fallback
 // keeps separately launched development workers compatible without DB churn.
-const livePollTimer = setInterval(() => void pollLiveChanges().catch((error) => app.log.warn(`Live update poll failed: ${error instanceof Error ? error.message : String(error)}`)), 30_000);
+const livePollTimer = setInterval(() => {
+  if (isDatabaseConfigured()) void pollLiveChanges().catch((error) => app.log.warn(`Live update poll failed: ${error instanceof Error ? error.message : String(error)}`));
+}, 30_000);
 livePollTimer.unref();
 
 app.addHook('onRequest', async (request, reply) => {
   const requestPath = authPath(request.url);
   if (!requestPath.startsWith('/api/') || requestPath === '/api/health' || requestPath === '/api/ready' || requestPath.startsWith('/api/auth/') || requestPath.startsWith('/api/internal/events')) return;
+  if (requestPath === '/api/setup/database' && !isDatabaseConfigured()) return;
+  if (!isDatabaseConfigured()) return reply.code(503).send({ error: '数据库尚未配置。请先完成 MySQL 安装引导。' });
   const status = await statusFor(request.headers.cookie);
   if (!status.configured) return reply.code(503).send({ error: '请先在网页中设置访问密码，再使用 Page Watch。' });
   if (!status.authenticated) return reply.code(401).send({ error: '登录已失效，请重新登录。' });
@@ -460,14 +464,28 @@ app.get('/api/events', async (request, reply) => {
 });
 app.get('/api/auth/status', async (request, reply) => {
   reply.header('Cache-Control', 'no-store');
+  if (!isDatabaseConfigured()) return { setupRequired: false, authenticated: false, databaseSetupRequired: true };
   const status = await statusFor(request.headers.cookie);
-  return { setupRequired: !status.configured, authenticated: status.authenticated };
+  return { setupRequired: !status.configured, authenticated: status.authenticated, databaseSetupRequired: false };
+});
+app.get('/api/setup/database', async () => ({ configured: isDatabaseConfigured(), source: databaseConfigurationSource(), error: databaseConfigurationError() }));
+app.post('/api/setup/database', async (request, reply) => {
+  try {
+    await configureDatabase(request.body as Parameters<typeof configureDatabase>[0]);
+    startOperationalServices();
+    return reply.code(201).send({ configured: true });
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : 'MySQL 连接或初始化失败。' });
+  }
 });
 app.post('/api/auth/setup', async (request, reply) => {
   try {
     const password = (request.body as { password?: unknown }).password;
     validatePassword(password);
     await configurePassword(password);
+    // External services are optional. Mark only brand-new installations for
+    // the one-time guide; upgrades keep their established workflow intact.
+    await setSetting('integration_onboarding_pending', '1');
     reply.header('Set-Cookie', sessionCookie(await createSession()));
     return reply.code(201).send({ authenticated: true });
   } catch (error) {
@@ -489,6 +507,29 @@ app.post('/api/auth/login', async (request, reply) => {
 app.post('/api/auth/logout', async (_request, reply) => {
   reply.header('Set-Cookie', clearSessionCookie());
   return reply.code(204).send();
+});
+
+// The guide deliberately reports configuration only. It never probes external
+// services: a NAS may be offline during installation and Page Watch remains
+// fully usable for subscriptions, archives and rules without either service.
+app.get('/api/setup/integrations', async () => {
+  const jellyfin = getJellyfinSettings();
+  const qbittorrent = getQbittorrentSettings();
+  return {
+    pending: getSetting('integration_onboarding_pending') === '1',
+    jellyfin: {
+      enabled: jellyfin.enabled,
+      configured: Boolean(jellyfin.url && jellyfin.apiKey && jellyfin.libraryIds.length)
+    },
+    qbittorrent: {
+      enabled: qbittorrent.enabled,
+      configured: Boolean(qbittorrent.url && (qbittorrent.authMode === 'api_key' ? qbittorrent.apiKey : qbittorrent.username && qbittorrent.password))
+    }
+  };
+});
+app.post('/api/setup/integrations/complete', async () => {
+  await setSetting('integration_onboarding_pending', '0');
+  return { completed: true };
 });
 type HeartbeatRow = {
   worker_name: string;
@@ -565,6 +606,7 @@ async function readinessStatus() {
 }
 
 app.get('/api/ready', async (_request, reply) => {
+  if (!isDatabaseConfigured()) return reply.code(503).send({ ok: false, database: 'setup_required', unavailable: ['数据库尚未配置'], services: [], external: [] });
   try {
     const status = await readinessStatus();
     return reply.code(status.ok ? 200 : 503).send(status);
@@ -1276,7 +1318,8 @@ app.put('/api/settings/qbittorrent', async (request, reply) => {
       setSetting('qbit_tags', settings.tags),
       setSetting('qbit_auto_download', settings.autoDownload ? '1' : '0'),
       setSetting('qbit_auto_download_min_size_mb', String(settings.autoDownloadMinSizeMb)),
-      setSetting('qbit_stop_after_download', settings.stopAfterDownload ? '1' : '0')
+      setSetting('qbit_stop_after_download', settings.stopAfterDownload ? '1' : '0'),
+      setSetting('integration_onboarding_pending', '0')
     ]);
     if (!settings.enabled) await reportIntegrationStatus('qbittorrent', 'disabled', 'qBittorrent 已在 Page Watch 中停用');
     return publicQbittorrentSettings();
@@ -1315,7 +1358,8 @@ app.put('/api/settings/jellyfin', async (request, reply) => {
       setSetting('jellyfin_sync_interval_minutes', String(settings.syncIntervalMinutes)),
       setSetting('jellyfin_skip_magnet_when_available', settings.skipMagnetWhenAvailable ? '1' : '0'),
       setSetting('jellyfin_last_synced_at', ''),
-      setSetting('jellyfin_media_index_synced_at', '')
+      setSetting('jellyfin_media_index_synced_at', ''),
+      setSetting('integration_onboarding_pending', '0')
     ]);
     await clearJellyfinMediaIndex();
     await db.run(`UPDATE archive_entries SET jellyfin_status = ?, jellyfin_item_id = NULL, jellyfin_item_name = NULL,
@@ -1503,7 +1547,10 @@ if (process.env.NODE_ENV === 'production') {
   });
 }
 
-app.listen({ port, host: '0.0.0.0' }).then(() => {
+let operationalServicesStarted = false;
+function startOperationalServices() {
+  if (operationalServicesStarted || !isDatabaseConfigured()) return;
+  operationalServicesStarted = true;
   const beat = async () => {
     await reportWorkerHeartbeat('api', `网页服务监听端口 ${port}`).catch((error) => app.log.warn(`Unable to save API heartbeat: ${error instanceof Error ? error.message : String(error)}`));
     if (engineController.snapshot().state === 'sleeping') {
@@ -1542,7 +1589,6 @@ app.listen({ port, host: '0.0.0.0' }).then(() => {
     }
   };
   void scheduleDownloadObserver();
-  startRuntimeMemoryReporter('api');
   void appendRuntimeLog({ level: 'info', source: 'system', message: `网页服务已启动，监听端口 ${port}。` })
     .catch((error) => app.log.warn(`Unable to save service startup log: ${error instanceof Error ? error.message : String(error)}`));
   const maintainMetrics = async () => {
@@ -1558,6 +1604,11 @@ app.listen({ port, host: '0.0.0.0' }).then(() => {
   void maintainMetrics();
   const maintenanceTimer = setInterval(() => void maintainMetrics(), 24 * 60 * 60_000);
   maintenanceTimer.unref();
+}
+
+app.listen({ port, host: '0.0.0.0' }).then(() => {
+  startRuntimeMemoryReporter('api');
+  startOperationalServices();
 }).catch((error) => {
   app.log.error(error);
   process.exit(1);

@@ -21,11 +21,11 @@ docker compose up -d --build
 
 打开 `http://NAS_IP:3030`。Compose 只启动一个 Page Watch 容器；容器内常驻的只有网页 API/SSE 进程与轻量执行引擎。网页检查、发行日期、磁力检索与预览由按需网页执行器处理，并和 Chromium 一起在设定的空闲时间后退出；Jellyfin 全量同步同样由按需同步器分页写入 MySQL。任务中心仍展示六项独立逻辑服务，订阅、档案、队列、下载与影视库状态、运行日志保存在 MySQL；请按你的 NAS 备份策略备份 `page_watch` 数据库。
 
-部署前请复制 `.env.example` 为 `.env`，填写 `MYSQL_HOST`、`MYSQL_DATABASE`、`MYSQL_USER`、`MYSQL_PASSWORD` 和独立的 `APP_ENCRYPTION_KEY`。用 `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"` 生成主密钥并长期妥善保存；它用于 AES-256-GCM 加密 MySQL 中的 Jellyfin/qBittorrent 凭据和会话签名密钥，遗失后需在网页重新配置外部服务。升级时必须保留既有 `APP_ENCRYPTION_KEY`，不要重新生成。Docker 容器会通过这些变量连接 NAS 上已有的 MySQL，而不会自行创建数据库容器。健康检查以 `curl /api/ready` 完成，不会周期性启动额外 Node 进程；API 异常由 Docker 重启，执行引擎异常仅在容器内部重启。
+部署前请复制 `.env.example` 为 `.env` 并填写独立的 `APP_ENCRYPTION_KEY`。首次打开网页会先要求填写 MySQL 地址、库名、账号和密码；连接测试及建表成功后，连接信息会以 AES-256-GCM 加密保存在 Docker 的 `./data/database-bootstrap.json`，容器升级不会丢失。用 `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"` 生成主密钥并长期妥善保存；遗失它后需重新填写数据库及外部服务凭据。既有部署仍可保留 `MYSQL_*` 环境变量以兼容旧方式，但网页不能覆盖由环境变量管理的连接。健康检查以 `curl /api/ready` 完成，不会周期性启动额外 Node 进程；安装引导尚未完成时它返回 503 是正常状态。
 
 ### 首次访问与安全
 
-首次打开网页会要求设置至少 12 位的访问密码；该密码使用加盐哈希保存，浏览器只持有 7 天有效的 HttpOnly 会话 Cookie。设置后，订阅、归档、日志、代理和 qBittorrent 配置接口都必须登录才能读取或修改。
+首次打开网页依次要求连接 MySQL、设置至少 12 位的访问密码，并可选配置 Jellyfin/qBittorrent；后两者绝不会在容器启动时自动连接。该密码使用加盐哈希保存，浏览器只持有 7 天有效的 HttpOnly 会话 Cookie。设置后，订阅、归档、日志、代理和 qBittorrent 配置接口都必须登录才能读取或修改。
 
 如果 NAS 前面使用 HTTPS 反向代理，请在 `.env` 设置 `APP_SESSION_SECURE=true`，让会话 Cookie 仅通过 HTTPS 传输；直接使用 `http://NAS_IP:3030` 时保持默认 `false`。请不要把 Web UI 端口直接暴露到公网，建议仅限家庭局域网或经 VPN / 反向代理访问。
 

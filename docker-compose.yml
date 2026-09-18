@@ -11,13 +11,18 @@ services:
     environment:
       PORT: 3030
       OUTBOUND_PROXY: ${OUTBOUND_PROXY:-}
-      MYSQL_HOST: ${MYSQL_HOST}
+      # Optional legacy bootstrap values. When omitted, MySQL is configured
+      # through the first-run page and saved encrypted in ./data.
+      MYSQL_HOST: ${MYSQL_HOST:-}
       MYSQL_PORT: ${MYSQL_PORT:-3306}
-      MYSQL_DATABASE: ${MYSQL_DATABASE}
-      MYSQL_USER: ${MYSQL_USER}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-}
+      MYSQL_USER: ${MYSQL_USER:-}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-}
+      PAGE_WATCH_BOOTSTRAP_PATH: /data/database-bootstrap.json
       APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?请在 .env 配置 APP_ENCRYPTION_KEY}
       APP_SESSION_SECURE: ${APP_SESSION_SECURE:-false}
+    volumes:
+      - ./data:/data
     healthcheck:
       test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3030/api/ready').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))\""]
       interval: 30s

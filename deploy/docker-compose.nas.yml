@@ -2,11 +2,13 @@ name: page-watch
 
 x-page-watch-environment: &page-watch-environment
   OUTBOUND_PROXY: ${OUTBOUND_PROXY:-}
-  MYSQL_HOST: ${MYSQL_HOST:?请在 deploy/.env 配置 MYSQL_HOST}
+  # Optional legacy bootstrap values. New deployments configure MySQL in the
+  # browser and store it encrypted in the persistent Page Watch data folder.
+  MYSQL_HOST: ${MYSQL_HOST:-}
   MYSQL_PORT: ${MYSQL_PORT:-3306}
-  MYSQL_DATABASE: ${MYSQL_DATABASE:?请在 deploy/.env 配置 MYSQL_DATABASE}
-  MYSQL_USER: ${MYSQL_USER:?请在 deploy/.env 配置 MYSQL_USER}
-  MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请在 deploy/.env 配置 MYSQL_PASSWORD}
+  MYSQL_DATABASE: ${MYSQL_DATABASE:-}
+  MYSQL_USER: ${MYSQL_USER:-}
+  MYSQL_PASSWORD: ${MYSQL_PASSWORD:-}
   MYSQL_CONNECTION_LIMIT: ${MYSQL_CONNECTION_LIMIT:-3}
   APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?请在 deploy/.env 配置 APP_ENCRYPTION_KEY}
 
@@ -28,7 +30,10 @@ services:
     environment:
       <<: *page-watch-environment
       PORT: 3030
+      PAGE_WATCH_BOOTSTRAP_PATH: /data/database-bootstrap.json
       APP_SESSION_SECURE: ${APP_SESSION_SECURE:-false}
+    volumes:
+      - ../data:/data
     healthcheck:
       test: ["CMD-SHELL", "curl --fail --silent --show-error http://127.0.0.1:3030/api/ready >/dev/null"]
       interval: 30s

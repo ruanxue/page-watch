@@ -1,38 +1,63 @@
 import 'dotenv/config';
 import mysql, { type Pool, type PoolConnection, type ResultSetHeader } from 'mysql2/promise';
 import { ensureMySqlSchema } from './mysql-schema.js';
+import { environmentDatabaseSettings, normalizeDatabaseSettings, savedDatabaseSettings, saveDatabaseSettings, type MySqlConnectionSettings } from './database-bootstrap.js';
 import { defaultInspectionRules, inspectionRulesJson } from './inspection-rules.js';
 import { notifyLive } from './live-events.js';
 import { decryptSecret, encryptSecret, isEncryptedSecret, readApplicationEncryptionKey } from './secret-storage.js';
 import { defaultRuntimeSettings, normalizeRuntimeSettings, type RuntimeSettings } from './runtime-settings.js';
 
-const host = process.env.MYSQL_HOST?.trim();
-const user = process.env.MYSQL_USER?.trim();
-const password = process.env.MYSQL_PASSWORD;
-const database = process.env.MYSQL_DATABASE?.trim();
-const port = Number(process.env.MYSQL_PORT ?? 3306);
-const connectionLimit = Number(process.env.MYSQL_CONNECTION_LIMIT ?? 3);
 const applicationEncryptionKey = readApplicationEncryptionKey();
 const sensitiveSettingKeys = new Set(['jellyfin_api_key', 'qbit_api_key', 'qbit_password', 'app_auth_session_secret']);
 
-if (!host || !user || password === undefined || !database || !Number.isInteger(port) || port < 1 || port > 65535 || !Number.isInteger(connectionLimit) || connectionLimit < 1 || connectionLimit > 16) {
-  throw new Error('MySQL 配置不完整。请设置 MYSQL_HOST、MYSQL_PORT、MYSQL_DATABASE、MYSQL_USER 和 MYSQL_PASSWORD。');
-}
+let pool: Pool | null = null;
+let databaseSource: 'environment' | 'saved' | null = null;
+let databaseConfigurationProblem: string | null = null;
 
-export const pool: Pool = mysql.createPool({
-  host,
-  port,
-  user,
-  password,
-  database,
+function createPool(config: MySqlConnectionSettings) {
+  return mysql.createPool({
+  host: config.host,
+  port: config.port,
+  user: config.user,
+  password: config.password,
+  database: config.database,
   waitForConnections: true,
   // Six workers live in one container. A small per-process pool avoids each
   // of them reserving eight connections on the NAS MySQL server.
-  connectionLimit,
+  connectionLimit: config.connectionLimit,
   queueLimit: 0,
   charset: 'utf8mb4_unicode_ci',
   timezone: 'Z'
-});
+  });
+}
+
+function loadDatabasePool() {
+  try {
+    const environment = environmentDatabaseSettings();
+    const saved = environment ? null : savedDatabaseSettings();
+    const config = environment ?? saved;
+    if (!config) return null;
+    databaseSource = environment ? 'environment' : 'saved';
+    return createPool(config);
+  } catch (error) {
+    databaseConfigurationProblem = '已保存的数据库连接无法读取。请重新填写 MySQL 配置，并确认 APP_ENCRYPTION_KEY 未变更。';
+    console.warn(`Unable to read saved database connection: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+}
+
+pool = loadDatabasePool();
+
+export class DatabaseNotConfiguredError extends Error {
+  constructor() { super('数据库尚未配置。请先完成 MySQL 安装引导。'); }
+}
+export function isDatabaseConfigured() { return pool !== null; }
+export function databaseConfigurationSource() { return databaseSource; }
+export function databaseConfigurationError() { return databaseConfigurationProblem; }
+function requirePool() {
+  if (!pool) throw new DatabaseNotConfiguredError();
+  return pool;
+}
 
 type Runner = Pool | PoolConnection;
 export type RunResult = { changes: number; lastInsertRowid: number };
@@ -61,9 +86,11 @@ function clientFor(runner: Runner): DatabaseClient {
 }
 
 export const db: DatabaseClient & { transaction<T>(work: (tx: DatabaseClient) => Promise<T>): Promise<T> } = {
-  ...clientFor(pool),
+  async all<T>(sql: string, params: unknown[] = []) { return clientFor(requirePool()).all<T>(sql, params); },
+  async get<T>(sql: string, params: unknown[] = []) { return clientFor(requirePool()).get<T>(sql, params); },
+  async run(sql: string, params: unknown[] = []) { return clientFor(requirePool()).run(sql, params); },
   async transaction<T>(work: (tx: DatabaseClient) => Promise<T>) {
-    const connection = await pool.getConnection();
+    const connection = await requirePool().getConnection();
     try {
       await connection.beginTransaction();
       const result = await work(clientFor(connection));
@@ -77,6 +104,28 @@ export const db: DatabaseClient & { transaction<T>(work: (tx: DatabaseClient) =>
     }
   }
 };
+
+/** Test, initialise and persist a browser-provided MySQL connection only after it succeeds. */
+export async function configureDatabase(input: Partial<MySqlConnectionSettings>) {
+  if (databaseSource === 'environment') throw new Error('当前数据库连接由 Docker 环境变量管理，请在部署配置中修改。');
+  const settings = normalizeDatabaseSettings(input);
+  const candidate = createPool(settings);
+  try {
+    await candidate.query('SELECT 1');
+    await ensureMySqlSchema(candidate);
+    saveDatabaseSettings(settings);
+    const previous = pool;
+    pool = candidate;
+    databaseSource = 'saved';
+    databaseConfigurationProblem = null;
+    initialization = null;
+    await initializeDatabase();
+    await previous?.end();
+  } catch (error) {
+    await candidate.end().catch(() => undefined);
+    throw error;
+  }
+}
 
 export type Subscription = {
   id: number;
@@ -746,7 +795,7 @@ let initialization: Promise<void> | null = null;
  */
 export function initializeDatabase() {
   if (!initialization) initialization = (async () => {
-    await ensureMySqlSchema(pool);
+    await ensureMySqlSchema(requirePool());
     await encryptLegacySensitiveSettings();
     await preloadSettings();
     await seedDefaultSubscriptionPresets();
@@ -757,4 +806,4 @@ export function initializeDatabase() {
   return initialization;
 }
 
-if (process.env.PAGE_WATCH_DATABASE_INITIALIZE !== '0') await initializeDatabase();
+if (process.env.PAGE_WATCH_DATABASE_INITIALIZE !== '0' && isDatabaseConfigured()) await initializeDatabase();

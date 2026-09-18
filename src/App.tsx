@@ -120,7 +120,12 @@ type RuntimeLog = {
   scope: 'system' | 'check' | 'release' | 'magnet' | 'download' | 'library';
 };
 
-type AuthStatus = { setupRequired: boolean; authenticated: boolean };
+type AuthStatus = { setupRequired: boolean; authenticated: boolean; databaseSetupRequired?: boolean };
+type IntegrationOnboarding = {
+  pending: boolean;
+  jellyfin: { enabled: boolean; configured: boolean };
+  qbittorrent: { enabled: boolean; configured: boolean };
+};
 type SystemService = { name: string; label: string; status: 'ready' | 'busy' | 'sleeping' | 'error' | 'missing'; detail: string; lastSeenAt: string | null; healthy: boolean };
 type SystemStatus = { generatedAt: string; services: SystemService[] };
 type TaskStatus = 'queued' | 'running' | 'retrying' | 'completed' | 'failed';
@@ -303,6 +308,7 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const [rulesOpen, setRulesOpen] = useState(() => window.location.hash === '#rules');
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [taskSummary, setTaskSummary] = useState<TasksResponse['summary'] | null>(null);
+  const [integrationOnboarding, setIntegrationOnboarding] = useState<IntegrationOnboarding | null>(null);
 
   const load = async () => {
     try { setSubscriptions(await request<Subscription[]>('/api/subscriptions')); }
@@ -311,6 +317,11 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
   };
 
   useEffect(() => { void load(); }, []);
+  useEffect(() => {
+    void request<IntegrationOnboarding>('/api/setup/integrations')
+      .then(setIntegrationOnboarding)
+      .catch(() => setIntegrationOnboarding({ pending: false, jellyfin: { enabled: false, configured: false }, qbittorrent: { enabled: false, configured: false } }));
+  }, []);
   useEffect(() => {
     let alive = true;
     const loadStatus = async () => {
@@ -456,7 +467,40 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
     </section>
     {editor && <Editor item={editor === 'new' ? null : editor} onClose={() => setEditor(null)} onSaved={async () => { setEditor(null); await load(); setNotice('订阅已保存。'); }} onFullScan={async () => { await load(); setNotice('已加入全量检查队列。'); }} onArchiveCleared={async () => { setEditor(null); await load(); setNotice('订阅数据已重置。'); }} />}
     {networkSettingsOpen && <NetworkSettings onClose={() => setNetworkSettingsOpen(false)} onSaved={(message) => { setNetworkSettingsOpen(false); setNotice(message); }} />}
+    {integrationOnboarding?.pending && <IntegrationOnboardingGuide
+      status={integrationOnboarding}
+      onComplete={async () => {
+        await request('/api/setup/integrations/complete', { method: 'POST' });
+        setIntegrationOnboarding((current) => current ? { ...current, pending: false } : current);
+      }}
+      onOpenSettings={async () => {
+        await request('/api/setup/integrations/complete', { method: 'POST' });
+        setIntegrationOnboarding((current) => current ? { ...current, pending: false } : current);
+        window.location.hash = '#downloads';
+      }}
+    />}
   </main>;
+}
+
+function IntegrationOnboardingGuide({ status, onComplete, onOpenSettings }: { status: IntegrationOnboarding; onComplete: () => Promise<void>; onOpenSettings: () => Promise<void> }) {
+  const [busy, setBusy] = useState(false);
+  const finish = (action: () => Promise<void>) => {
+    setBusy(true);
+    void action().finally(() => setBusy(false));
+  };
+  return <div className="overlay integration-onboarding" role="dialog" aria-modal="true" aria-labelledby="integration-onboarding-title">
+    <section className="editor onboarding-card">
+      <p className="eyebrow">首次使用</p>
+      <h2 id="integration-onboarding-title">外部服务按需配置</h2>
+      <p>Page Watch 已可直接用于订阅、网页检查、发行日期和磁力检索。Jellyfin 与 qBittorrent 均是可选功能：系统不会在安装或启动时主动连接它们。</p>
+      <div className="onboarding-integrations">
+        <article><strong>Jellyfin 影视库</strong><span className={status.jellyfin.configured && status.jellyfin.enabled ? 'ready' : ''}>{status.jellyfin.configured && status.jellyfin.enabled ? '已配置' : '未启用'}</span><small>配置并选择媒体库后，才会同步本地影视库索引。</small></article>
+        <article><strong>qBittorrent 下载</strong><span className={status.qbittorrent.configured && status.qbittorrent.enabled ? 'ready' : ''}>{status.qbittorrent.configured && status.qbittorrent.enabled ? '已配置' : '未启用'}</span><small>填写 Web UI 凭据并启用后，下载按钮才可提交任务。</small></article>
+      </div>
+      <p className="field-note">配置页会先保存你填写的信息；只有点击“保存并测试连接”时才会访问对应服务。未配置或未启用时，相关功能会明确提示并保持关闭。</p>
+      <footer><button type="button" className="secondary" disabled={busy} onClick={() => finish(onComplete)}>{busy ? '处理中…' : '暂不设置，进入页面'}</button><button type="button" className="primary" disabled={busy} onClick={() => finish(onOpenSettings)}>前往下载与影视库配置</button></footer>
+    </section>
+  </div>;
 }
 
 function AccessGate({ setupRequired, onAuthenticated }: { setupRequired: boolean; onAuthenticated: () => Promise<void> }) {
@@ -494,6 +538,7 @@ export default function App() {
   };
   useEffect(() => { void loadAuth(); }, []);
   if (!auth) return <main className="access-gate"><div className="access-card access-loading">正在读取访问状态…</div></main>;
+  if (auth.databaseSetupRequired) return <DatabaseSetupGate onConfigured={loadAuth} />;
   if (!auth.authenticated) return <AccessGate setupRequired={auth.setupRequired} onAuthenticated={loadAuth} />;
   return <AppShell onLogout={async () => {
     await request('/api/auth/logout', { method: 'POST' });
@@ -501,6 +546,32 @@ export default function App() {
     resetLiveUpdates();
     await loadAuth();
   }} />;
+}
+
+function DatabaseSetupGate({ onConfigured }: { onConfigured: () => Promise<void> }) {
+  const [form, setForm] = useState({ host: '', port: 3306, database: 'page_watch', user: 'page_watch', password: '', connectionLimit: 3 });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const update = <K extends keyof typeof form>(key: K, value: typeof form[K]) => setForm((current) => ({ ...current, [key]: value }));
+  const submit = (event: FormEvent) => {
+    event.preventDefault(); setBusy(true); setError('');
+    void request('/api/setup/database', { method: 'POST', body: JSON.stringify(form) })
+      .then(onConfigured)
+      .catch((reason) => setError(reason instanceof Error ? reason.message : '无法连接或初始化 MySQL。'))
+      .finally(() => setBusy(false));
+  };
+  return <main className="access-gate"><form className="access-card database-setup-card" onSubmit={submit}>
+    <div className="brand"><span className="brand-mark">⌁</span><span>PAGE WATCH</span></div>
+    <p className="eyebrow">安装引导 · 第一步</p><h1>连接 MySQL 数据库</h1>
+    <p>验证成功后，连接信息将使用 <code>APP_ENCRYPTION_KEY</code> 加密保存到 Docker 持久目录。Jellyfin 与 qBittorrent 不会在容器启动时被访问。</p>
+    <label>MySQL 主机<input autoFocus required disabled={busy} value={form.host} onChange={(event) => update('host', event.target.value)} placeholder="例如 mysql 或 192.168.1.20" /></label>
+    <div className="two-col"><label>端口<input required type="number" min="1" max="65535" disabled={busy} value={form.port} onChange={(event) => update('port', Number(event.target.value))} /></label><label>数据库名<input required disabled={busy} value={form.database} onChange={(event) => update('database', event.target.value)} /></label></div>
+    <label>数据库账号<input required autoComplete="username" disabled={busy} value={form.user} onChange={(event) => update('user', event.target.value)} /></label>
+    <label>数据库密码<input required type="password" autoComplete="current-password" disabled={busy} value={form.password} onChange={(event) => update('password', event.target.value)} /></label>
+    <label>连接数上限<input required type="number" min="1" max="16" disabled={busy} value={form.connectionLimit} onChange={(event) => update('connectionLimit', Number(event.target.value))} /><span className="field-note">个人 NAS 通常保持 3 即可。</span></label>
+    {error && <p className="form-error">{error}</p>}
+    <button className="primary" disabled={busy} type="submit">{busy ? '正在验证并初始化…' : '验证连接并继续'}</button>
+  </form></main>;
 }
 
 function Empty({ onCreate }: { onCreate: () => void }) {

@@ -32,8 +32,6 @@
    它会创建 `page-watch-backend` 共享网络和 `deploy/.env`。编辑 `deploy/.env`：
 
    - `PAGE_WATCH_IMAGE` 改成实际 GHCR 地址，例如 `ghcr.io/your-name/page-watch:stable`；
-   - `MYSQL_HOST` 填 MySQL 的 Docker **服务名**，例如 `mysql`；
-   - 填入 MySQL 专用账号密码；
    - 用 `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"` 生成并填入 `APP_ENCRYPTION_KEY`；此密钥只用于加密数据库中的外部服务凭据，后续升级必须保持不变；
    - NAS 没有代理时保持 `OUTBOUND_PROXY=` 为空。
 
@@ -52,7 +50,7 @@
    bash scripts/nas/update.sh
    ```
 
-打开 `http://NAS_LAN_IP:3030`。Page Watch 只运行一个容器；容器内常驻网页 API/SSE 进程和轻量执行引擎，网页执行器（含 Chromium）与 Jellyfin 全量同步器只会在有任务时启动，并在完成/空闲后退出。任务中心仍会分别展示网页检查、发行日期、磁力检索、qBittorrent 下载和 Jellyfin 同步任务。原有 MySQL 数据库继续被使用；订阅、档案、规则、下载配置、Jellyfin 配置和日志不会随镜像升级而丢失。
+打开 `http://NAS_LAN_IP:3030`。首次安装先在网页填写 MySQL 服务地址、数据库名、专用账号及密码；验证与建表成功后，连接信息会经 `APP_ENCRYPTION_KEY` 加密保存至项目的 `data/database-bootstrap.json`，不会随镜像升级丢失。Page Watch 只运行一个容器；容器内常驻网页 API/SSE 进程和轻量执行引擎，网页执行器（含 Chromium）与 Jellyfin 全量同步器只会在有任务时启动，并在完成/空闲后退出。任务中心仍会分别展示网页检查、发行日期、磁力检索、qBittorrent 下载和 Jellyfin 同步任务。
 
 ## 内部服务地址
 
@@ -60,7 +58,7 @@ Page Watch 和 MySQL、Jellyfin 同在 `page-watch-backend` 网络后，应使�
 
 | 服务 | 在 Page Watch 中填写 |
 | --- | --- |
-| MySQL | `MYSQL_HOST=mysql`（实际服务名为准） |
+| MySQL | 在首次网页引导填写 `mysql`（实际服务名为准） |
 | Jellyfin | `http://jellyfin:8096`（实际服务名为准） |
 | qBittorrent（原生 NAS 服务） | `http://NAS_LAN_IP:QB_WEB_UI_PORT` |
 

@@ -183,6 +183,7 @@ body { background: #f8fafc; }
 .access-card .form-error { margin: 16px 0 0; }
 .access-card .primary { width: 100%; min-height: 43px; margin-top: 22px; color: #ffffff; background: #2563eb; }
 .access-card .primary:hover { background: #1d4ed8; }
+.integration-onboarding { z-index: 30; }.onboarding-card { width: min(620px, 100%); }.onboarding-card > p:not(.eyebrow):not(.field-note) { margin: 10px 0 20px; color: #475569; line-height: 1.65; }.onboarding-integrations { display: grid; gap: 10px; }.onboarding-integrations article { display: grid; grid-template-columns: 1fr auto; gap: 5px 12px; padding: 14px; border: 1px solid #dbe3ef; border-radius: 10px; background: #f8fafc; }.onboarding-integrations strong { color: #172033; }.onboarding-integrations span { align-self: start; padding: 3px 7px; color: #64748b; border-radius: 999px; background: #e2e8f0; font-size: .72rem; font-weight: 700; }.onboarding-integrations span.ready { color: #15803d; background: #dcfce7; }.onboarding-integrations small { grid-column: 1 / -1; color: #64748b; line-height: 1.45; }.onboarding-card .field-note { display: block; margin-top: 16px; line-height: 1.55; }.onboarding-card footer { display: flex; justify-content: flex-end; gap: 9px; margin-top: 22px; }.onboarding-card footer button { min-height: 42px; }
 .access-loading { color: #64748b; text-align: center; }
 
 /* Keep qBittorrent state compact: no speed, path, size, or sync-time details in the table. */
