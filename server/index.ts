@@ -253,9 +253,15 @@ livePollTimer.unref();
 app.addHook('onRequest', async (request, reply) => {
   const requestPath = authPath(request.url);
   if (!requestPath.startsWith('/api/') || requestPath === '/api/health' || requestPath === '/api/ready' || requestPath.startsWith('/api/auth/') || requestPath.startsWith('/api/internal/events')) return;
-  if (requestPath === '/api/setup/database' && !isDatabaseConfigured()) return;
-  if (!isDatabaseConfigured()) return reply.code(503).send({ error: '数据库尚未配置。请先完成 MySQL 安装引导。' });
+  if (!isDatabaseConfigured()) {
+    if (requestPath === '/api/setup/database') return;
+    return reply.code(503).send({ error: '数据库尚未配置。请先完成 MySQL 安装引导。' });
+  }
   const status = await statusFor(request.headers.cookie);
+  // The first-run sequence is database connection, then access password.
+  // Keep the database endpoint retryable until that password exists so a
+  // failed initialization never traps the setup page behind authentication.
+  if (requestPath === '/api/setup/database' && !status.configured) return;
   if (!status.configured) return reply.code(503).send({ error: '请先在网页中设置访问密码，再使用 Page Watch。' });
   if (!status.authenticated) return reply.code(401).send({ error: '登录已失效，请重新登录。' });
 });

@@ -13,6 +13,7 @@ const sensitiveSettingKeys = new Set(['jellyfin_api_key', 'qbit_api_key', 'qbit_
 let pool: Pool | null = null;
 let databaseSource: 'environment' | 'saved' | null = null;
 let databaseConfigurationProblem: string | null = null;
+let databaseConfigurationInProgress = false;
 
 function createPool(config: MySqlConnectionSettings) {
   return mysql.createPool({
@@ -51,7 +52,7 @@ pool = loadDatabasePool();
 export class DatabaseNotConfiguredError extends Error {
   constructor() { super('数据库尚未配置。请先完成 MySQL 安装引导。'); }
 }
-export function isDatabaseConfigured() { return pool !== null; }
+export function isDatabaseConfigured() { return pool !== null && !databaseConfigurationInProgress; }
 export function databaseConfigurationSource() { return databaseSource; }
 export function databaseConfigurationError() { return databaseConfigurationProblem; }
 function requirePool() {
@@ -110,18 +111,33 @@ export async function configureDatabase(input: Partial<MySqlConnectionSettings>)
   if (databaseSource === 'environment') throw new Error('当前数据库连接由 Docker 环境变量管理，请在部署配置中修改。');
   const settings = normalizeDatabaseSettings(input);
   const candidate = createPool(settings);
+  const previousPool = pool;
+  const previousSource = databaseSource;
+  const previousProblem = databaseConfigurationProblem;
+  const previousInitialization = initialization;
   try {
     await candidate.query('SELECT 1');
     await ensureMySqlSchema(candidate);
-    saveDatabaseSettings(settings);
-    const previous = pool;
     pool = candidate;
     databaseSource = 'saved';
     databaseConfigurationProblem = null;
+    databaseConfigurationInProgress = true;
     initialization = null;
     await initializeDatabase();
-    await previous?.end();
+    // Persist only after every initialization step succeeds. Otherwise a
+    // failed setup would leave the browser on the database page while the API
+    // considered the database configured and required an impossible login.
+    saveDatabaseSettings(settings);
+    databaseConfigurationInProgress = false;
+    await previousPool?.end().catch((error) => console.warn(`Unable to close previous database pool: ${error instanceof Error ? error.message : String(error)}`));
   } catch (error) {
+    if (pool === candidate) {
+      pool = previousPool;
+      databaseSource = previousSource;
+      databaseConfigurationProblem = previousProblem;
+      initialization = previousInitialization;
+    }
+    databaseConfigurationInProgress = false;
     await candidate.end().catch(() => undefined);
     throw error;
   }
