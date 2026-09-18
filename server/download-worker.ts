@@ -1,5 +1,5 @@
 import { appendRuntimeLog, db, getQbittorrentSettings, recordPerformanceMetric, refreshSettings, reportIntegrationStatus, reportWorkerHeartbeat, scheduleSubscriptionProgressRebuild, type WorkerTaskContext } from './db.js';
-import { addMagnetToQbittorrent, getQbittorrentTorrentFiles, getQbittorrentTorrentStates, setQbittorrentTorrentFilePriority, startQbittorrentTorrents, stopQbittorrentTorrents, torrentHashFromMagnet, type QbittorrentTorrentFile, type QbittorrentTorrentState } from './qbittorrent.js';
+import { addMagnetToQbittorrent, getQbittorrentTorrentFiles, getQbittorrentTorrentStates, isQbittorrentDownloadComplete, isQbittorrentReadyToStopSeeding, setQbittorrentTorrentFilePriority, startQbittorrentTorrents, stopQbittorrentTorrents, torrentHashFromMagnet, type QbittorrentTorrentFile, type QbittorrentTorrentState } from './qbittorrent.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { notifyLive } from './live-events.js';
 import { isExecutionEngineDraining } from './engine-drain.js';
@@ -172,7 +172,7 @@ async function recoverStalledJobs() {
 
 function stateForDownload(torrent: QbittorrentTorrentState) {
   const state = torrent.state.toLowerCase();
-  if (torrent.progress >= 0.999 || state.includes('upload')) return 'completed';
+  if (isQbittorrentDownloadComplete(torrent)) return 'completed';
   if (state.includes('paused') || state.includes('stopped')) return 'paused';
   if (state.includes('queued')) return 'waiting';
   if (state.includes('downloading') || state.includes('dl') || state.includes('check') || state.includes('moving')) return 'downloading';
@@ -289,7 +289,7 @@ async function syncDownloadStates() {
   const fileFilterByEntryId = new Map(fileFilterPlans.map((plan) => [plan.id, plan]));
   const stopCandidates = tracked.filter((entry) => {
     const torrent = byHash.get(entry.hash);
-    return Boolean(torrent && !rejectedIds.has(entry.id) && !metadataPending.has(entry.id) && torrent.progress >= 0.999 && !isStoppedState(torrent.state));
+    return Boolean(torrent && !rejectedIds.has(entry.id) && !metadataPending.has(entry.id) && isQbittorrentReadyToStopSeeding(torrent) && !isStoppedState(torrent.state));
   });
   const stoppedIds = await stopCompletedTorrents(settings, stopCandidates);
   const checkedAt = new Date().toISOString();

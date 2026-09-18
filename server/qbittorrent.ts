@@ -57,6 +57,19 @@ export type QbittorrentTorrentFile = {
   priority: number;
 };
 
+const completedSeedingStates = new Set(['uploading', 'stalledup', 'queuedup', 'forcedup', 'pausedup']);
+const activeSeedingStates = new Set(['uploading', 'stalledup', 'queuedup', 'forcedup']);
+
+/** A rounded 99.9% progress value is still incomplete: qBittorrent reports 1 only at 100%. */
+export function isQbittorrentDownloadComplete(torrent: Pick<QbittorrentTorrentState, 'progress' | 'state'>) {
+  return torrent.progress >= 1 && completedSeedingStates.has(torrent.state.toLowerCase());
+}
+
+/** Only stop a torrent after qBittorrent has fully entered an active seeding state. */
+export function isQbittorrentReadyToStopSeeding(torrent: Pick<QbittorrentTorrentState, 'progress' | 'state'>) {
+  return torrent.progress >= 1 && activeSeedingStates.has(torrent.state.toLowerCase());
+}
+
 export type QbittorrentAddOptions = {
   /** qBittorrent stops after receiving magnet metadata, before payload download. */
   stopCondition?: 'MetadataReceived';

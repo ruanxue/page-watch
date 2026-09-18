@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { getQbittorrentTorrentFiles, setQbittorrentTorrentFilePriority } from './qbittorrent.js';
+import { getQbittorrentTorrentFiles, isQbittorrentDownloadComplete, isQbittorrentReadyToStopSeeding, setQbittorrentTorrentFilePriority } from './qbittorrent.js';
 
 const config = {
   url: 'http://qbittorrent.test:8080',
@@ -42,4 +42,15 @@ test('waits for magnet metadata when qBittorrent has no file list yet', async (c
   globalThis.fetch = (async () => new Response('', { status: 409 })) as typeof fetch;
   context.after(() => { globalThis.fetch = originalFetch; });
   assert.equal(await getQbittorrentTorrentFiles(config, hash), null);
+});
+
+test('only stops seeding after qBittorrent reports 100 percent and an active seeding state', () => {
+  assert.equal(isQbittorrentDownloadComplete({ progress: 0.999, state: 'uploading' }), false);
+  assert.equal(isQbittorrentReadyToStopSeeding({ progress: 0.999, state: 'uploading' }), false);
+  assert.equal(isQbittorrentDownloadComplete({ progress: 1, state: 'checkingUP' }), false);
+  assert.equal(isQbittorrentReadyToStopSeeding({ progress: 1, state: 'checkingUP' }), false);
+  assert.equal(isQbittorrentDownloadComplete({ progress: 1, state: 'stalledUP' }), true);
+  assert.equal(isQbittorrentReadyToStopSeeding({ progress: 1, state: 'stalledUP' }), true);
+  assert.equal(isQbittorrentDownloadComplete({ progress: 1, state: 'pausedUP' }), true);
+  assert.equal(isQbittorrentReadyToStopSeeding({ progress: 1, state: 'pausedUP' }), false);
 });
