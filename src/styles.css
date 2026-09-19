@@ -269,6 +269,7 @@ body { background: #f8fafc; }
 
 /* One settings destination keeps optional integrations out of the daily workflow. */
 .settings-page { max-width: 920px; }.settings-page .qbit-settings-page { max-width: none; scroll-margin-top: 24px; }.settings-page .jellyfin-settings-page { margin-top: 28px; }.settings-section { margin-top: 28px; scroll-margin-top: 24px; }.embedded-settings-form.editor { width: 100%; max-height: none; padding: 22px; overflow: visible; box-shadow: 0 8px 24px rgba(15,23,42,.04); }.embedded-settings-form.editor header { margin-bottom: 14px; }.embedded-settings-form.editor footer { justify-content: flex-end; }.qbit-card-divider { height: 1px; margin: 22px 0; background: #e2e8f0; }
+.settings-card-title { margin: 0 0 22px; color: #172033; font-size: 1.22rem; letter-spacing: -.035em; }.qbit-settings > .qbit-card:has(+ .qbit-form-actions) { border-bottom: 0; border-radius: 12px 12px 0 0; box-shadow: none; }.qbit-settings > .qbit-card + .qbit-form-actions { margin-top: -16px; padding: 0 21px 21px; border: 1px solid #e2e8f0; border-top: 0; border-radius: 0 0 12px 12px; background: #ffffff; box-shadow: 0 8px 24px rgba(15,23,42,.04); }.runtime-settings .runtime-settings-card { display: block; margin: 0; padding: 0; border: 0; background: transparent; }.runtime-settings .runtime-settings-card > div:first-child { display: none; }
 
 /* The primary UI intentionally stays compact: labels and live state remain,
    while repeated instructional copy is omitted across every workspace. */
