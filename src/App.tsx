@@ -1550,27 +1550,28 @@ function PresetManager({ presets, onClose, onChanged, embedded = false, register
 
 function NetworkSettings({ onClose, onSaved, embedded = false }: { onClose?: () => void; onSaved: (message: string) => void; embedded?: boolean }) {
   const [proxyUrl, setProxyUrl] = useState('');
+  const [enabled, setEnabled] = useState(false);
   const [fromEnvironment, setFromEnvironment] = useState(false);
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState('');
   useEffect(() => {
-    void request<{ proxyUrl: string; fromEnvironment: boolean }>('/api/settings/network')
-      .then((network) => { setProxyUrl(network.proxyUrl); setFromEnvironment(network.fromEnvironment); })
+    void request<{ proxyUrl: string; enabled: boolean; fromEnvironment: boolean }>('/api/settings/network')
+      .then((network) => { setProxyUrl(network.proxyUrl); setEnabled(network.enabled); setFromEnvironment(network.fromEnvironment); })
       .catch((reason) => setError(reason.message))
       .finally(() => setBusy(false));
   }, []);
   async function save(event: FormEvent) {
     event.preventDefault(); setBusy(true); setError('');
     try {
-      const network = fromEnvironment ? null : await request<{ active: boolean }>('/api/settings/network', { method: 'PUT', body: JSON.stringify({ proxyUrl }) });
+      const network = fromEnvironment ? null : await request<{ active: boolean; enabled: boolean }>('/api/settings/network', { method: 'PUT', body: JSON.stringify({ proxyUrl, enabled }) });
+      if (network) setEnabled(network.enabled);
       onSaved(network ? (network.active ? '网络代理已保存。' : '网络代理已关闭。') : '网络代理由环境变量管理。');
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存设置。'); }
     finally { setBusy(false); }
   }
   const form = <form className={`editor network-settings ${embedded ? 'embedded-settings-form' : ''}`} onSubmit={save}>
-    <header><div><p className="eyebrow">网络连接</p><h2 id="network-title">网络代理</h2></div>{onClose && <button type="button" className="close" onClick={onClose}>×</button>}</header>
-    <p className="network-copy">配置后，普通网页抓取和浏览器渲染都会通过同一个代理连接。</p>
-    {fromEnvironment ? <div className="environment-note">当前代理由 Docker 的 <code>OUTBOUND_PROXY</code> 环境变量提供。请在部署配置中修改。</div> : <label>HTTP / HTTPS 代理地址<input disabled={busy} value={proxyUrl} onChange={(event) => setProxyUrl(event.target.value)} placeholder="例如 http://192.168.1.10:7890" /><span className="field-note">留空并保存即可关闭代理。NAS 中请填写代理服务的局域网 IP，不要填写 127.0.0.1。</span></label>}
+    <header><div><p className="eyebrow">网络连接</p><h2 id="network-title">网络代理</h2></div><div className="network-header-actions"><label className="toggle"><input type="checkbox" checked={enabled} disabled={busy || fromEnvironment} onChange={(event) => setEnabled(event.target.checked)} /><span />启用代理</label>{onClose && <button type="button" className="close" onClick={onClose}>×</button>}</div></header>
+    {fromEnvironment ? <div className="environment-note">当前代理由 Docker 的 <code>OUTBOUND_PROXY</code> 环境变量提供。请在部署配置中修改。</div> : <label>HTTP / HTTPS 代理地址<input disabled={busy} value={proxyUrl} onChange={(event) => setProxyUrl(event.target.value)} /></label>}
     {error && <p className="form-error">{error}</p>}
     <footer>{onClose && <button type="button" className="secondary" onClick={onClose}>取消</button>}<button className="primary" disabled={busy} type="submit">{busy ? '读取中…' : '保存设置'}</button></footer>
   </form>;

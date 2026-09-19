@@ -672,7 +672,9 @@ export async function getIntegrationStatuses() {
 }
 
 export function getOutboundProxyUrl() {
-  return process.env.OUTBOUND_PROXY?.trim() || getSetting('outbound_proxy').trim();
+  const environmentProxy = process.env.OUTBOUND_PROXY?.trim();
+  if (environmentProxy) return environmentProxy;
+  return getSetting('outbound_proxy_enabled') === '0' ? '' : getSetting('outbound_proxy').trim();
 }
 
 export function getRuntimeSettings(): RuntimeSettings {

@@ -1282,18 +1282,22 @@ function normalizePresetNames(input: unknown) {
   return names;
 }
 
-app.get('/api/settings/network', async () => ({
-  proxyUrl: process.env.OUTBOUND_PROXY ? '' : getSetting('outbound_proxy'),
-  active: Boolean(getOutboundProxyUrl()),
-  fromEnvironment: Boolean(process.env.OUTBOUND_PROXY)
-}));
+app.get('/api/settings/network', async () => {
+  const fromEnvironment = Boolean(process.env.OUTBOUND_PROXY);
+  const proxyUrl = fromEnvironment ? '' : getSetting('outbound_proxy');
+  const enabled = fromEnvironment || (getSetting('outbound_proxy_enabled') !== '0' && Boolean(proxyUrl.trim()));
+  return { proxyUrl, enabled, active: Boolean(getOutboundProxyUrl()), fromEnvironment };
+});
 
 app.put('/api/settings/network', async (request, reply) => {
   if (process.env.OUTBOUND_PROXY) return reply.code(409).send({ error: '当前代理由 OUTBOUND_PROXY 环境变量管理。' });
   try {
-    const proxyUrl = validateProxy((request.body as { proxyUrl?: string }).proxyUrl);
-    await setSetting('outbound_proxy', proxyUrl);
-    return { proxyUrl, active: Boolean(proxyUrl), fromEnvironment: false };
+    const body = request.body as { proxyUrl?: string; enabled?: unknown };
+    if (body.enabled !== undefined && typeof body.enabled !== 'boolean') throw new Error('代理开关无效。');
+    const proxyUrl = validateProxy(body.proxyUrl);
+    const enabled = Boolean(proxyUrl) && (body.enabled ?? true);
+    await Promise.all([setSetting('outbound_proxy', proxyUrl), setSetting('outbound_proxy_enabled', enabled ? '1' : '0')]);
+    return { proxyUrl, enabled, active: enabled, fromEnvironment: false };
   } catch (error) {
     return reply.code(400).send({ error: error instanceof Error ? error.message : '无法保存代理设置。' });
   }
