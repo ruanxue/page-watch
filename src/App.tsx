@@ -658,14 +658,27 @@ function magnetSearchUrl(rules: InspectionRules | null, content: string) {
 
 function DownloadCell({ entry, downloadingId, onSubmit }: { entry: ArchiveEntry; downloadingId: number | null; onSubmit: (entry: ArchiveEntry) => void }) {
   if (entry.magnet_status !== 'found') return <span>—</span>;
-  if (entry.download_status === 'not_queued' || entry.download_status === 'failed' || entry.download_status === 'filtered') {
+  // A removed torrent is only the prior qBittorrent record; it must not
+  // prevent a new manual submission. Keep its orange cue unless Jellyfin has
+  // confirmed the title is still available, where the normal action applies.
+  const wasRemoved = entry.download_status === 'removed';
+  if (entry.download_status === 'not_queued' || entry.download_status === 'failed' || entry.download_status === 'filtered' || wasRemoved) {
     const wasFiltered = entry.download_status === 'filtered';
     const title = entry.download_status === 'failed'
       ? (entry.download_error || '提交失败，点击重试')
       : wasFiltered
         ? (entry.download_error || '种子内文件均未达到最小单文件大小；点击可按当前设置重新筛选')
-        : '提交给 qBittorrent';
-    return <button className={`download-action ${entry.download_status === 'failed' ? 'download-failed' : wasFiltered ? 'download-filtered' : ''}`} type="button" disabled={downloadingId === entry.id} title={title} onClick={() => void onSubmit(entry)}>{entry.download_status === 'failed' ? '重试' : wasFiltered ? '重新筛选' : '下载'}</button>;
+        : wasRemoved
+          ? (entry.jellyfin_status === 'available' ? '影视库已入库；仍可按需重新提交下载' : '上一次下载记录已删除，点击重新提交')
+          : '提交给 qBittorrent';
+    const style = entry.download_status === 'failed'
+      ? 'download-failed'
+      : wasFiltered
+        ? 'download-filtered'
+        : wasRemoved && entry.jellyfin_status !== 'available'
+          ? 'download-removed'
+          : '';
+    return <button className={`download-action ${style}`} type="button" disabled={downloadingId === entry.id} title={title} onClick={() => void onSubmit(entry)}>{entry.download_status === 'failed' ? '重试' : wasFiltered ? '重新筛选' : '下载'}</button>;
   }
   if (entry.download_status === 'queued' || entry.download_status === 'running') return <span className="download-state pending">提交中</span>;
   const status = entry.download_status === 'completed' ? '完成'

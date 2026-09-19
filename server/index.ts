@@ -1196,7 +1196,7 @@ app.post('/api/subscriptions/:id/download-backfill', async (request, reply) => {
   if (!await ensureQbittorrentEnabled(reply)) return;
   const candidates = await db.all<{ id: number; download_status: string }>(`SELECT id, download_status FROM archive_entries
     WHERE subscription_id = ? AND magnet_status = 'found' AND magnet_value IS NOT NULL
-      AND download_status IN ('not_queued', 'failed', 'filtered') ORDER BY id ASC`, [id]);
+      AND download_status IN ('not_queued', 'failed', 'filtered', 'removed') ORDER BY id ASC`, [id]);
   let queued = 0;
   await db.transaction(async (tx) => {
     for (const entry of candidates) {
@@ -1209,7 +1209,7 @@ app.post('/api/subscriptions/:id/download-backfill', async (request, reply) => {
             download_error = '已排队手动下载，将恢复种子内全部文件。', updated_at = ? WHERE id = ?`, [now, now, entry.id]);
         } else {
           await tx.run(`UPDATE archive_entries SET download_status = 'queued', download_queued_at = ?, download_error = NULL,
-            download_filter_min_size_bytes = NULL, updated_at = ? WHERE id = ?`, [now, now, entry.id]);
+            download_filter_min_size_bytes = NULL, download_removed_at = NULL, updated_at = ? WHERE id = ?`, [now, now, entry.id]);
         }
       }
     }
@@ -1239,7 +1239,7 @@ app.post('/api/archive/:id/download', async (request, reply) => {
           download_error = '已排队手动下载，将恢复种子内全部文件。', updated_at = ? WHERE id = ?`, [now, now, entry.id]);
       } else {
         await tx.run(`UPDATE archive_entries SET download_status = 'queued', download_queued_at = ?, download_error = NULL,
-          download_filter_min_size_bytes = NULL, updated_at = ? WHERE id = ?`, [now, now, entry.id]);
+          download_filter_min_size_bytes = NULL, download_removed_at = NULL, updated_at = ? WHERE id = ?`, [now, now, entry.id]);
       }
     }
   });
