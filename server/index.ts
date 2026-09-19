@@ -724,7 +724,7 @@ async function getTaskOverview() {
     taskProgressBySubscription(),
     db.all<ActiveDownloadRow>(`SELECT a.id, a.subscription_id, s.name AS subscription_name, a.content, a.title, a.download_status, a.download_progress,
       a.download_queued_at, a.download_added_at, a.download_error FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
-      WHERE a.download_status IN ('queued', 'running', 'added', 'waiting', 'downloading', 'paused')`),
+      WHERE a.download_status IN ('queued', 'running', 'added', 'waiting', 'downloading')`),
     getIntegrationStatuses(),
     db.get<{ count: number }>(`SELECT COUNT(*) AS count FROM (${taskQueueUnion}) AS queue_tasks WHERE status = 'failed'`)
   ]);
@@ -734,7 +734,7 @@ async function getTaskOverview() {
     const numericProgress = download.download_progress === null ? null : Number(download.download_progress);
     const percent = numericProgress !== null && Number.isFinite(numericProgress) ? Math.round(numericProgress * 100) : null;
     const label = download.download_status === 'paused' ? 'qBittorrent 已暂停' : percent === null ? '等待 qBittorrent 开始下载' : `下载 ${percent}%`;
-    active.push({ id: `download-state-${download.id}`, kind: 'download', status: download.download_status === 'paused' ? 'queued' : 'running', priority: 0,
+    active.push({ id: `download-state-${download.id}`, kind: 'download', status: 'running', priority: 0,
       subscriptionId: download.subscription_id, subscriptionName: download.subscription_name, content: download.content, title: download.title,
       requestedAt: download.download_queued_at ?? download.download_added_at ?? new Date().toISOString(), startedAt: download.download_added_at, finishedAt: null, retryAfter: null, attemptCount: 0,
       error: download.download_error, progress: percent === null ? { current: null, total: null, label } : { current: percent, total: 100, label } });

@@ -52,5 +52,7 @@ test('only stops seeding after qBittorrent reports 100 percent and an active see
   assert.equal(isQbittorrentDownloadComplete({ progress: 1, state: 'stalledUP' }), true);
   assert.equal(isQbittorrentReadyToStopSeeding({ progress: 1, state: 'stalledUP' }), true);
   assert.equal(isQbittorrentDownloadComplete({ progress: 1, state: 'pausedUP' }), true);
+  assert.equal(isQbittorrentDownloadComplete({ progress: 1, state: 'stoppedUP' }), true);
   assert.equal(isQbittorrentReadyToStopSeeding({ progress: 1, state: 'pausedUP' }), false);
+  assert.equal(isQbittorrentReadyToStopSeeding({ progress: 1, state: 'stoppedUP' }), false);
 });

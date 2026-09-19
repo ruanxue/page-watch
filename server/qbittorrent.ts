@@ -57,7 +57,7 @@ export type QbittorrentTorrentFile = {
   priority: number;
 };
 
-const completedSeedingStates = new Set(['uploading', 'stalledup', 'queuedup', 'forcedup', 'pausedup']);
+const completedSeedingStates = new Set(['uploading', 'stalledup', 'queuedup', 'forcedup', 'pausedup', 'stoppedup']);
 const activeSeedingStates = new Set(['uploading', 'stalledup', 'queuedup', 'forcedup']);
 
 /** A rounded 99.9% progress value is still incomplete: qBittorrent reports 1 only at 100%. */
