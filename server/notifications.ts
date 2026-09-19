@@ -296,7 +296,7 @@ export function createDownloadCompletedNotification(input: {
     occurredAt: input.occurredAt ?? new Date().toISOString(),
     title: '下载已完成',
     summary: `“${input.content}”已在 qBittorrent 中下载完成。`,
-    pagePath: '#downloads',
+    pagePath: '#archive',
     subscription: input.subscription,
     operation: { kind: 'qBittorrent 下载' },
     items: [{ content: input.content }]
@@ -310,7 +310,7 @@ export function createTestNotification(): NotificationPayload {
     type: 'test',
     severity: 'info',
     occurredAt: new Date().toISOString(),
-    title: 'Page Watch 测试通知',
+    title: '测试通知',
     summary: '通知渠道连接正常。后续仅会按所选事件发送提醒。',
     pagePath: '#subscriptions',
     subscription: null,
