@@ -836,7 +836,7 @@ function ArchivePage({ subscriptions, onNotice }: { subscriptions: Subscription[
     {!loading && !error && <div className="archive-pagination"><span>共 {archiveTotal} 条 · 第 {archivePage} / {archiveTotalPages} 页</span><label>每页<select value={archivePageSize} onChange={(event) => { setArchivePageSize(Number(event.target.value)); setArchivePage(1); }}><option value={50}>50 条</option><option value={100}>100 条</option><option value={200}>200 条</option></select></label><button className="quiet" type="button" disabled={archivePage <= 1} onClick={() => setArchivePage((page) => page - 1)}>上一页</button><button className="quiet" type="button" disabled={archivePage >= archiveTotalPages} onClick={() => setArchivePage((page) => page + 1)}>下一页</button></div>}
   </section>;
   return <section id="archive" className="archive-section">
-    <div className="section-head"><div><h2>内容档案</h2><p>按订阅查看首次获取到的内容。</p></div></div>
+    <div className="section-head"><div><h2>内容档案</h2></div></div>
     {subscriptions.length === 0 ? <div className="empty-card archive-empty"><div className="empty-orbit">◌</div><h3>还没有订阅</h3><p>添加订阅并完成首次检查后，内容档案会自动建立。</p></div> : <div className="archive-subscription-grid">{subscriptions.map((subscription) => <button className="archive-subscription-card" key={subscription.id} onClick={() => void openArchive(subscription)}><span className="site-ident">{shortUrl(subscription.url).slice(0, 1).toUpperCase()}</span><span className="archive-card-copy"><strong>{subscription.name}</strong><small>{shortUrl(subscription.url)}</small></span><span className="archive-count"><b>{subscription.archive_count}</b><small>条内容</small></span><span className="archive-arrow">→</span></button>)}</div>}
   </section>;
 }
@@ -1427,10 +1427,10 @@ function JellyfinSettingsPanel({ onNotice }: { onNotice: (message: string) => vo
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Jellyfin 影视库同步失败。'); }
     finally { setBusy(false); }
   }
-  return <section className="qbit-settings-page jellyfin-settings-page"><div className="section-head"><div><h2>Jellyfin 影视库</h2><p>同步指定媒体库后，内容档案会显示“已入库”或“未入库”。</p></div></div><form className="qbit-settings" onSubmit={(event) => { event.preventDefault(); setBusy(true); setError(''); void save().catch((reason) => setError(reason instanceof Error ? reason.message : '无法保存 Jellyfin 设置。')).finally(() => setBusy(false)); }}>
+  return <section className="qbit-settings-page jellyfin-settings-page"><div className="section-head"><div><h2>Jellyfin 影视库</h2></div></div><form className="qbit-settings" onSubmit={(event) => { event.preventDefault(); setBusy(true); setError(''); void save().catch((reason) => setError(reason instanceof Error ? reason.message : '无法保存 Jellyfin 设置。')).finally(() => setBusy(false)); }}>
     <section className="qbit-card"><div className="qbit-card-head"><div><h3>连接与同步</h3><p>仅以只读方式查询 Jellyfin 媒体库，不会修改影片或元数据。</p></div><label className="toggle"><input type="checkbox" checked={form.enabled} disabled={loading || busy} onChange={(event) => update('enabled', event.target.checked)} /><span />启用影视库同步</label></div>
       <label>Jellyfin Web 地址<input disabled={loading || busy} value={form.url} onChange={(event) => update('url', event.target.value)} placeholder="例如 http://192.168.1.20:8096" /><span className="field-note">填写 Jellyfin Web UI 的局域网地址和端口。</span></label>
-      <label>API 密钥<input type="password" autoComplete="off" disabled={loading || busy} value={form.apiKey} onChange={(event) => update('apiKey', event.target.value)} placeholder={apiKeyConfigured ? '已保存；留空则不修改' : '在 Jellyfin 管理后台创建的 API 密钥'} /><span className="field-note">密钥仅保存于服务端，不会再返回或显示。</span></label>
+      <label>API 密钥<input type="password" autoComplete="off" disabled={loading || busy} value={form.apiKey} onChange={(event) => update('apiKey', event.target.value)} placeholder={apiKeyConfigured ? '********' : 'API 密钥'} /></label>
       <label>同步间隔（分钟）<input type="number" min="5" max="1440" disabled={loading || busy || !form.enabled} value={form.syncIntervalMinutes} onChange={(event) => update('syncIntervalMinutes', Number(event.target.value))} /></label>
       <label className="toggle jellyfin-skip-toggle"><input type="checkbox" checked={form.skipMagnetWhenAvailable} disabled={loading || busy || !form.enabled} onChange={(event) => update('skipMagnetWhenAvailable', event.target.checked)} /><span />已入库时自动跳过磁力检索</label>
       {libraries.length > 0 && <fieldset className="jellyfin-libraries" disabled={loading || busy || !form.enabled}><legend>同步的媒体库</legend><div>{libraries.map((library) => <label key={library.id} className="library-choice"><input type="checkbox" checked={form.libraryIds.includes(library.id)} onChange={() => toggleLibrary(library.id)} /><span><b>{library.name}</b>{library.collectionType ? <small>{library.collectionType}</small> : null}</span></label>)}</div><span className="field-note">可多选；同步只读取所选媒体库中的影片项目。</span></fieldset>}
@@ -1619,7 +1619,7 @@ function NotificationSettingsModal({ onClose, onNotice, embedded = false }: { on
 
   const update = <K extends keyof NotificationForm>(key: K, value: NotificationForm[K]) => setForm((current) => ({ ...current, [key]: value }));
   const updateEvent = <K extends keyof NotificationEvents>(key: K, value: boolean) => setForm((current) => ({ ...current, events: { ...current.events, [key]: value } }));
-  const configuredLabel = (configured: boolean) => configured ? '已保存；留空则不修改' : '尚未配置';
+  const configuredLabel = (configured: boolean) => configured ? '********' : '';
   function payload() {
     const { wecomWebhook, dingtalkWebhook, dingtalkSecret, webhookUrl, webhookHmacSecret, ...settings } = form;
     return {
