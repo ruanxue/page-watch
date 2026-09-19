@@ -1021,7 +1021,7 @@ app.get('/api/archive', async (request) => {
       s.id AS subscription_id, s.name AS subscription_name, s.url AS subscription_url
     FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
     ${where}
-    ORDER BY a.id ASC LIMIT ? OFFSET ?`, [...params, pageSize, (page - 1) * pageSize]);
+    ORDER BY a.release_date IS NULL ASC, a.release_date DESC, a.id ASC LIMIT ? OFFSET ?`, [...params, pageSize, (page - 1) * pageSize]);
   return { items, total, page, pageSize };
 });
 
