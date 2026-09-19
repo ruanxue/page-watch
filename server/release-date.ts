@@ -158,10 +158,14 @@ async function inspectReleaseDateInBrowser(url: URL, rule: ReleaseDateRule, prio
       const response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 30_000 });
       await assertSafeUrl(page.url());
       const diagnostic = await page.evaluate((config) => {
-        const normalizeLabel = (value: string) => value.replace(/\s+/g, ' ').trim().replace(/[：:]/g, '');
         const containers = Array.from(document.querySelectorAll(config.containerSelector));
-        const expected = normalizeLabel(config.labelText);
-        const labelled = containers.filter((container) => normalizeLabel(container.querySelector(config.labelSelector)?.textContent ?? '') === expected);
+        const expected = config.labelText.replace(/\s+/g, ' ').trim().replace(/[：:]/g, '');
+        const labelled = containers.filter((container) => (
+          (container.querySelector(config.labelSelector)?.textContent ?? '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .replace(/[：:]/g, '') === expected
+        ));
         const values = labelled.map((container) => {
           const element = container.querySelector(config.valueSelector);
           if (!element) return null;
