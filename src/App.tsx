@@ -415,10 +415,14 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
     archived: subscriptions.reduce((sum, item) => sum + item.archive_count, 0),
     libraryAvailable: subscriptions.reduce((sum, item) => sum + Number(item.jellyfin_available_count ?? 0), 0)
   }), [subscriptions]);
-  const unhealthyServices = systemStatus?.services.filter((service) => !service.healthy) ?? [];
-  const busyServiceCount = systemStatus?.services.filter((service) => service.healthy && service.status === 'busy').length ?? 0;
-  const servicesHealthy = Boolean(systemStatus && unhealthyServices.length === 0);
-  const serviceAttention = unhealthyServices.map((service) => `${service.label}：${service.status === 'missing' ? '尚未启动' : service.detail}`).join('；');
+  // Logical workers may deliberately release their process while idle, and a
+  // busy worker's last persisted heartbeat can briefly lag behind its live
+  // state. Neither is an incident; reserve the sidebar warning for a worker
+  // that explicitly reports an error or has never started.
+  const attentionServices = systemStatus?.services.filter((service) => service.status === 'error' || service.status === 'missing') ?? [];
+  const busyServiceCount = systemStatus?.services.filter((service) => service.status === 'busy').length ?? 0;
+  const servicesHealthy = Boolean(systemStatus && attentionServices.length === 0);
+  const serviceAttention = attentionServices.map((service) => `${service.label}：${service.status === 'missing' ? '尚未启动' : service.detail}`).join('；');
   const taskCount = taskSummary?.running ?? busyServiceCount;
   const healthyServiceSummary = systemStatus ? `${systemStatus.services.length} 项服务在线 · ${taskCount} 项任务执行中` : '';
 
@@ -476,7 +480,7 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
         <a className={`nav-item ${view === 'settings' ? 'active' : ''}`} href="#settings"><span>⚙</span> 设置</a>
       </nav>
       <div className={`sidebar-note ${servicesHealthy ? '' : 'needs-attention'}`} title={serviceAttention}>
-        <span className="pulse" /> {servicesHealthy ? '后台服务运行正常' : systemStatus ? `服务需要注意（${unhealthyServices.length}）` : '正在确认服务状态…'}
+        <span className="pulse" /> {servicesHealthy ? '后台服务运行正常' : systemStatus ? `服务需要注意（${attentionServices.length}）` : '正在确认服务状态…'}
         {servicesHealthy ? <a className="sidebar-task-link" href="#operations">{healthyServiceSummary}</a> : <small>{serviceAttention || '正在读取服务状态…'}</small>}
         <button type="button" className="sign-out" onClick={() => void onLogout()}>退出登录</button>
       </div>

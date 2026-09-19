@@ -45,6 +45,19 @@ async function runNextLibrarySync() {
     await db.run(`UPDATE library_sync_jobs SET status = 'completed', finished_at = ?, error = NULL,
       progress_phase = 'completed', progress_label = ?, progress_current = ?, progress_total = ? WHERE id = ?`,
     [finished, `同步完成：${result.scanned} 个媒体项目，${result.matched} 条已入库`, result.scanned, result.scanned, job.id]);
+    // The complete sync runs in a short-lived child process. Its settings
+    // writes update that child's cache only, whereas this long-lived runner
+    // immediately decides whether another sync is due. Mirror the confirmed
+    // completion into the runner cache to prevent it from re-queueing the
+    // same full-library sync every dispatch cycle.
+    try {
+      await setSetting('jellyfin_media_index_synced_at', finished);
+      await setSetting('jellyfin_last_synced_at', finished);
+    } catch (cacheError) {
+      // The child has already persisted both values. Do not turn a completed
+      // sync into a failure merely because this optional cache mirror failed.
+      console.warn(`Unable to refresh the Jellyfin sync cache: ${cacheError instanceof Error ? cacheError.message : String(cacheError)}`);
+    }
     await recordPerformanceMetric({ scope: 'library', metric: 'processed', dimension: 'full_sync', durationMs: Date.now() - startedAtMs }).catch(() => undefined);
     await reportIntegrationStatus('jellyfin', 'healthy', '最近一次媒体库同步成功').catch(() => undefined);
     await appendRuntimeLog({ level: 'success', source: 'library', message: `Jellyfin 影视库${job.trigger_type === 'manual' ? '手动' : '定时'}同步任务完成：扫描 ${result.scanned} 个媒体项目，${result.matched} 条已入库。` });
