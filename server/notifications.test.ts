@@ -40,12 +40,13 @@ test('formats a branded DingTalk Markdown digest with independently linked conte
     items: Array.from({ length: 6 }, (_, index) => ({ content: `ITEM-${index + 1}`, detailUrl: `https://example.test/${index + 1}` }))
   };
   const markdown = notificationMarkdown(payload);
-  assert.match(markdown, /^### 【Page Watch｜发现 8 条新内容】/);
+  assert.match(markdown, /^### Page Watch｜发现 8 条新内容/);
   assert.match(markdown, /\*\*订阅：\*\* 新片列表/);
   assert.match(markdown, /\*\*数量：\*\* 8 条/);
   assert.match(markdown, /\*\*详情 1：\*\* \[https:\/\/example\.test\/1\]\(https:\/\/example\.test\/1\)/);
   assert.match(markdown, /\*\*入口：\*\* Page Watch > 内容档案/);
   assert.match(markdown, /\*\*时间：\*\* 2026-09-18 08:00:00/);
+  assert.match(markdown, /\*\*订阅：\*\* 新片列表\n\n\*\*数量：\*\* 8 条/);
   assert.equal((markdown.match(/ITEM-/g) ?? []).length, 5);
 });
 
@@ -58,7 +59,7 @@ test('formats every event with a branded heading and stable field order', () => 
   ];
   for (const payload of payloads) {
     const markdown = notificationMarkdown(payload);
-    assert.match(markdown, new RegExp(`^### 【Page Watch｜${payload.title}】`));
+    assert.match(markdown, new RegExp(`^### Page Watch｜${payload.title}`));
     assert.match(markdown, /\*\*时间：\*\* 2026-09-18 08:00:00/);
   }
   const failure = notificationMarkdown(payloads[2]);
@@ -75,13 +76,13 @@ test('formats a personal-WeChat-compatible Enterprise WeCom text request and a D
   const wecom = buildNotificationRequest(testPayload, { ...baseSettings, channel: 'wecom' }, '1720000000000');
   const wecomBody = JSON.parse(wecom.body);
   assert.equal(wecomBody.msgtype, 'text');
-  assert.match(wecomBody.text.content, /【Page Watch｜测试通知】/);
+  assert.match(wecomBody.text.content, /Page Watch｜测试通知/);
   assert.doesNotMatch(wecomBody.text.content, /\*\*/);
 
   const dingtalk = buildNotificationRequest(testPayload, { ...baseSettings, channel: 'dingtalk' }, '1720000000000');
   const url = new URL(dingtalk.url);
   assert.equal(JSON.parse(dingtalk.body).msgtype, 'markdown');
-  assert.match(JSON.parse(dingtalk.body).markdown.text, /^### 【Page Watch｜测试通知】/);
+  assert.match(JSON.parse(dingtalk.body).markdown.text, /^### Page Watch｜测试通知/);
   assert.ok(url.searchParams.get('timestamp'));
   assert.ok(url.searchParams.get('sign'));
 });

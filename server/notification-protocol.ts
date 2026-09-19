@@ -70,16 +70,17 @@ function notificationFields(payload: NotificationPayload): NotificationField[] {
 }
 
 function notificationHeading(payload: NotificationPayload) {
-  return `【Page Watch｜${payload.title.replace(/^Page Watch\s*/i, '')}】`;
+  return `Page Watch｜${payload.title.replace(/^Page Watch\s*/i, '')}`;
 }
 
 export function notificationMarkdown(payload: NotificationPayload) {
-  const lines = [`### ${notificationHeading(payload)}`, ''];
-  for (const field of notificationFields(payload)) {
+  const fields = notificationFields(payload).map((field) => {
     const value = field.link ? `[${field.value}](${field.value})` : field.value;
-    lines.push(`**${field.label}：** ${value}`);
-  }
-  return lines.join('\n').slice(0, 3500);
+    return `**${field.label}：** ${value}`;
+  });
+  // DingTalk treats a lone newline as a soft break, so use paragraphs to
+  // preserve one visible row per field in the rendered Markdown message.
+  return [`### ${notificationHeading(payload)}`, ...fields].join('\n\n').slice(0, 3500);
 }
 
 /**
