@@ -190,6 +190,12 @@ type TasksResponse = {
   active: TaskItem[];
   history: TaskItem[];
 };
+
+function serviceVisualState(service: SystemService | undefined) {
+  if (!service) return 'error';
+  if (service.status === 'busy' || service.status === 'sleeping') return service.status;
+  return service.healthy ? 'ready' : 'error';
+}
 type PerformanceMetrics = {
   range: '24h' | '7d' | '30d' | '180d';
   generatedAt: string;
@@ -890,7 +896,7 @@ function TaskCenterPage({ data, error, scope }: { data: TasksResponse | null; er
   const serviceState = !service ? '状态读取中' : service.status === 'busy' ? '正在执行' : service.status === 'sleeping' ? '在线休眠' : service.healthy ? '在线待命' : service.status === 'missing' ? '未启动' : '需要注意';
   return <section className="task-center-page operation-task-panel">
     <div className="section-head"><div><p className="eyebrow">{definition.label}</p><h2>{definition.label}任务</h2><p>{definition.description}</p></div></div>
-    <section className={`operation-worker-state ${service?.healthy ? service.status : 'error'}`}><div><strong>{serviceState}</strong><span>{service?.detail ?? '正在读取 Worker 心跳。'}</span></div><small>{service?.lastSeenAt ? `最近心跳 ${formatTime(service.lastSeenAt)}` : '尚未收到心跳'}</small></section>
+    <section className={`operation-worker-state ${serviceVisualState(service)}`}><div><strong>{serviceState}</strong><span>{service?.detail ?? '正在读取 Worker 心跳。'}</span></div><small>{service?.lastSeenAt ? `最近心跳 ${formatTime(service.lastSeenAt)}` : '尚未收到心跳'}</small></section>
     <div className="task-toolbar" role="group" aria-label="任务筛选">{([['all', '全部'], ['running', '执行中'], ['queued', '排队中'], ['failed', '失败'], ['completed', '最近完成']] as const).map(([key, label]) => <button key={key} type="button" className={filter === key ? 'active' : ''} onClick={() => setFilter(key)}>{label}</button>)}</div>
     {error ? <div className="form-error">{error}</div> : !data ? <div className="empty">正在读取任务状态…</div> : <>
       {(filter === 'all' || filter === 'running' || filter === 'queued') && <section className="task-list-section"><div className="task-list-heading"><h3>实时任务</h3><span>{active.length} 项</span></div>{active.length ? <div className="task-list">{active.map(renderTask)}</div> : <div className="empty-card task-empty"><h3>暂无匹配的实时任务</h3><p>新任务加入队列后会立即显示在这里。</p></div>}</section>}
@@ -1069,7 +1075,7 @@ function OperationsCenterPage({ onSummary }: { onSummary: (summary: TasksRespons
       const tasks = (data?.active ?? []).filter((task) => taskMatchesScope(task, definition.scope));
       const running = tasks.filter((task) => task.status === 'running').length;
       const waiting = tasks.filter((task) => task.status === 'queued' || task.status === 'retrying').length;
-      return <button type="button" key={definition.scope} className={`operation-service ${scope === definition.scope ? 'selected' : ''} ${service?.healthy ? service.status : 'error'}`} onClick={() => setScope(definition.scope)}>
+      return <button type="button" key={definition.scope} className={`operation-service ${scope === definition.scope ? 'selected' : ''} ${serviceVisualState(service)}`} onClick={() => setScope(definition.scope)}>
         <span className="operation-service-top"><strong>{definition.label}</strong><em>{service?.status === 'busy' ? '执行中' : service?.status === 'sleeping' ? '休眠' : service?.healthy ? '在线' : service?.status === 'missing' ? '未启动' : '注意'}</em></span>
         <small title={service?.detail}>{service?.detail ?? '正在读取服务状态。'}</small>
         <footer>{definition.kinds.length ? <>{running} 执行中 · {waiting} 排队</> : '系统事件与网页接口状态'}<span>→</span></footer>
