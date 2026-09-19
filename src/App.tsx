@@ -1069,12 +1069,9 @@ function OperationsCenterPage({ onSummary }: { onSummary: (summary: TasksRespons
       const tasks = (data?.active ?? []).filter((task) => taskMatchesScope(task, definition.scope));
       const running = tasks.filter((task) => task.status === 'running').length;
       const waiting = tasks.filter((task) => task.status === 'queued' || task.status === 'retrying').length;
-      const progress = tasks.find((task) => task.progress?.total && task.progress.current !== null)?.progress ?? null;
-      const percent = progress?.total && progress.current !== null ? Math.max(0, Math.min(100, Math.round(progress.current / progress.total * 100))) : null;
       return <button type="button" key={definition.scope} className={`operation-service ${scope === definition.scope ? 'selected' : ''} ${service?.healthy ? service.status : 'error'}`} onClick={() => setScope(definition.scope)}>
         <span className="operation-service-top"><strong>{definition.label}</strong><em>{service?.status === 'busy' ? '执行中' : service?.status === 'sleeping' ? '休眠' : service?.healthy ? '在线' : service?.status === 'missing' ? '未启动' : '注意'}</em></span>
         <small title={service?.detail}>{service?.detail ?? '正在读取服务状态。'}</small>
-        {percent !== null && <div className="operation-service-progress" title={progress?.label ?? undefined}><i style={{ width: `${percent}%` }} /><span>{progress?.current} / {progress?.total}</span></div>}
         <footer>{definition.kinds.length ? <>{running} 执行中 · {waiting} 排队</> : '系统事件与网页接口状态'}<span>→</span></footer>
       </button>;
     })}</div></section>
