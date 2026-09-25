@@ -88,6 +88,7 @@ export async function ensureMySqlSchema(pool: Pool) {
     magnet_checked_at VARCHAR(40) NULL,
     magnet_error TEXT NULL,
     download_status VARCHAR(16) NOT NULL DEFAULT 'not_queued',
+    download_completion_notified_at VARCHAR(40) NULL,
     download_queued_at VARCHAR(40) NULL,
     download_added_at VARCHAR(40) NULL,
     download_torrent_hash CHAR(40) NULL,
@@ -398,6 +399,7 @@ export async function ensureMySqlSchema(pool: Pool) {
   await addColumnIfMissing(pool, 'archive_entries', 'release_checked_at', 'VARCHAR(40) NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'release_error', 'TEXT NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'download_status', "VARCHAR(16) NOT NULL DEFAULT 'not_queued'");
+  await addColumnIfMissing(pool, 'archive_entries', 'download_completion_notified_at', 'VARCHAR(40) NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'download_queued_at', 'VARCHAR(40) NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'download_added_at', 'VARCHAR(40) NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'download_torrent_hash', 'CHAR(40) NULL');
@@ -418,6 +420,11 @@ export async function ensureMySqlSchema(pool: Pool) {
   await addColumnIfMissing(pool, 'archive_entries', 'jellyfin_error', 'TEXT NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'updated_at', "VARCHAR(40) NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'");
   await pool.query("UPDATE archive_entries SET updated_at = first_seen_at WHERE updated_at = '1970-01-01T00:00:00.000Z'");
+  // Treat already-completed downloads as having emitted their completion event.
+  // This prevents the first run after migration from re-notifying old entries.
+  await pool.query(`UPDATE archive_entries
+    SET download_completion_notified_at = COALESCE(download_checked_at, download_added_at, updated_at, first_seen_at)
+    WHERE download_status = 'completed' AND download_completion_notified_at IS NULL`);
   await addColumnIfMissing(pool, 'jobs', 'attempt_count', 'INT NOT NULL DEFAULT 0');
   await addColumnIfMissing(pool, 'jobs', 'retry_after', 'VARCHAR(40) NULL');
   await addColumnIfMissing(pool, 'jobs', 'priority', 'INT NOT NULL DEFAULT 0');

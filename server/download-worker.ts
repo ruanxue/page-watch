@@ -1,9 +1,10 @@
-import { appendRuntimeLog, db, getQbittorrentSettings, recordPerformanceMetric, refreshSettings, reportIntegrationStatus, reportWorkerHeartbeat, scheduleSubscriptionProgressRebuild, type WorkerTaskContext } from './db.js';
+import { appendRuntimeLog, db, getQbittorrentSettings, recordPerformanceMetric, refreshSettings, reportIntegrationStatus, reportWorkerHeartbeat, scheduleSubscriptionProgressRebuild, type DatabaseClient, type WorkerTaskContext } from './db.js';
 import { addMagnetToQbittorrent, getQbittorrentTorrentFiles, getQbittorrentTorrentStates, isQbittorrentDownloadComplete, isQbittorrentReadyToStopSeeding, setQbittorrentTorrentFilePriority, startQbittorrentTorrents, stopQbittorrentTorrents, torrentHashFromMagnet, type QbittorrentTorrentFile, type QbittorrentTorrentState } from './qbittorrent.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { notifyLive } from './live-events.js';
 import { isExecutionEngineDraining } from './engine-drain.js';
 import { createDownloadCompletedNotification, createOperationFailureNotification, enqueueNotification } from './notifications.js';
+import { shouldEnqueueDownloadCompletionNotification } from './download-notification.js';
 
 const POLL_MS = 1_000;
 const STATUS_SYNC_MS = 10_000;
@@ -32,6 +33,7 @@ type TrackedDownload = {
   subscription_name: string;
   content: string;
   download_status: string;
+  download_completion_notified_at: string | null;
   download_added_at: string | null;
   download_checked_at: string | null;
   download_torrent_hash: string | null;
@@ -86,7 +88,7 @@ async function runNextDownloadJob() {
       if (selectedFiles.length) await startQbittorrentTorrents(settings, [torrentHash]);
       await db.transaction(async (tx) => {
         await tx.run(`UPDATE archive_entries SET download_status = ?, download_added_at = ?, download_checked_at = ?, download_error = ?,
-          download_filter_min_size_bytes = NULL, download_removed_at = NULL, updated_at = ? WHERE id = ?`,
+          download_filter_min_size_bytes = NULL, download_removed_at = NULL, download_completion_notified_at = NULL, updated_at = ? WHERE id = ?`,
         [selectedFiles.length ? 'added' : 'filtered', finishedAt, finishedAt,
           selectedFiles.length ? null : `自动单文件大小筛选：${skippedFiles.length} 个文件均小于 ${displaySize(minimumBytes)}，已在 qBittorrent 中设为不下载。`,
           finishedAt, job.archive_entry_id]);
@@ -105,6 +107,7 @@ async function runNextDownloadJob() {
     await db.transaction(async (tx) => {
       await tx.run(`UPDATE archive_entries SET download_status = ?, download_added_at = ?, download_torrent_hash = ?, download_checked_at = ?, download_error = ?,
         download_progress = NULL, download_speed = NULL, download_size = NULL, downloaded_bytes = NULL, download_save_path = NULL, download_content_path = NULL, download_removed_at = NULL,
+        download_completion_notified_at = NULL,
         download_filter_min_size_bytes = ?, updated_at = ? WHERE id = ?`,
       [canStageSizeFilter ? 'waiting' : 'added', finishedAt, submission.torrentHash, finishedAt,
         canStageSizeFilter ? `正在读取元数据，以应用最小单文件大小 ${settings.autoDownloadMinSizeMb} MB。` : null,
@@ -233,7 +236,7 @@ async function syncDownloadStates() {
   lastStatusSyncAt = Date.now();
   const settings = getQbittorrentSettings();
   if (!settings.enabled) return false;
-  const entries = await db.all<TrackedDownload>(`SELECT a.id, a.subscription_id, s.name AS subscription_name, a.content, a.download_status, a.download_added_at, a.download_checked_at, a.download_torrent_hash, a.magnet_value,
+  const entries = await db.all<TrackedDownload>(`SELECT a.id, a.subscription_id, s.name AS subscription_name, a.content, a.download_status, a.download_completion_notified_at, a.download_added_at, a.download_checked_at, a.download_torrent_hash, a.magnet_value,
     a.download_progress, a.download_speed, a.download_size, a.downloaded_bytes, a.download_save_path, a.download_content_path, a.download_filter_min_size_bytes
     FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
     WHERE a.download_status IN ('added', 'waiting', 'downloading', 'paused', 'completed')`);
@@ -300,6 +303,15 @@ async function syncDownloadStates() {
   const changedSubscriptionIds = new Set<number>();
   const checkedAtMs = Date.parse(checkedAt);
   let notificationQueued = false;
+  const enqueueCompletionNotification = async (tx: DatabaseClient, entry: TrackedDownload, nextStatus: string) => {
+    if (!shouldEnqueueDownloadCompletionNotification(entry.download_status, nextStatus, entry.download_completion_notified_at)) return false;
+    const claimed = await tx.run(`UPDATE archive_entries SET download_completion_notified_at = ?
+      WHERE id = ? AND download_completion_notified_at IS NULL`, [checkedAt, entry.id]);
+    if (!claimed.changes) return false;
+    completed.push({ id: entry.id, subscription_id: entry.subscription_id, subscription_name: entry.subscription_name, content: entry.content });
+    const queued = await enqueueNotification(createDownloadCompletedNotification({ subscription: { id: entry.subscription_id, name: entry.subscription_name }, content: entry.content, occurredAt: checkedAt }), tx);
+    return queued.queued;
+  };
   await db.transaction(async (tx) => {
     for (const entry of tracked) {
       const torrent = byHash.get(entry.hash);
@@ -361,11 +373,7 @@ async function syncDownloadStates() {
             selectedBytes: plan.selectedFiles.reduce((total, file) => total + file.size, 0),
             minimum
           });
-          if (status === 'completed' && entry.download_status !== 'completed') {
-            completed.push({ id: entry.id, subscription_id: entry.subscription_id, subscription_name: entry.subscription_name, content: entry.content });
-            const queued = await enqueueNotification(createDownloadCompletedNotification({ subscription: { id: entry.subscription_id, name: entry.subscription_name }, content: entry.content, occurredAt: checkedAt }), tx);
-            notificationQueued ||= queued.queued;
-          }
+          if (await enqueueCompletionNotification(tx, entry, status)) notificationQueued = true;
           changedSubscriptionIds.add(entry.subscription_id);
           continue;
         }
@@ -377,11 +385,7 @@ async function syncDownloadStates() {
           WHERE id = ?`, [next, entry.hash, checkedAt, torrent.progress, torrent.downloadSpeed, torrent.totalSize, torrent.downloadedBytes, torrent.savePath, torrent.contentPath, checkedAt, entry.id]);
         changedSubscriptionIds.add(entry.subscription_id);
       }
-      if (next === 'completed' && entry.download_status !== 'completed') {
-        completed.push({ id: entry.id, subscription_id: entry.subscription_id, subscription_name: entry.subscription_name, content: entry.content });
-        const queued = await enqueueNotification(createDownloadCompletedNotification({ subscription: { id: entry.subscription_id, name: entry.subscription_name }, content: entry.content, occurredAt: checkedAt }), tx);
-        notificationQueued ||= queued.queued;
-      }
+      if (await enqueueCompletionNotification(tx, entry, next)) notificationQueued = true;
     }
   });
   for (const entry of completed) {

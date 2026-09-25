@@ -356,7 +356,11 @@ export async function queueReleaseJob(archiveEntryId: number, client: DatabaseCl
 
 /** Add an archive item to the qBittorrent submission queue, without allowing a duplicate active job. */
 export async function queueDownloadJob(archiveEntryId: number, client: DatabaseClient = db, priority: JobPriority = JOB_PRIORITY.normal) {
-  return queueUnique('download_jobs', 'archive_entry_id', archiveEntryId, priority, client);
+  const result = await queueUnique('download_jobs', 'archive_entry_id', archiveEntryId, priority, client);
+  if (result.queued) {
+    await client.run('UPDATE archive_entries SET download_completion_notified_at = NULL WHERE id = ?', [archiveEntryId]);
+  }
+  return result;
 }
 
 /** Exact Jellyfin lookup runs ahead of automatic magnet searching. */
