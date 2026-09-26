@@ -168,7 +168,7 @@ function archiveItems(content: string) {
   return [...new Set(content.split('\n').map((item) => item.trim()).filter(Boolean))];
 }
 
-async function archiveNewItems(subscription: Subscription, items: CapturedItem[], capturedAt: string, client: DatabaseClient) {
+async function archiveNewItems(subscription: Subscription, items: CapturedItem[], capturedAt: string, client: DatabaseClient, suppressAutoDownload = false) {
   const rules = getInspectionRules();
   const jellyfin = getJellyfinSettings();
   const currentItems = uniqueItems(items);
@@ -181,8 +181,8 @@ async function archiveNewItems(subscription: Subscription, items: CapturedItem[]
     const releaseUrl = rules.releaseDate.enabled ? expandReleaseUrl(rules.releaseDate.urlTemplate, { detailUrl, subscriptionUrl: subscription.url, content: item.content }) : null;
     const shouldCheckLibraryFirst = rules.magnet.enabled && jellyfin.enabled && jellyfin.libraryIds.length > 0 && jellyfin.skipMagnetWhenAvailable;
     const result = await client.run(`INSERT IGNORE INTO archive_entries
-      (subscription_id, content, title, archive_code, content_hash, first_seen_at, detail_url, release_status, magnet_status, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [subscription.id, item.content, item.title, archiveKey(item.content), hash(item.content), capturedAt, detailUrl, releaseUrl ? 'pending' : 'unsearched', rules.magnet.enabled && !shouldCheckLibraryFirst ? 'pending' : 'unsearched', capturedAt]);
+      (subscription_id, content, title, archive_code, content_hash, first_seen_at, detail_url, release_status, magnet_status, auto_download_suppressed, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [subscription.id, item.content, item.title, archiveKey(item.content), hash(item.content), capturedAt, detailUrl, releaseUrl ? 'pending' : 'unsearched', rules.magnet.enabled && !shouldCheckLibraryFirst ? 'pending' : 'unsearched', suppressAutoDownload ? 1 : 0, capturedAt]);
     if (result.changes) {
       insertedItems.push(item);
       if (rules.magnet.enabled) {
@@ -244,7 +244,7 @@ export async function captureSubscription(subscription: Subscription, browserPri
     const write = await tx.run(`UPDATE subscriptions
       SET last_checked_at = ?, last_hash = ?, last_content = ?, last_error = NULL, updated_at = ?
       WHERE id = ? AND updated_at = ?`, [now, result.hash, result.content, now, subscription.id, subscription.updated_at]);
-    const addedItems = write.changes ? await archiveNewItems(subscription, result.items, now, tx) : [];
+    const addedItems = write.changes ? await archiveNewItems(subscription, result.items, now, tx, !hadBaseline) : [];
     if (write.changes && hadBaseline && addedItems.length) {
       await enqueueNotification(createContentDiscoveredNotification({ subscription, count: addedItems.length, items: addedItems, occurredAt: now }), tx);
     }
@@ -336,7 +336,7 @@ async function captureInitialFullScan(subscription: Subscription, browserPriorit
         WHERE subscription_id = ? AND scan_id = ? AND id > ? ORDER BY page_number ASC, item_position ASC, id ASC LIMIT 200`, [subscription.id, scanId, cursor]);
       if (!batch.length) break;
       cursor = batch[batch.length - 1].id;
-      const inserted = await archiveNewItems(subscription, batch.map((item) => ({ content: item.content, title: item.title, detailUrl: item.detail_url })), now, tx);
+      const inserted = await archiveNewItems(subscription, batch.map((item) => ({ content: item.content, title: item.title, detailUrl: item.detail_url })), now, tx, !subscription.last_hash);
       addedCount += inserted.length;
       if (addedItems.length < 5) addedItems.push(...inserted.slice(0, 5 - addedItems.length));
     }

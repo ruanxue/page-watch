@@ -15,6 +15,7 @@ type MagnetJob = {
   content: string;
   subscription_name: string;
   attempt_count: number;
+  auto_download_suppressed: number;
 };
 
 async function remainingJobs(subscriptionId: number) {
@@ -35,7 +36,7 @@ async function logProgress(subscriptionId: number) {
 
 async function runNextMagnetJob() {
   if (isExecutionEngineDraining()) return;
-  const job = await db.get<MagnetJob>(`SELECT j.id, j.archive_entry_id, j.attempt_count, a.subscription_id, a.content, s.name AS subscription_name
+  const job = await db.get<MagnetJob>(`SELECT j.id, j.archive_entry_id, j.attempt_count, a.subscription_id, a.content, a.auto_download_suppressed, s.name AS subscription_name
     FROM magnet_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id
     WHERE j.status = 'queued' AND (j.retry_after IS NULL OR j.retry_after <= ?) ORDER BY j.priority DESC, j.requested_at ASC, j.id ASC LIMIT 1`, [new Date().toISOString()]);
   if (!job) return;
@@ -67,7 +68,7 @@ async function runNextMagnetJob() {
         await tx.run(`UPDATE archive_entries SET magnet_status = 'found', magnet_value = ?, magnet_checked_at = ?, magnet_error = NULL, updated_at = ?
           WHERE id = ?`, [result.value, finishedAt, finishedAt, job.archive_entry_id]);
         const qbit = getQbittorrentSettings();
-        if (qbit.enabled && qbit.autoDownload) {
+        if (qbit.enabled && qbit.autoDownload && !job.auto_download_suppressed) {
           const queued = await queueDownloadJob(job.archive_entry_id, tx);
           downloadQueued = queued.queued;
           if (queued.queued) await tx.run(`UPDATE archive_entries SET download_status = 'queued', download_queued_at = ?, download_error = NULL,

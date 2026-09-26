@@ -87,6 +87,7 @@ export async function ensureMySqlSchema(pool: Pool) {
     magnet_value MEDIUMTEXT NULL,
     magnet_checked_at VARCHAR(40) NULL,
     magnet_error TEXT NULL,
+    auto_download_suppressed TINYINT NOT NULL DEFAULT 0,
     download_status VARCHAR(16) NOT NULL DEFAULT 'not_queued',
     download_completion_notified_at VARCHAR(40) NULL,
     download_queued_at VARCHAR(40) NULL,
@@ -398,6 +399,7 @@ export async function ensureMySqlSchema(pool: Pool) {
   await addColumnIfMissing(pool, 'archive_entries', 'release_status', "VARCHAR(16) NOT NULL DEFAULT 'unsearched'");
   await addColumnIfMissing(pool, 'archive_entries', 'release_checked_at', 'VARCHAR(40) NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'release_error', 'TEXT NULL');
+  await addColumnIfMissing(pool, 'archive_entries', 'auto_download_suppressed', 'TINYINT NOT NULL DEFAULT 0');
   await addColumnIfMissing(pool, 'archive_entries', 'download_status', "VARCHAR(16) NOT NULL DEFAULT 'not_queued'");
   await addColumnIfMissing(pool, 'archive_entries', 'download_completion_notified_at', 'VARCHAR(40) NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'download_queued_at', 'VARCHAR(40) NULL');
