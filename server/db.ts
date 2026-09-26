@@ -1,23 +1,18 @@
 import 'dotenv/config';
 import mysql, { type Pool, type PoolConnection, type ResultSetHeader } from 'mysql2/promise';
 import { ensureMySqlSchema } from './mysql-schema.js';
-import { environmentDatabaseSettings, normalizeDatabaseSettings, savedDatabaseSettings, saveDatabaseSettings, type MySqlConnectionSettings } from './database-bootstrap.js';
+import { databaseBootstrapForStartup, databaseBootstrapNeedsMigration, environmentDatabaseSettings, migrateLegacyDatabaseSettingsToPlaintext, normalizeDatabaseSettings, savedDatabaseSettings, saveDatabaseSettings, type MySqlConnectionSettings } from './database-bootstrap.js';
 import { defaultInspectionRules, inspectionRulesJson } from './inspection-rules.js';
 import { notifyLive } from './live-events.js';
-import { decryptSecret, encryptSecret, isEncryptedSecret, readApplicationEncryptionKey } from './secret-storage.js';
+import { decryptSecret, isEncryptedSecret, isPageWatchEncryptedValue, readOptionalLegacyApplicationEncryptionKey } from './secret-storage.js';
 import { defaultRuntimeSettings, normalizeRuntimeSettings, type RuntimeSettings } from './runtime-settings.js';
-
-const applicationEncryptionKey = readApplicationEncryptionKey();
-const sensitiveSettingKeys = new Set([
-  'jellyfin_api_key', 'qbit_api_key', 'qbit_password', 'app_auth_session_secret',
-  'notification_wecom_webhook', 'notification_dingtalk_webhook', 'notification_dingtalk_secret',
-  'notification_webhook_url', 'notification_webhook_hmac_secret'
-]);
 
 let pool: Pool | null = null;
 let databaseSource: 'environment' | 'saved' | null = null;
 let databaseConfigurationProblem: string | null = null;
 let databaseConfigurationInProgress = false;
+let legacyBootstrapCiphertextForMigration: string | null = null;
+let legacyBootstrapSettingsForMigration: MySqlConnectionSettings | null = null;
 
 function createPool(config: MySqlConnectionSettings) {
   return mysql.createPool({
@@ -39,13 +34,22 @@ function createPool(config: MySqlConnectionSettings) {
 function loadDatabasePool() {
   try {
     const environment = environmentDatabaseSettings();
-    const saved = environment ? null : savedDatabaseSettings();
+    const bootstrap = databaseBootstrapForStartup();
+    const saved = bootstrap?.settings ?? null;
+    const legacyBootstrap = bootstrap && bootstrap.ciphertext !== null ? bootstrap : null;
+    if (legacyBootstrap) {
+      if (environment && (environment.host !== legacyBootstrap.settings.host || environment.port !== legacyBootstrap.settings.port || environment.database !== legacyBootstrap.settings.database)) {
+        throw new Error('MYSQL_* 环境变量指向的数据库与旧版引导文件不同。为避免迁移错误的数据库，请暂时清除 MYSQL_* 环境变量并使用旧版引导连接完成迁移；数据库和引导文件未修改。');
+      }
+      legacyBootstrapCiphertextForMigration = legacyBootstrap.ciphertext;
+      legacyBootstrapSettingsForMigration = legacyBootstrap.settings;
+    }
     const config = environment ?? saved;
     if (!config) return null;
     databaseSource = environment ? 'environment' : 'saved';
     return createPool(config);
   } catch (error) {
-    databaseConfigurationProblem = '已保存的数据库连接无法读取。请重新填写 MySQL 配置，并确认 APP_ENCRYPTION_KEY 未变更。';
+    databaseConfigurationProblem = error instanceof Error ? error.message : '已保存的数据库连接无法读取。请确认 APP_ENCRYPTION_KEY 未变更。';
     console.warn(`Unable to read saved database connection: ${error instanceof Error ? error.message : String(error)}`);
     return null;
   }
@@ -113,6 +117,12 @@ export const db: DatabaseClient & { transaction<T>(work: (tx: DatabaseClient) =>
 /** Test, initialise and persist a browser-provided MySQL connection only after it succeeds. */
 export async function configureDatabase(input: Partial<MySqlConnectionSettings>) {
   if (databaseSource === 'environment') throw new Error('当前数据库连接由 Docker 环境变量管理，请在部署配置中修改。');
+  if (databaseBootstrapNeedsMigration()) {
+    // Do not let the setup form replace a v1 bootstrap when the legacy key is
+    // absent or wrong. First migrate the stored destination with its old key.
+    savedDatabaseSettings();
+    throw new Error('旧版数据库引导配置尚未迁移；请保留原数据库连接和旧密钥，让新版先完成迁移，再更改 MySQL 地址。');
+  }
   const settings = normalizeDatabaseSettings(input);
   const candidate = createPool(settings);
   const previousPool = pool;
@@ -476,18 +486,15 @@ export function getSetting(key: string) {
   return settings.get(key) ?? '';
 }
 
-function storedSettingValue(key: string, value: string) {
-  return sensitiveSettingKeys.has(key) ? encryptSecret(value, applicationEncryptionKey) : value;
-}
-
 function readableSettingValue(key: string, value: string) {
-  return sensitiveSettingKeys.has(key) ? decryptSecret(value, applicationEncryptionKey) : value;
+  if (!isPageWatchEncryptedValue(value)) return value;
+  if (!isEncryptedSecret(value)) throw new Error(`app_settings 中发现不支持的 pwenc 加密版本（${key}）；数据库未修改。`);
+  throw new Error(`app_settings 中仍有未迁移的 pwenc:v1 配置（${key}）；请重启 Page Watch 完成迁移。`);
 }
 
 export async function setSetting(key: string, value: string) {
-  const stored = storedSettingValue(key, value);
   await db.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, ?, ?)
-    ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`, [key, stored, new Date().toISOString()]);
+    ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`, [key, value, new Date().toISOString()]);
   settings.set(key, value);
 }
 
@@ -505,22 +512,43 @@ export async function refreshSettings(force = false) {
   lastSettingsRefreshAt = Date.now();
 }
 
-/** Encrypt legacy plaintext credentials once, without changing their plaintext value in memory. */
-async function encryptLegacySensitiveSettings() {
-  const rows = await db.all<{ key: string; value: string }>('SELECT `key`, value FROM app_settings');
-  const legacy = rows.filter((row) => sensitiveSettingKeys.has(row.key) && !isEncryptedSecret(row.value));
-  // Validate ciphertext from prior launches before a worker starts using it.
-  for (const row of rows) if (sensitiveSettingKeys.has(row.key) && isEncryptedSecret(row.value)) readableSettingValue(row.key, row.value);
-  if (!legacy.length) return;
-  const now = new Date().toISOString();
-  await db.transaction(async (tx) => {
-    for (const row of legacy) {
-      const encrypted = storedSettingValue(row.key, row.value);
-      // More than one worker can start at once; this condition makes the
-      // migration idempotent even if each observed the same plaintext row.
-      await tx.run('UPDATE app_settings SET value = ?, updated_at = ? WHERE `key` = ? AND value = ?', [encrypted, now, row.key, row.value]);
-    }
-  });
+/** Decrypt every legacy value before any update, then convert the set atomically. */
+async function migrateEncryptedSettingsToPlaintext() {
+  const keyToClear: { current: Buffer | null } = { current: null };
+  try {
+    await db.transaction(async (tx) => {
+      const rows = await tx.all<{ key: string; value: string }>('SELECT `key`, value FROM app_settings FOR UPDATE');
+      const encrypted = rows.filter((row) => isPageWatchEncryptedValue(row.value));
+      const unsupported = encrypted.find((row) => !isEncryptedSecret(row.value));
+      if (unsupported) throw new Error(`app_settings 中发现不支持的 pwenc 加密版本（${unsupported.key}）；数据库和引导文件未修改。`);
+      if (!encrypted.length) return;
+
+      const key = readOptionalLegacyApplicationEncryptionKey();
+      if (!key) throw new Error('app_settings 中存在旧版 pwenc:v1 密文，但未找到原 APP_ENCRYPTION_KEY 或旧 data/app-encryption-key。请恢复原密钥后重启；数据库和引导文件未修改。');
+      keyToClear.current = key;
+      const plaintextRows = encrypted.map((row) => {
+        try { return { ...row, plaintext: decryptSecret(row.value, key!) }; }
+        catch {
+          throw new Error(`无法使用当前 APP_ENCRYPTION_KEY 解密 app_settings 中的 pwenc:v1 配置（${row.key}）。请确认旧密钥正确；数据库和引导文件未修改。`);
+        }
+      });
+      const now = new Date().toISOString();
+      for (const row of plaintextRows) {
+        const result = await tx.run('UPDATE app_settings SET value = ?, updated_at = ? WHERE `key` = ? AND value = ?', [row.plaintext, now, row.key, row.value]);
+        if (result.changes !== 1) throw new Error(`迁移 app_settings 中的旧版密文时配置已变化（${row.key}）；数据库事务已回滚。`);
+      }
+    });
+  } finally {
+    keyToClear.current?.fill(0);
+  }
+}
+
+async function migrateDatabaseBootstrapToPlaintext() {
+  if (!legacyBootstrapCiphertextForMigration || !databaseBootstrapNeedsMigration()) return;
+  if (!legacyBootstrapSettingsForMigration) throw new Error('旧版数据库引导配置无法读取；未修改引导文件。');
+  migrateLegacyDatabaseSettingsToPlaintext(legacyBootstrapSettingsForMigration, legacyBootstrapCiphertextForMigration);
+  legacyBootstrapCiphertextForMigration = null;
+  legacyBootstrapSettingsForMigration = null;
 }
 
 export type PerformanceMetricInput = {
@@ -823,7 +851,8 @@ let initialization: Promise<void> | null = null;
 export function initializeDatabase() {
   if (!initialization) initialization = (async () => {
     await ensureMySqlSchema(requirePool());
-    await encryptLegacySensitiveSettings();
+    await migrateEncryptedSettingsToPlaintext();
+    await migrateDatabaseBootstrapToPlaintext();
     await preloadSettings();
     await seedDefaultSubscriptionPresets();
     await backfillMissavPaginationDefaults();

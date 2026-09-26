@@ -12,14 +12,16 @@ services:
       PORT: 3030
       OUTBOUND_PROXY: ${OUTBOUND_PROXY:-}
       # Optional legacy bootstrap values. When omitted, MySQL is configured
-      # through the first-run page and saved encrypted in ./data.
+      # through the first-run page.
       MYSQL_HOST: ${MYSQL_HOST:-}
       MYSQL_PORT: ${MYSQL_PORT:-3306}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-}
       MYSQL_USER: ${MYSQL_USER:-}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-}
       PAGE_WATCH_BOOTSTRAP_PATH: /data/database-bootstrap.json
+      # Used only to find an existing key while migrating legacy pwenc:v1 data.
       PAGE_WATCH_ENCRYPTION_KEY_PATH: /data/app-encryption-key
+      # Migration-only: keep the original value while upgrading legacy pwenc:v1 data.
       APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:-}
       APP_SESSION_SECURE: ${APP_SESSION_SECURE:-false}
     volumes:

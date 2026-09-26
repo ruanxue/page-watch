@@ -3,15 +3,14 @@ name: page-watch
 x-page-watch-environment: &page-watch-environment
   OUTBOUND_PROXY: ${OUTBOUND_PROXY:-}
   # Optional legacy bootstrap values. New deployments configure MySQL in the
-  # browser and store it encrypted in the persistent Page Watch data folder.
+  # browser.
   MYSQL_HOST: ${MYSQL_HOST:-}
   MYSQL_PORT: ${MYSQL_PORT:-3306}
   MYSQL_DATABASE: ${MYSQL_DATABASE:-}
   MYSQL_USER: ${MYSQL_USER:-}
   MYSQL_PASSWORD: ${MYSQL_PASSWORD:-}
   MYSQL_CONNECTION_LIMIT: ${MYSQL_CONNECTION_LIMIT:-3}
-  # Optional advanced override. When blank, a random key is generated once in
-  # the mounted data directory and survives image/container updates.
+  # Migration-only: keep the original value while upgrading legacy pwenc:v1 data.
   APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:-}
 
 x-page-watch-service: &page-watch-service
@@ -33,6 +32,7 @@ services:
       <<: *page-watch-environment
       PORT: 3030
       PAGE_WATCH_BOOTSTRAP_PATH: /data/database-bootstrap.json
+      # Read only by the one-time migration from the legacy encrypted format.
       PAGE_WATCH_ENCRYPTION_KEY_PATH: /data/app-encryption-key
       APP_SESSION_SECURE: ${APP_SESSION_SECURE:-false}
     volumes:

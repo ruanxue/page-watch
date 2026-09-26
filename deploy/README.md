@@ -32,7 +32,7 @@
    它会创建 `page-watch-backend` 共享网络和 `deploy/.env`。编辑 `deploy/.env`：
 
    - `PAGE_WATCH_IMAGE` 改成实际 GHCR 地址，例如 `ghcr.io/your-name/page-watch:stable`；
-   - 个人部署可将 `APP_ENCRYPTION_KEY` 留空；服务会在 `data/app-encryption-key` 自动生成并持久保存密钥。高级部署可自行填写 32 字节 Base64URL 密钥，后续升级必须保持不变；
+   - 新部署不需要设置 `APP_ENCRYPTION_KEY`；首次启动后在网页填写 MySQL 地址、数据库名、账号和密码。只有从旧版升级时，才临时保留原 `APP_ENCRYPTION_KEY` 或 `data/app-encryption-key`，用于一次性迁移旧数据；
    - NAS 没有代理时保持 `OUTBOUND_PROXY=` 为空。
 
 6. 将 MySQL 与 Jellyfin 服务也加入 `page-watch-backend` 网络。长期方案是在各自 Compose 文件中声明这个 `external` 网络；临时检查可以使用：
@@ -50,7 +50,19 @@
    bash scripts/nas/update.sh
    ```
 
-打开 `http://NAS_LAN_IP:3030`。首次安装先在网页填写 MySQL 服务地址、数据库名、专用账号及密码；验证与建表成功后，连接信息会经 `APP_ENCRYPTION_KEY` 加密保存至项目的 `data/database-bootstrap.json`，不会随镜像升级丢失。Page Watch 只运行一个容器；容器内常驻网页 API/SSE 进程和轻量执行引擎，网页执行器（含 Chromium）与 Jellyfin 全量同步器只会在有任务时启动，并在完成/空闲后退出。任务中心仍会分别展示网页检查、发行日期、磁力检索、qBittorrent 下载和 Jellyfin 同步任务。
+打开 `http://NAS_LAN_IP:3030`。首次安装只需在网页填写 MySQL 服务地址、数据库名、专用账号及密码。连接信息会以明文保存在 `data/database-bootstrap.json`，外部服务凭据会以明文保存在 MySQL；MySQL 备份也会包含这些凭据，请限制网络访问、账号权限和备份文件权限。Page Watch 只运行一个容器；容器内常驻网页 API/SSE 进程和轻量执行引擎，网页执行器（含 Chromium）与 Jellyfin 全量同步器只会在有任务时启动，并在完成/空闲后退出。任务中心仍会分别展示网页检查、发行日期、磁力检索、qBittorrent 下载和 Jellyfin 同步任务。
+
+## 从旧版加密配置迁移
+
+升级前先备份 `page_watch` 数据库和 `data` 目录，并停止旧版容器。新版启动时会使用原 `APP_ENCRYPTION_KEY` 或 `data/app-encryption-key`，先在一个 MySQL 事务中解密并迁移旧 `pwenc:v1` 设置，再把数据库连接文件原子改为 version 2 明文格式。旧密钥缺失或不正确时不会修改旧密文；保留旧密钥、修复数据库连接后再重试。
+
+如果旧引导文件使用 `MYSQL_*` 环境变量启动，请确保环境变量连接的 MySQL 与旧 `database-bootstrap.json` 指向同一个数据库，否则新版会停止迁移且不写入文件。迁移时保留旧 NAS 使用的数据库地址，先完成迁移并确认 version 2。然后在本地新部署首次引导中填写同一个 `page_watch` 数据库的局域网地址、库名、账号和密码。若要让现有 NAS 容器改用另一台 MySQL，先备份并将完整 `page_watch` 数据库恢复到新服务器，再在 `deploy/.env` 中设置 `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_DATABASE`、`MYSQL_USER` 和 `MYSQL_PASSWORD` 后重启容器；不要只改地址连到空库。`MYSQL_*` 设置会覆盖引导文件，网页不能修改这种环境变量管理的连接。迁移期间不要运行旧版容器。旧版不能读取 version 2 引导文件，而且可能将已迁移的设置重新加密。迁移完成后可从 `deploy/.env` 移除 `APP_ENCRYPTION_KEY`；不要删除 `data` 目录。若 MySQL 设置迁移成功但引导文件替换失败，保留旧密钥和备份，重启新版即可重试。可用下面的命令只查看引导文件版本，不会输出其中的连接密码：
+
+```bash
+docker exec pagewatch node -e "console.log(JSON.parse(require('fs').readFileSync('/data/database-bootstrap.json','utf8')).version)"
+```
+
+输出 `2` 表示引导文件已迁移。若原密钥永久丢失，旧密文无法解密，新版会停止迁移并保留原数据；需要恢复匹配的旧密钥，或在数据库备份后由管理员人工处理受影响的加密项。
 
 ## 内部服务地址
 

@@ -43,7 +43,13 @@ docker compose up -d --build
 
 打开 `http://NAS_IP:3030`。Compose 只启动一个 Page Watch 容器；容器内常驻的只有网页 API/SSE 进程与轻量执行引擎。网页检查、发行日期、磁力检索与预览由按需网页执行器处理，并和 Chromium 一起在设定的空闲时间后退出；Jellyfin 全量同步同样由按需同步器分页写入 MySQL。任务中心仍展示六项独立逻辑服务，订阅、档案、队列、下载与影视库状态、运行日志保存在 MySQL；请按你的 NAS 备份策略备份 `page_watch` 数据库。
 
-部署前请复制 `.env.example` 为 `.env`；个人部署无需填写 `APP_ENCRYPTION_KEY`，首次启动会在 Docker 持久目录自动生成 `data/app-encryption-key` 并在后续更新复用。首次打开网页会先要求填写 MySQL 地址、库名、账号和密码；连接测试及建表成功后，连接信息会以 AES-256-GCM 加密保存在 Docker 的 `./data/database-bootstrap.json`，容器升级不会丢失。若需要让密钥独立于数据卷管理，可在 `.env` 显式填写 32 字节 Base64URL 格式的 `APP_ENCRYPTION_KEY`；已有部署务必保留原值，避免旧凭据无法解密。既有部署仍可保留 `MYSQL_*` 环境变量以兼容旧方式，但网页不能覆盖由环境变量管理的连接。健康检查以 `curl /api/ready` 完成，不会周期性启动额外 Node 进程；安装引导尚未完成时它返回 503 是正常状态。
+部署前请复制 `.env.example` 为 `.env`；新部署无需设置 `APP_ENCRYPTION_KEY`。首次打开网页只需填写 MySQL 地址、库名、账号和密码；连接信息以明文保存在 `data/database-bootstrap.json`，外部服务凭据以明文保存在 MySQL。MySQL 备份因此包含外部服务凭据，必须限制数据库网络访问、账号权限和备份文件读取权限。`APP_ENCRYPTION_KEY` 仅用于一次性迁移旧版 `pwenc:v1` 配置；旧 NAS 升级时要保留原环境变量或 `data/app-encryption-key`，直到迁移完成并确认 `database-bootstrap.json` 已变为 version 2。既有部署仍可使用 `MYSQL_*` 环境变量；网页不能覆盖由环境变量管理的连接。健康检查以 `curl /api/ready` 完成，不会周期性启动额外 Node 进程；安装引导尚未完成时它返回 503 是正常状态。
+
+### 从旧版 NAS 升级
+
+先停止旧版容器，再用保留原有数据目录、旧 MySQL 连接和原 `APP_ENCRYPTION_KEY` / `data/app-encryption-key` 的新版启动一次。新版会在一个 MySQL 事务中验证并解密全部 `pwenc:v1` 设置，再统一改为明文；事务成功后才原子替换数据库引导文件为 version 2 明文格式。迁移时不要更改旧 NAS 使用的数据库地址。确认 version 2 后，本地新部署只需填写同一个 `page_watch` 数据库的局域网地址、库名、账号和密码。若要改用另一台 MySQL，先备份并把完整 `page_watch` 数据库恢复到新服务器，再将新部署指向它。迁移完成后可移除旧密钥配置。不要让旧版和新版同时运行，也不要让旧版在迁移后重新写入数据库；旧版无法读取 version 2 引导文件，且可能把已明文迁移的设置重新加密。
+
+若旧密钥缺失、错误或发现未知的 `pwenc:` 版本，迁移会失败并保留原密文和 version 1 引导文件。恢复原密钥后重试，不要删除密文。如果 app_settings 的 MySQL 事务已提交为明文但引导文件原子写入失败，保留原密钥和数据库备份并再次启动新版完成引导文件迁移。迁移后旧版不能读取 version 2；回滚前必须恢复升级前的 MySQL 与 `data` 备份。
 
 ### 首次访问与安全
 
@@ -103,7 +109,7 @@ WSL 本地开发使用项目版本对应的 Playwright Chromium；首次运行�
 
 在左侧“通知设置”中可选择企业微信机器人、钉钉机器人或通用 Webhook 作为唯一主通知渠道。默认仅发送“发现新内容”和“任务最终失败”；“已找到磁力链接”“下载完成”可按需开启。首次建立内容历史不会发送通知；一次检查发现多条新内容时会汇总为一条，并最多列出 5 条。企业微信机器人发送纯文本，以便个人微信查看；钉钉使用 Markdown 格式。
 
-通知地址、钉钉签名密钥和 Webhook HMAC 密钥均使用 `APP_ENCRYPTION_KEY` 加密保存，网页只显示是否已配置。业务事件先写入 MySQL Outbox，发送失败会自动重试三次；相同订阅的相同最终错误会在 30 分钟内合并。通用 Webhook 使用 JSON `POST`，包含事件类型、时间、订阅、任务和条目摘要；配置 HMAC 密钥后，请用 `X-Page-Watch-Timestamp` 与 `X-Page-Watch-Signature`（`sha256=<hex>`，签名输入为 `timestamp.body`）验签。
+通知地址、钉钉签名密钥和 Webhook HMAC 密钥以明文保存在 MySQL 中，网页只显示是否已配置。业务事件先写入 MySQL Outbox，发送失败会自动重试三次；相同订阅的相同最终错误会在 30 分钟内合并。通用 Webhook 使用 JSON `POST`，包含事件类型、时间、订阅、任务和条目摘要；配置 HMAC 密钥后，请用 `X-Page-Watch-Timestamp` 与 `X-Page-Watch-Signature`（`sha256=<hex>`，签名输入为 `timestamp.body`）验签。
 
 ## qBittorrent 下载
 

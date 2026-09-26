@@ -1,10 +1,11 @@
-import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { createDecipheriv, createCipheriv, randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
-const prefix = 'pwenc:v1:';
+const encryptedPrefix = 'pwenc:';
+const version1Prefix = 'pwenc:v1:';
 
-function decodeApplicationEncryptionKey(raw: string) {
+function decodeLegacyApplicationEncryptionKey(raw: string) {
   const encoded = raw.trim();
   if (!/^[A-Za-z0-9_-]+$/.test(encoded)) throw new Error('APP_ENCRYPTION_KEY 必须是有效的 Base64URL 字符串。');
   let key: Buffer;
@@ -14,59 +15,53 @@ function decodeApplicationEncryptionKey(raw: string) {
   return key;
 }
 
-const generatedKeyPath = resolve(process.env.PAGE_WATCH_ENCRYPTION_KEY_PATH?.trim() || './data/app-encryption-key');
+export const legacyApplicationEncryptionKeyPath = resolve(process.env.PAGE_WATCH_ENCRYPTION_KEY_PATH?.trim() || './data/app-encryption-key');
 
-function readOrCreateGeneratedKey() {
-  try { return readFileSync(generatedKeyPath, 'utf8').trim(); }
+/** Reads a legacy key for the one-time migration. New deployments never create a key. */
+export function readOptionalLegacyApplicationEncryptionKey(raw = process.env.APP_ENCRYPTION_KEY) {
+  if (raw?.trim()) return decodeLegacyApplicationEncryptionKey(raw);
+  try { return decodeLegacyApplicationEncryptionKey(readFileSync(legacyApplicationEncryptionKeyPath, 'utf8').trim()); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-  }
-  mkdirSync(dirname(generatedKeyPath), { recursive: true });
-  const generated = randomBytes(32).toString('base64url');
-  try {
-    // wx ensures two briefly overlapping startup processes never overwrite a
-    // usable key. The loser reads the winner's value below.
-    writeFileSync(generatedKeyPath, `${generated}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-    console.info(`APP_ENCRYPTION_KEY 未提供，已在持久目录创建本地加密密钥：${generatedKeyPath}`);
-    return generated;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    return readFileSync(generatedKeyPath, 'utf8').trim();
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
   }
 }
 
-/**
- * Advanced deployments may keep the root key outside the data volume through
- * APP_ENCRYPTION_KEY. Personal installations can omit it: a random key is
- * then generated once inside the mounted data directory and reused on update.
- */
+/** Kept for the legacy storage tests and migration callers that require a key. */
 export function readApplicationEncryptionKey(raw = process.env.APP_ENCRYPTION_KEY) {
-  return decodeApplicationEncryptionKey(raw?.trim() || readOrCreateGeneratedKey());
+  const key = readOptionalLegacyApplicationEncryptionKey(raw);
+  if (!key) throw new Error('旧版加密配置需要原 APP_ENCRYPTION_KEY 或 data/app-encryption-key。未找到密钥，数据库中的 pwenc:v1 密文未修改。');
+  return key;
 }
 
 export function isEncryptedSecret(value: string) {
-  return value.startsWith(prefix);
+  return value.startsWith(version1Prefix);
 }
 
-/** Versioned AES-256-GCM storage format. The key always remains outside MySQL. */
-export function encryptSecret(value: string, key: Buffer) {
-  const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', key, iv);
-  const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return `${prefix}${iv.toString('base64url')}:${ciphertext.toString('base64url')}:${tag.toString('base64url')}`;
+export function isPageWatchEncryptedValue(value: string) {
+  return value.startsWith(encryptedPrefix);
 }
 
+/** Legacy decoder only. Current settings are stored and read as plaintext. */
 export function decryptSecret(value: string, key: Buffer) {
-  if (!isEncryptedSecret(value)) return value;
+  if (!isPageWatchEncryptedValue(value)) return value;
+  if (!isEncryptedSecret(value)) throw new Error('不支持的加密配置版本。仅支持迁移旧版 pwenc:v1 数据。');
   const [, , encodedIv, encodedCiphertext, encodedTag, extra] = value.split(':');
-  // AES-GCM 对空字符串会产生合法的空密文段；IV 与认证标签仍必须存在。
-  if (!encodedIv || encodedCiphertext === undefined || !encodedTag || extra) throw new Error('保存的敏感配置格式无效。请重新配置对应服务。');
+  if (!encodedIv || encodedCiphertext === undefined || !encodedTag || extra) throw new Error('保存的 pwenc:v1 配置格式无效。');
   try {
     const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(encodedIv, 'base64url'));
     decipher.setAuthTag(Buffer.from(encodedTag, 'base64url'));
     return Buffer.concat([decipher.update(Buffer.from(encodedCiphertext, 'base64url')), decipher.final()]).toString('utf8');
   } catch {
-    throw new Error('无法解密敏感配置。请确认 APP_ENCRYPTION_KEY 未变更；如密钥已遗失，请重新配置外部服务。');
+    throw new Error('无法使用现有 APP_ENCRYPTION_KEY 解密旧版 pwenc:v1 配置。请确认使用升级前的密钥；迁移未修改数据库密文。');
   }
+}
+
+/** Kept only to preserve the old v1 format for compatibility tooling and tests. */
+export function encryptSecret(value: string, key: Buffer) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `${version1Prefix}${iv.toString('base64url')}:${ciphertext.toString('base64url')}:${tag.toString('base64url')}`;
 }
