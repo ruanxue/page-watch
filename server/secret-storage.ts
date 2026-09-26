@@ -53,7 +53,7 @@ export function decryptSecret(value: string, key: Buffer) {
     decipher.setAuthTag(Buffer.from(encodedTag, 'base64url'));
     return Buffer.concat([decipher.update(Buffer.from(encodedCiphertext, 'base64url')), decipher.final()]).toString('utf8');
   } catch {
-    throw new Error('无法使用现有 APP_ENCRYPTION_KEY 解密旧版 pwenc:v1 配置。请确认使用升级前的密钥；迁移未修改数据库密文。');
+    throw new Error('无法解密旧版 pwenc:v1 配置：当前 APP_ENCRYPTION_KEY 无法解密该密文。请确认使用升级前的密钥；迁移未修改数据库密文。');
   }
 }
 
