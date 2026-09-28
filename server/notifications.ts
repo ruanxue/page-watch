@@ -5,7 +5,7 @@ import { buildNotificationRequest, type FetchLike } from './notification-protoco
 export { dingtalkSignature, notificationMarkdown, webhookSignature } from './notification-protocol.js';
 
 export type NotificationChannel = 'wecom' | 'dingtalk' | 'webhook';
-export type NotificationEventType = 'content_discovered' | 'operation_failed' | 'magnet_found' | 'download_completed';
+export type NotificationEventType = 'content_discovered' | 'operation_failed' | 'magnet_found' | 'download_completed' | 'full_scan_completed';
 export type NotificationSeverity = 'info' | 'error';
 
 export type NotificationItem = { content: string; title?: string | null; detailUrl?: string | null };
@@ -21,6 +21,14 @@ export type NotificationPayload = {
   subscription: { id: number; name?: string | null } | null;
   operation: { kind: string; jobId?: number | null; error?: string | null } | null;
   items: NotificationItem[];
+  fullScan?: {
+    pageCount: number;
+    scannedCount: number;
+    archivedCount: number;
+    magnetFoundCount: number;
+    magnetNotFoundCount: number;
+    failedCount: number;
+  };
 };
 
 export type NotificationEvents = Record<NotificationEventType, boolean>;
@@ -63,7 +71,8 @@ const defaultEvents: NotificationEvents = {
   content_discovered: true,
   operation_failed: true,
   magnet_found: false,
-  download_completed: false
+  download_completed: false,
+  full_scan_completed: true
 };
 
 const settingsKeys = {
@@ -93,7 +102,9 @@ function parseEvents(raw: string): NotificationEvents {
       content_discovered: typeof value.content_discovered === 'boolean' ? value.content_discovered : defaultEvents.content_discovered,
       operation_failed: typeof value.operation_failed === 'boolean' ? value.operation_failed : defaultEvents.operation_failed,
       magnet_found: typeof value.magnet_found === 'boolean' ? value.magnet_found : defaultEvents.magnet_found,
-      download_completed: typeof value.download_completed === 'boolean' ? value.download_completed : defaultEvents.download_completed
+      download_completed: typeof value.download_completed === 'boolean' ? value.download_completed : defaultEvents.download_completed,
+      // Existing settings predate this option. Enable the one full-scan summary by default.
+      full_scan_completed: typeof value.full_scan_completed === 'boolean' ? value.full_scan_completed : defaultEvents.full_scan_completed
     };
   } catch { return { ...defaultEvents }; }
 }
@@ -144,7 +155,8 @@ function eventsInput(value: unknown, fallback: NotificationEvents): Notification
     content_discovered: booleanInput(input.content_discovered, fallback.content_discovered, '新内容通知'),
     operation_failed: booleanInput(input.operation_failed, fallback.operation_failed, '失败通知'),
     magnet_found: booleanInput(input.magnet_found, fallback.magnet_found, '磁链通知'),
-    download_completed: booleanInput(input.download_completed, fallback.download_completed, '下载完成通知')
+    download_completed: booleanInput(input.download_completed, fallback.download_completed, '下载完成通知'),
+    full_scan_completed: booleanInput(input.full_scan_completed, fallback.full_scan_completed, '全量检索汇总通知')
   };
 }
 
@@ -236,6 +248,38 @@ export function createContentDiscoveredNotification(input: {
     subscription: input.subscription,
     operation: null,
     items: input.items.slice(0, 5).map((item) => ({ content: item.content, title: item.title ?? null, detailUrl: item.detailUrl ?? null }))
+  };
+}
+
+export type FullScanNotificationStats = {
+  pageCount: number;
+  scannedCount: number;
+  archivedCount: number;
+  magnetFoundCount: number;
+  magnetNotFoundCount: number;
+  failedCount: number;
+};
+
+export function createFullScanCompletedNotification(input: {
+  subscription: { id: number; name?: string | null };
+  stats: FullScanNotificationStats;
+  items: NotificationItem[];
+  occurredAt?: string;
+}): NotificationPayload {
+  const { pageCount, scannedCount, archivedCount, magnetFoundCount, magnetNotFoundCount, failedCount } = input.stats;
+  return {
+    version: 1,
+    id: randomUUID(),
+    type: 'full_scan_completed',
+    severity: failedCount ? 'error' : 'info',
+    occurredAt: input.occurredAt ?? new Date().toISOString(),
+    title: '全量检索完成',
+    summary: `读取 ${pageCount} 页、${scannedCount} 条；入档 ${archivedCount} 条；找到磁链 ${magnetFoundCount} 条、未找到 ${magnetNotFoundCount} 条；最终失败 ${failedCount} 条。`,
+    pagePath: '#archive',
+    subscription: input.subscription,
+    operation: { kind: '全量检索' },
+    items: input.items.slice(0, 5).map((item) => ({ content: item.content, title: item.title ?? null, detailUrl: item.detailUrl ?? null })),
+    fullScan: { pageCount, scannedCount, archivedCount, magnetFoundCount, magnetNotFoundCount, failedCount }
   };
 }
 
@@ -393,6 +437,44 @@ async function recoverStalledNotifications() {
     WHERE status = 'running' AND started_at < ?`, [new Date().toISOString(), cutoff]);
 }
 
+async function finalizeOneFullScanBatch() {
+  return db.transaction(async (tx) => {
+    const batch = await tx.get<{ id: string; subscription_id: number; subscription_name: string; page_count: number | null; scanned_count: number | null; archived_count: number | null }>(`SELECT id, subscription_id, subscription_name, page_count, scanned_count, archived_count
+      FROM full_scan_batches WHERE status = 'processing' ORDER BY created_at ASC, id ASC LIMIT 1 FOR UPDATE`);
+    if (!batch) return false;
+    const active = await tx.get<{ count: number }>(`SELECT
+      (SELECT COUNT(*) FROM release_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id WHERE a.full_scan_batch_id = ? AND j.status IN ('queued','running')) +
+      (SELECT COUNT(*) FROM magnet_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id WHERE a.full_scan_batch_id = ? AND j.status IN ('queued','running')) +
+      (SELECT COUNT(*) FROM library_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id WHERE a.full_scan_batch_id = ? AND j.status IN ('queued','running')) AS count`,
+    [batch.id, batch.id, batch.id]);
+    if (Number(active?.count ?? 0) > 0) return false;
+
+    const totals = await tx.get<{ entry_count: number; magnet_found: number; magnet_not_found: number; failed_count: number }>(`SELECT COUNT(*) AS entry_count,
+        COALESCE(SUM(magnet_status = 'found'), 0) AS magnet_found,
+        COALESCE(SUM(magnet_status = 'not_found'), 0) AS magnet_not_found,
+        COALESCE(SUM(magnet_status IN ('failed','pending')), 0) + COALESCE(SUM(release_status IN ('failed','pending')), 0) AS failed_count
+      FROM archive_entries WHERE full_scan_batch_id = ?`, [batch.id]);
+    const items = await tx.all<{ content: string; title: string | null; detail_url: string | null }>(`SELECT content, title, detail_url FROM archive_entries
+      WHERE full_scan_batch_id = ? ORDER BY id ASC LIMIT 5`, [batch.id]);
+    const now = new Date().toISOString();
+    await enqueueNotification(createFullScanCompletedNotification({
+      subscription: { id: batch.subscription_id, name: batch.subscription_name },
+      stats: {
+        pageCount: Number(batch.page_count ?? 0),
+        scannedCount: Number(batch.scanned_count ?? 0),
+        archivedCount: Number(batch.archived_count ?? totals?.entry_count ?? 0),
+        magnetFoundCount: Number(totals?.magnet_found ?? 0),
+        magnetNotFoundCount: Number(totals?.magnet_not_found ?? 0),
+        failedCount: Number(totals?.failed_count ?? 0)
+      },
+      items: items.map((item) => ({ content: item.content, title: item.title, detailUrl: item.detail_url })),
+      occurredAt: now
+    }), tx);
+    await tx.run(`UPDATE full_scan_batches SET status = 'completed', completed_at = ? WHERE id = ? AND status = 'processing'`, [now, batch.id]);
+    return true;
+  });
+}
+
 export async function runNotificationWorkerTick() {
   if (working) return;
   working = true;
@@ -400,6 +482,7 @@ export async function runNotificationWorkerTick() {
     await refreshSettings();
     await maintainNotificationOutbox();
     await recoverStalledNotifications();
+    await finalizeOneFullScanBatch();
     const now = new Date().toISOString();
     const job = await db.get<OutboxRow>(`SELECT id, event_type, payload, attempt_count FROM notification_outbox
       WHERE status = 'queued' AND next_attempt_at <= ? ORDER BY created_at ASC, id ASC LIMIT 1`, [now]);

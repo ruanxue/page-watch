@@ -7,7 +7,7 @@ import type { NotificationPayload, NotificationSettings } from './notifications.
 const baseSettings: NotificationSettings = {
   enabled: true,
   channel: 'wecom',
-  events: { content_discovered: true, operation_failed: true, magnet_found: false, download_completed: false },
+  events: { content_discovered: true, operation_failed: true, magnet_found: false, download_completed: false, full_scan_completed: true },
   wecomWebhook: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=example',
   dingtalkWebhook: 'https://oapi.dingtalk.com/robot/send?access_token=example',
   dingtalkSecret: 'SECexample',
@@ -48,6 +48,31 @@ test('formats a branded DingTalk Markdown digest with independently linked conte
   assert.match(markdown, /\*\*时间：\*\* 2026-09-18 08:00:00/);
   assert.match(markdown, /\*\*订阅：\*\* 新片列表\n\n\*\*数量：\*\* 8 条/);
   assert.equal((markdown.match(/ITEM-/g) ?? []).length, 5);
+});
+
+test('formats a single full-scan summary and keeps structured webhook statistics', () => {
+  const payload: NotificationPayload = {
+    ...testPayload,
+    type: 'full_scan_completed',
+    severity: 'error',
+    title: '全量检索完成',
+    summary: '读取 8 页、212 条；入档 209 条；找到磁链 180 条、未找到 24 条；最终失败 5 条。',
+    pagePath: '#archive',
+    subscription: { id: 7, name: '新片列表' },
+    operation: { kind: '全量检索' },
+    fullScan: { pageCount: 8, scannedCount: 212, archivedCount: 209, magnetFoundCount: 180, magnetNotFoundCount: 24, failedCount: 5 },
+    items: Array.from({ length: 7 }, (_, index) => ({ content: `ITEM-${index + 1}`, title: `标题 ${index + 1}`, detailUrl: `https://example.test/${index + 1}` }))
+  };
+  const markdown = notificationMarkdown(payload);
+  assert.deepEqual(payload.fullScan, { pageCount: 8, scannedCount: 212, archivedCount: 209, magnetFoundCount: 180, magnetNotFoundCount: 24, failedCount: 5 });
+  assert.match(markdown, /^### Page Watch｜全量检索完成/);
+  assert.match(markdown, /\*\*分页：\*\* 8 页/);
+  assert.match(markdown, /\*\*读取：\*\* 212 条/);
+  assert.match(markdown, /\*\*最终失败：\*\* 5 条/);
+  assert.match(markdown, /\*\*详情 1：\*\* \[https:\/\/example\.test\/1\]/);
+  assert.equal((markdown.match(/ITEM-/g) ?? []).length, 5);
+  const webhook = buildNotificationRequest(payload, { ...baseSettings, channel: 'webhook' });
+  assert.deepEqual(JSON.parse(webhook.body).fullScan, payload.fullScan);
 });
 
 test('formats every event with a branded heading and stable field order', () => {

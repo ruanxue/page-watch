@@ -60,7 +60,7 @@ async function runNextLibrarySync() {
     }
     await recordPerformanceMetric({ scope: 'library', metric: 'processed', dimension: 'full_sync', durationMs: Date.now() - startedAtMs }).catch(() => undefined);
     await reportIntegrationStatus('jellyfin', 'healthy', '最近一次媒体库同步成功').catch(() => undefined);
-    await appendRuntimeLog({ level: 'success', source: 'library', message: `Jellyfin 影视库${job.trigger_type === 'manual' ? '手动' : '定时'}同步任务完成：扫描 ${result.scanned} 个媒体项目，${result.matched} 条已入库。` });
+    await appendRuntimeLog({ level: 'success', source: 'library', jobId: job.id, message: `Jellyfin 影视库${job.trigger_type === 'manual' ? '手动' : '定时'}同步任务完成：扫描 ${result.scanned} 个媒体项目，${result.matched} 条已入库。` });
   } catch (error) {
     const message = error instanceof Error ? error.message : '未知 Jellyfin 同步错误';
     const failedAt = new Date().toISOString();
@@ -69,7 +69,7 @@ async function runNextLibrarySync() {
       await enqueueNotification(createOperationFailureNotification({ operation: 'Jellyfin 影视库同步', error: message, jobId: job.id, occurredAt: failedAt }), tx);
     });
     await reportIntegrationStatus('jellyfin', 'degraded', '最近一次媒体库同步失败').catch(() => undefined);
-    await appendRuntimeLog({ level: 'error', source: 'library', message: `Jellyfin 影视库${job.trigger_type === 'manual' ? '手动' : '定时'}同步失败：${message}` });
+    await appendRuntimeLog({ level: 'error', source: 'library', jobId: job.id, message: `Jellyfin 影视库${job.trigger_type === 'manual' ? '手动' : '定时'}同步失败：${message}` });
   } finally {
     syncing = false;
     syncTask = null;

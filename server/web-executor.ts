@@ -4,13 +4,17 @@ import { flushTelemetry, getRuntimeSettings, refreshSettings, reportRuntimeMetri
 import { getInspectionRules, type ReleaseDateRule } from './inspection-rules.js';
 import { lookupMagnet } from './magnet.js';
 import { lookupReleaseDate } from './release-date.js';
+import { readMissavActressName, readMissavPerformers, searchMissavCode } from './missav-search.js';
 import { startRuntimeMemoryReporter } from './runtime-observability.js';
 
 type ExecutorRequest =
   | { id: string; operation: 'capture'; payload: { subscription: Subscription; priority: number } }
   | { id: string; operation: 'release'; payload: { detailUrl: string; rule: ReleaseDateRule; priority: number } }
   | { id: string; operation: 'magnet'; payload: { content: string; rule: ReturnType<typeof getInspectionRules>['magnet'] } }
-  | { id: string; operation: 'preview'; payload: Parameters<typeof previewCapture>[0] };
+  | { id: string; operation: 'preview'; payload: Parameters<typeof previewCapture>[0] }
+  | { id: string; operation: 'code-search'; payload: { code: string; priority: number } }
+  | { id: string; operation: 'performers'; payload: { detailUrl: string } }
+  | { id: string; operation: 'actress-name'; payload: { actressUrl: string } };
 
 type ExecutorMessage = { type: 'request'; request: ExecutorRequest };
 
@@ -63,6 +67,19 @@ async function execute(request: ExecutorRequest) {
     case 'release': return lookupReleaseDate(request.payload.detailUrl, request.payload.rule, request.payload.priority);
     case 'magnet': return lookupMagnet(request.payload.content, request.payload.rule);
     case 'preview': return previewCapture(request.payload);
+    case 'code-search': {
+      const search = await searchMissavCode(request.payload.code);
+      if (search.status === 'not_found') return search;
+      const film = search.film;
+      const rule = getInspectionRules().releaseDate;
+      if (!rule.enabled) return { status: 'found', film, releaseDate: { status: 'unavailable', reason: '发行日期检索规则已停用。' } };
+      let releaseDate: { status: 'found'; releaseDate: string } | { status: 'unavailable'; reason: string } | { status: 'failed'; reason: string };
+      try { releaseDate = await lookupReleaseDate(film.detailUrl, rule, request.payload.priority); }
+      catch (error) { releaseDate = { status: 'failed', reason: error instanceof Error ? error.message : String(error) }; }
+      return { status: 'found', film, releaseDate };
+    }
+    case 'performers': return readMissavPerformers(request.payload.detailUrl);
+    case 'actress-name': return readMissavActressName(request.payload.actressUrl);
   }
 }
 

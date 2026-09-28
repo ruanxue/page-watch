@@ -55,11 +55,19 @@ function notificationFields(payload: NotificationPayload): NotificationField[] {
   const fields: NotificationField[] = [];
   if (payload.subscription) fields.push({ label: '订阅', value: payload.subscription.name ?? `#${payload.subscription.id}` });
   if (payload.type === 'content_discovered') fields.push({ label: '数量', value: `${discoveredCount(payload)} 条` });
+  if (payload.type === 'full_scan_completed' && payload.fullScan) {
+    fields.push({ label: '分页', value: `${payload.fullScan.pageCount} 页` });
+    fields.push({ label: '读取', value: `${payload.fullScan.scannedCount} 条` });
+    fields.push({ label: '入档', value: `${payload.fullScan.archivedCount} 条` });
+    fields.push({ label: '找到磁链', value: `${payload.fullScan.magnetFoundCount} 条` });
+    fields.push({ label: '未找到磁链', value: `${payload.fullScan.magnetNotFoundCount} 条` });
+    fields.push({ label: '最终失败', value: `${payload.fullScan.failedCount} 条` });
+  }
   const indexedItems = payload.items.slice(0, 5);
   indexedItems.forEach((item, index) => {
     const suffix = indexedItems.length > 1 ? ` ${index + 1}` : '';
     fields.push({ label: `内容${suffix}`, value: itemLabel(item) });
-    if (payload.type === 'content_discovered' && item.detailUrl) fields.push({ label: `详情${suffix}`, value: item.detailUrl, link: true });
+    if ((payload.type === 'content_discovered' || payload.type === 'full_scan_completed') && item.detailUrl) fields.push({ label: `详情${suffix}`, value: item.detailUrl, link: true });
   });
   if (payload.operation?.kind) fields.push({ label: '任务', value: payload.operation.kind });
   if (payload.type === 'operation_failed') fields.push({ label: '失败原因', value: conciseFailureReason(payload.operation?.error ?? payload.summary) });

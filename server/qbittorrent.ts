@@ -62,7 +62,18 @@ const activeSeedingStates = new Set(['uploading', 'stalledup', 'queuedup', 'forc
 
 /** A rounded 99.9% progress value is still incomplete: qBittorrent reports 1 only at 100%. */
 export function isQbittorrentDownloadComplete(torrent: Pick<QbittorrentTorrentState, 'progress' | 'state'>) {
-  return torrent.progress >= 1 && completedSeedingStates.has(torrent.state.toLowerCase());
+  const state = torrent.state.toLowerCase();
+  // These states explicitly mean the download phase has ended. Preserve them
+  // as completed even if an API response rounds progress below 100%.
+  if (state === 'pausedup' || state === 'stoppedup') return true;
+  return torrent.progress >= 1 && completedSeedingStates.has(state);
+}
+
+/** Only unfinished download-side paused states should leave the hot sync loop. */
+export function isQbittorrentDownloadPaused(torrent: Pick<QbittorrentTorrentState, 'progress' | 'state'>) {
+  if (torrent.progress >= 1 || isQbittorrentDownloadComplete(torrent)) return false;
+  const state = torrent.state.toLowerCase();
+  return state === 'pauseddl' || state === 'stoppeddl';
 }
 
 /** Only stop a torrent after qBittorrent has fully entered an active seeding state. */

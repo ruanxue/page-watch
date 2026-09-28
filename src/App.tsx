@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { FormEvent, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
 import { resetLiveUpdates, subscribeLive, type LiveEvent } from './live-updates.js';
 
 type Subscription = {
@@ -107,6 +107,15 @@ type ArchivePageResult = {
   pageSize: number;
 };
 
+type ArchiveCodeResult = Pick<ArchiveEntry, 'id' | 'content' | 'title' | 'detail_url' | 'first_seen_at' | 'release_date' | 'release_status' | 'release_error' | 'magnet_status' | 'magnet_value' | 'magnet_error' | 'subscription_id' | 'subscription_name' | 'subscription_url'>;
+type SearchPerformer = { name: string; url: string };
+type SearchRelease = { status: 'found'; releaseDate: string } | { status: 'unavailable' | 'failed'; reason: string } | { status: 'pending' };
+type SearchMagnet = { status: 'found'; value: string } | { status: 'not_found' | 'failed' | 'disabled'; reason: string } | { status: 'pending' };
+type CodeSearchResponse =
+  | { source: 'archive'; code: string; items: ArchiveCodeResult[] }
+  | { source: 'not_found'; code: string }
+  | { source: 'missav'; searchId: string; code: string; title: string | null; detailUrl: string; releaseDate: SearchRelease; magnet: SearchMagnet; performers: SearchPerformer[]; performerError: string | null };
+
 type RuntimeLog = {
   id: number;
   level: 'info' | 'success' | 'error';
@@ -121,7 +130,7 @@ type RuntimeLog = {
 };
 
 type NotificationChannel = 'wecom' | 'dingtalk' | 'webhook';
-type NotificationEvents = { content_discovered: boolean; operation_failed: boolean; magnet_found: boolean; download_completed: boolean };
+type NotificationEvents = { content_discovered: boolean; operation_failed: boolean; magnet_found: boolean; download_completed: boolean; full_scan_completed: boolean };
 type NotificationSettings = {
   enabled: boolean;
   channel: NotificationChannel;
@@ -143,7 +152,7 @@ type NotificationForm = NotificationSettings & {
 const blankNotificationForm: NotificationForm = {
   enabled: false,
   channel: 'wecom',
-  events: { content_discovered: true, operation_failed: true, magnet_found: false, download_completed: false },
+  events: { content_discovered: true, operation_failed: true, magnet_found: false, download_completed: false, full_scan_completed: true },
   wecomWebhookConfigured: false,
   dingtalkWebhookConfigured: false,
   dingtalkSecretConfigured: false,
@@ -197,7 +206,7 @@ function serviceVisualState(service: SystemService | undefined) {
   return service.healthy ? 'ready' : 'error';
 }
 type PerformanceMetrics = {
-  range: '24h' | '7d' | '30d' | '180d';
+  range: '24h' | '7d';
   generatedAt: string;
   jellyfinCache: { hit: number; miss: number; hitRate: number | null };
   workers: Array<{ scope: 'capture' | 'release' | 'magnet' | 'library' | 'download'; processed: number; averageDurationMs: number | null }>;
@@ -317,10 +326,11 @@ function shortUrl(value: string) {
 
 const weekdayLabels = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
 
-type View = 'subscriptions' | 'archive' | 'settings' | 'operations';
+type View = 'subscriptions' | 'search' | 'archive' | 'settings' | 'operations';
 
 function viewFromHash(): View {
   if (window.location.hash === '#logs' || window.location.hash === '#tasks' || window.location.hash === '#operations') return 'operations';
+  if (window.location.hash === '#search') return 'search';
   if (window.location.hash === '#archive' || window.location.hash === '#activity') return 'archive';
   if (['#settings', '#downloads', '#network', '#runtime', '#notifications'].includes(window.location.hash)) return 'settings';
   return 'subscriptions';
@@ -344,12 +354,25 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
   const [loading, setLoading] = useState(true);
   const [editor, setEditor] = useState<Subscription | null | 'new'>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Subscription | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState('');
+  const [archiveHomeRequest, setArchiveHomeRequest] = useState(0);
   const [notice, setNotice] = useState('');
   const [view, setView] = useState<View>(viewFromHash);
   const [rulesOpen, setRulesOpen] = useState(() => window.location.hash === '#rules');
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [taskSummary, setTaskSummary] = useState<TasksResponse['summary'] | null>(null);
   const [integrationOnboarding, setIntegrationOnboarding] = useState<IntegrationOnboarding | null>(null);
+  const [subscriptionLayout, setSubscriptionLayout] = useState<'list' | 'compact'>(() => {
+    try { return window.localStorage.getItem('page-watch.subscription-layout') === 'compact' ? 'compact' : 'list'; }
+    catch { return 'list'; }
+  });
+
+  useEffect(() => {
+    try { window.localStorage.setItem('page-watch.subscription-layout', subscriptionLayout); }
+    catch { /* Keep the current view even when browser storage is unavailable. */ }
+  }, [subscriptionLayout]);
 
   const load = async () => {
     try { setSubscriptions(await request<Subscription[]>('/api/subscriptions')); }
@@ -424,7 +447,6 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const servicesHealthy = Boolean(systemStatus && attentionServices.length === 0);
   const serviceAttention = attentionServices.map((service) => `${service.label}：${service.status === 'missing' ? '尚未启动' : service.detail}`).join('；');
   const taskCount = taskSummary?.running ?? busyServiceCount;
-  const healthyServiceSummary = systemStatus ? `${systemStatus.services.length} 项服务在线 · ${taskCount} 项任务执行中` : '';
 
   function openRules() {
     setRulesOpen(true);
@@ -461,13 +483,28 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
     } catch (error) { setNotice(error instanceof Error ? error.message : '操作失败。'); }
   }
 
-  async function remove(item: Subscription) {
-    if (!window.confirm(`删除订阅“${item.name}”？这会同时删除它的内容档案。`)) return;
+  function askDelete(item: Subscription) {
+    setDeleteError('');
+    setDeleteTarget(item);
+  }
+
+  async function confirmDelete() {
+    if (!deleteTarget || deleteBusy) return;
+    setDeleteBusy(true);
+    setDeleteError('');
     try {
-      await request(`/api/subscriptions/${item.id}`, { method: 'DELETE' });
+      await request(`/api/subscriptions/${deleteTarget.id}`, { method: 'DELETE' });
+      setDeleteTarget(null);
       setNotice('订阅已删除。');
       await load();
-    } catch (error) { setNotice(error instanceof Error ? error.message : '删除失败。'); }
+    } catch (error) { setDeleteError(error instanceof Error ? error.message : '删除失败，请稍后重试。'); }
+    finally { setDeleteBusy(false); }
+  }
+
+  function navigateToArchive(event: ReactMouseEvent<HTMLAnchorElement>) {
+    if (view !== 'archive') return;
+    event.preventDefault();
+    setArchiveHomeRequest((current) => current + 1);
   }
 
   return <main className="shell">
@@ -475,20 +512,21 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
       <div className="brand"><span className="brand-mark">⌁</span><span>PAGE WATCH</span></div>
       <nav aria-label="主导航">
         <a className={`nav-item ${view === 'subscriptions' ? 'active' : ''}`} href="#subscriptions"><span>◉</span> 订阅中心 <b>{stats.total}</b></a>
-        <a className={`nav-item ${view === 'archive' ? 'active' : ''}`} href="#archive"><span>◌</span> 内容档案</a>
+        <a className={`nav-item ${view === 'search' ? 'active' : ''}`} href="#search"><span>⌕</span> 番号检索</a>
+        <a className={`nav-item ${view === 'archive' ? 'active' : ''}`} href="#archive" onClick={navigateToArchive}><span>◌</span> 内容档案</a>
         <a className={`nav-item ${view === 'operations' ? 'active' : ''}`} href="#operations"><span>◫</span> 运行中心 {taskCount ? <b>{taskCount}</b> : null}</a>
         <a className={`nav-item ${view === 'settings' ? 'active' : ''}`} href="#settings"><span>⚙</span> 设置</a>
       </nav>
       <div className={`sidebar-note ${servicesHealthy ? '' : 'needs-attention'}`} title={serviceAttention}>
         <span className="pulse" /> {servicesHealthy ? '后台服务运行正常' : systemStatus ? `服务需要注意（${attentionServices.length}）` : '正在确认服务状态…'}
-        {servicesHealthy ? <a className="sidebar-task-link" href="#operations">{healthyServiceSummary}</a> : <small>{serviceAttention || '正在读取服务状态…'}</small>}
+        {servicesHealthy && systemStatus ? <a className="sidebar-task-link" href="#operations"><span>{systemStatus.services.length} 项服务在线</span><span>{taskCount} 项任务执行中</span></a> : <small>{serviceAttention || '正在读取服务状态…'}</small>}
         <button type="button" className="sign-out" onClick={() => void onLogout()}>退出登录</button>
       </div>
     </aside>
 
     <section className="workspace">
       <header className="topbar">
-        <div><p className="eyebrow">自托管网页监测</p><h1>{view === 'archive' ? '内容档案' : view === 'settings' ? '设置' : view === 'operations' ? '运行中心' : '订阅中心'}</h1></div>
+        <div><p className="eyebrow">自托管网页监测</p><h1>{view === 'search' ? '番号检索' : view === 'archive' ? '内容档案' : view === 'settings' ? '设置' : view === 'operations' ? '运行中心' : '订阅中心'}</h1></div>
         {view === 'subscriptions' && <div className="topbar-actions"><button type="button" className="secondary" onClick={() => openRules()}>检查规则</button><button className="primary" onClick={() => setEditor('new')}><span>＋</span> 新建订阅</button></div>}
       </header>
 
@@ -499,17 +537,18 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
       </section>
 
       <section id="subscriptions" className="list-section">
-        <div className="section-head"><div><h2>你的网页订阅</h2><p>用 CSS Selector 精确读取所需内容</p></div><button className="quiet" onClick={() => void load()}>↻ 刷新</button></div>
+        <div className="section-head"><div><h2>你的网页订阅</h2><p>用 CSS Selector 精确读取所需内容</p></div><div className="subscription-list-actions"><div className="subscription-view-switch" role="group" aria-label="订阅显示方式"><button type="button" aria-pressed={subscriptionLayout === 'list'} className={subscriptionLayout === 'list' ? 'active' : ''} onClick={() => setSubscriptionLayout('list')}>列表</button><button type="button" aria-pressed={subscriptionLayout === 'compact'} className={subscriptionLayout === 'compact' ? 'active' : ''} onClick={() => setSubscriptionLayout('compact')}>紧凑</button></div><button className="quiet" onClick={() => void load()}>↻ 刷新</button></div></div>
         {loading ? <div className="empty">正在读取订阅…</div> : subscriptions.length === 0 ? <Empty onCreate={() => setEditor('new')} /> :
-          <div className="subscription-grid">
-            {subscriptions.map((item) => <SubscriptionCard key={item.id} item={item} onRun={runNow} onEdit={setEditor} onToggle={toggleSubscription} onDelete={remove} />)}
+          <div className={`subscription-grid ${subscriptionLayout}`}>
+            {subscriptions.map((item) => <SubscriptionCard key={item.id} item={item} onRun={runNow} onEdit={setEditor} onToggle={toggleSubscription} onDelete={askDelete} />)}
           </div>}
       </section>
       <RulesLibrary open={rulesOpen} onToggle={() => setRulesOpen((current) => !current)} onNotice={setNotice} />
-      </> : view === 'archive' ? <ArchivePage subscriptions={subscriptions} onNotice={setNotice} /> : view === 'settings' ? <SettingsPage onNotice={setNotice} /> : <OperationsCenterPage onSummary={setTaskSummary} />}
+      </> : view === 'search' ? <CodeSearchPage onNotice={setNotice} onSubscriptionsChanged={load} /> : view === 'archive' ? <ArchivePage subscriptions={subscriptions} onNotice={setNotice} homeRequest={archiveHomeRequest} /> : view === 'settings' ? <SettingsPage onNotice={setNotice} /> : <OperationsCenterPage onSummary={setTaskSummary} />}
       {notice && <div className="toast" role="status">{notice}</div>}
     </section>
     {editor && <Editor item={editor === 'new' ? null : editor} onClose={() => setEditor(null)} onSaved={async () => { setEditor(null); await load(); setNotice('订阅已保存。'); }} onFullScan={async () => { await load(); setNotice('已加入全量检查队列。'); }} onArchiveCleared={async () => { setEditor(null); await load(); setNotice('订阅数据已重置。'); }} />}
+    {deleteTarget && <SubscriptionDeleteDialog item={deleteTarget} busy={deleteBusy} error={deleteError} onCancel={() => { if (!deleteBusy) { setDeleteTarget(null); setDeleteError(''); } }} onConfirm={() => void confirmDelete()} />}
     {integrationOnboarding?.pending && <IntegrationOnboardingGuide
       status={integrationOnboarding}
       onComplete={async () => {
@@ -523,6 +562,45 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
       }}
     />}
   </main>;
+}
+
+function SubscriptionDeleteDialog({ item, busy, error, onCancel, onConfirm }: {
+  item: Subscription;
+  busy: boolean;
+  error: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const cancelButton = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => { cancelButton.current?.focus(); }, []);
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !busy) onCancel();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [busy, onCancel]);
+
+  return <div className="overlay confirmation-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onCancel(); }}>
+    <section className="editor confirmation-card" role="alertdialog" aria-modal="true" aria-labelledby="subscription-delete-title" aria-describedby="subscription-delete-description">
+      <header className="confirmation-header">
+        <span className="confirmation-icon" aria-hidden="true">!</span>
+        <div><p className="eyebrow">订阅管理</p><h2 id="subscription-delete-title">删除订阅</h2></div>
+        <button type="button" className="close" aria-label="关闭确认框" disabled={busy} onClick={onCancel}>×</button>
+      </header>
+      <p className="confirmation-question">确定删除 <strong>{item.name}</strong> 吗？</p>
+      <div className="confirmation-warning" id="subscription-delete-description">
+        <strong>此操作无法撤销</strong>
+        <p>该订阅及其内容档案会被删除。已经提交到 qBittorrent 的下载不会因此自动删除。</p>
+      </div>
+      {error && <p className="form-error confirmation-error" role="alert">{error}</p>}
+      <footer className="confirmation-actions">
+        <button ref={cancelButton} type="button" className="secondary" disabled={busy} onClick={onCancel}>取消</button>
+        <button type="button" className="confirm-danger" disabled={busy} onClick={onConfirm}>{busy ? '正在删除…' : '确认删除'}</button>
+      </footer>
+    </section>
+  </div>;
 }
 
 function IntegrationOnboardingGuide({ status, onComplete, onOpenSettings }: { status: IntegrationOnboarding; onComplete: () => Promise<void>; onOpenSettings: () => Promise<void> }) {
@@ -625,7 +703,11 @@ function SubscriptionCard({ item, onRun, onEdit, onToggle, onDelete }: { item: S
   return <article className={`subscription-card ${item.last_error ? 'has-error' : ''}`}>
     <div className="card-top"><div className="site-ident">{shortUrl(item.url).slice(0, 1).toUpperCase()}</div><div className="card-title"><h3>{item.name}</h3><a href={item.url} target="_blank" rel="noreferrer">{shortUrl(item.url)} ↗</a></div><button className="icon-button" title="编辑订阅" onClick={() => onEdit(item)}>⋯</button></div>
     {item.last_error && <div className="error-line">上次失败：{item.last_error}</div>}
-    <footer className="card-footer"><button type="button" className={`subscription-switch ${item.is_active ? 'on' : ''}`} role="switch" aria-checked={Boolean(item.is_active)} disabled={!item.selector} title={!item.selector ? '请先配置读取规则' : item.is_active ? '暂停订阅' : '启用订阅'} onClick={() => onToggle(item)}><span aria-hidden="true" /><em>{item.is_active ? '已启用' : '已暂停'}</em></button>{item.is_active && <span>{scheduleLabel(item)}</span>}<span>上次：{formatTime(item.last_checked_at)}</span>{Boolean(item.full_scan_active) && <span className="scan-progress"><b>{item.initial_scan_total ? `全量 ${item.initial_scan_pages_completed}/${item.initial_scan_total}` : '全量准备中'}</b><i><em style={{ width: item.initial_scan_total ? `${Math.min(100, item.initial_scan_pages_completed / item.initial_scan_total * 100)}%` : '18%' }} /></i></span>}<div className="card-actions"><button disabled={!item.selector} title={!item.selector ? '请先配置读取规则' : undefined} onClick={() => onRun(item)}>立即检查</button><button className="danger" onClick={() => onDelete(item)}>删除</button></div></footer>
+    <footer className="card-footer">
+      <div className="card-time-info">{item.is_active && <span className="card-schedule">{scheduleLabel(item)}</span>}<span className="card-last-checked">上次：{formatTime(item.last_checked_at)}</span></div>
+      {Boolean(item.full_scan_active) && <span className="scan-progress"><b>{item.initial_scan_total ? `全量 ${item.initial_scan_pages_completed}/${item.initial_scan_total}` : '全量准备中'}</b><i><em style={{ width: item.initial_scan_total ? `${Math.min(100, item.initial_scan_pages_completed / item.initial_scan_total * 100)}%` : '18%' }} /></i></span>}
+      <div className="card-footer-actions"><div className="card-actions"><button disabled={!item.selector} title={!item.selector ? '请先配置读取规则' : undefined} onClick={() => onRun(item)}>立即检查</button><button className="danger" onClick={() => onDelete(item)}>删除</button></div><button type="button" className={`subscription-switch ${item.is_active ? 'on' : ''}`} role="switch" aria-checked={Boolean(item.is_active)} disabled={!item.selector} title={!item.selector ? '请先配置读取规则' : item.is_active ? '暂停订阅' : '启用订阅'} onClick={() => onToggle(item)}><span aria-hidden="true" /><em>{item.is_active ? '已启用' : '已暂停'}</em></button></div>
+    </footer>
   </article>;
 }
 
@@ -730,7 +812,165 @@ function ReleaseDateCell({ entry }: { entry: ArchiveEntry }) {
   return <span className="release-status unsearched" title={entry.release_error ?? '尚未加入发行日期读取队列；请检查发行日期规则是否启用。'}>待读取</span>;
 }
 
-function ArchivePage({ subscriptions, onNotice }: { subscriptions: Subscription[]; onNotice: (message: string) => void }) {
+function CodeSearchPage({ onNotice, onSubscriptionsChanged }: { onNotice: (message: string) => void; onSubscriptionsChanged: () => Promise<void> }) {
+  const [code, setCode] = useState('');
+  const [history, setHistory] = useState<string[]>(() => {
+    try {
+      const value: unknown = JSON.parse(window.localStorage.getItem('page-watch.code-search-history') ?? '[]');
+      return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string').slice(0, 8) : [];
+    } catch { return []; }
+  });
+  const [result, setResult] = useState<CodeSearchResponse | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [localPerformers, setLocalPerformers] = useState<Record<number, { busy: boolean; searchId?: string; performers: SearchPerformer[]; error: string }>>({});
+  const [subscribingUrl, setSubscribingUrl] = useState('');
+  const [subscribeMessage, setSubscribeMessage] = useState('');
+  const [subscribeError, setSubscribeError] = useState(false);
+
+  async function runSearch(value: string) {
+    const query = value.trim();
+    if (!query || busy) return;
+    setCode(query);
+    const keyFor = (item: string) => item.replace(/[\s-]+/g, '').toUpperCase();
+    const nextHistory = [query, ...history.filter((item) => keyFor(item) !== keyFor(query))].slice(0, 8);
+    setHistory(nextHistory);
+    try { window.localStorage.setItem('page-watch.code-search-history', JSON.stringify(nextHistory)); } catch { /* Search history is optional. */ }
+    setBusy(true); setError(''); setResult(null); setSubscribeMessage(''); setSubscribeError(false); setLocalPerformers({});
+    try { setResult(await request<CodeSearchResponse>('/api/code-search', { method: 'POST', body: JSON.stringify({ code: query }) })); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : '番号检索失败。'); }
+    finally { setBusy(false); }
+  }
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    await runSearch(code);
+  }
+
+  function clearHistory() {
+    setHistory([]);
+    try { window.localStorage.removeItem('page-watch.code-search-history'); } catch { /* Search history is optional. */ }
+  }
+
+  async function loadMagnet(searchId: string, retry = false) {
+    try {
+      const response = await request<{ magnet: SearchMagnet }>('/api/code-search/magnet', { method: 'POST', body: JSON.stringify({ searchId, retry }) });
+      setResult((current) => current?.source === 'missav' && current.searchId === searchId ? { ...current, magnet: response.magnet } : current);
+    } catch (reason) {
+      setResult((current) => current?.source === 'missav' && current.searchId === searchId ? { ...current, magnet: { status: 'failed', reason: reason instanceof Error ? reason.message : '磁力检索失败。' } } : current);
+    }
+  }
+
+  const currentSearchId = result?.source === 'missav' ? result.searchId : null;
+  useEffect(() => {
+    if (!currentSearchId || result?.source !== 'missav' || result.magnet.status !== 'pending') return;
+    let active = true;
+    void request<{ magnet: SearchMagnet }>('/api/code-search/magnet', { method: 'POST', body: JSON.stringify({ searchId: currentSearchId }) })
+      .then((response) => { if (active) setResult((current) => current?.source === 'missav' && current.searchId === currentSearchId ? { ...current, magnet: response.magnet } : current); })
+      .catch((reason) => { if (active) setResult((current) => current?.source === 'missav' && current.searchId === currentSearchId ? { ...current, magnet: { status: 'failed', reason: reason instanceof Error ? reason.message : '磁力检索失败。' } } : current); });
+    return () => { active = false; };
+  }, [currentSearchId]);
+
+  async function loadLocalPerformers(item: ArchiveCodeResult) {
+    setLocalPerformers((current) => ({ ...current, [item.id]: { busy: true, performers: [], error: '' } }));
+    try {
+      const response = await request<{ searchId: string; performers: SearchPerformer[]; performerError: string | null }>('/api/code-search/performers', { method: 'POST', body: JSON.stringify({ archiveEntryId: item.id }) });
+      setLocalPerformers((current) => ({ ...current, [item.id]: { busy: false, searchId: response.searchId, performers: response.performers, error: response.performerError ?? '' } }));
+    } catch (reason) {
+      setLocalPerformers((current) => ({ ...current, [item.id]: { busy: false, performers: [], error: reason instanceof Error ? reason.message : '无法读取女优信息。' } }));
+    }
+  }
+
+  async function subscribe(searchId: string, performer: SearchPerformer) {
+    setSubscribingUrl(performer.url); setSubscribeMessage(''); setSubscribeError(false);
+    try {
+      const response = await request<{ created: boolean; addedToArchive: boolean; actressName: string; subscription: Subscription }>('/api/code-search/subscribe', { method: 'POST', body: JSON.stringify({ searchId, actressUrl: performer.url }) });
+      setSubscribeMessage(response.created
+        ? `已订阅“${response.actressName}”，这部影片已${response.addedToArchive ? '加入' : '存在于'}该订阅的内容档案；首次全量检查将按计划运行。`
+        : `“${response.actressName}”已经订阅，这部影片已${response.addedToArchive ? '补入' : '存在于'}该订阅的内容档案。`);
+      onNotice(response.created ? `已添加女优订阅“${response.actressName}”。` : `女优“${response.actressName}”已经订阅。`);
+      await onSubscriptionsChanged();
+    } catch (reason) { setSubscribeMessage(reason instanceof Error ? reason.message : '无法添加女优订阅。'); setSubscribeError(true); }
+    finally { setSubscribingUrl(''); }
+  }
+
+  async function copyMagnet(value: string) {
+    try {
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(value);
+      else {
+        const textarea = document.createElement('textarea');
+        textarea.value = value;
+        textarea.style.position = 'fixed'; textarea.style.opacity = '0';
+        document.body.append(textarea); textarea.select();
+        const copied = document.execCommand('copy');
+        textarea.remove();
+        if (!copied) throw new Error('浏览器拒绝复制');
+      }
+      onNotice('磁力链接已复制到剪贴板。');
+    }
+    catch { onNotice('浏览器无法复制，请检查剪贴板权限。'); }
+  }
+
+  const renderPerformers = (searchId: string, performers: SearchPerformer[], emptyError: string | null) => <div className="code-search-performers">
+    <h4>女优订阅</h4>
+    {performers.length ? performers.map((performer) => <div className="code-search-performer" key={`${searchId}:${performer.url}`}>
+      <div><strong>{performer.name || 'MissAV 女优'}</strong><small>订阅其单人作品（filters=individual）</small></div>
+      <button className="primary" type="button" disabled={Boolean(subscribingUrl)} onClick={() => void subscribe(searchId, performer)}>{subscribingUrl === performer.url ? '正在读取女优页…' : '加入订阅'}</button>
+    </div>) : <p className="field-note">{emptyError || '影片详情页没有女优链接。'}</p>}
+  </div>;
+
+  return <section id="code-search" className="code-search-page">
+    <section className="code-search-intro">
+      <p className="eyebrow">本地档案优先 · MissAV 精确匹配</p>
+      <h2>按番号查影片并订阅女优</h2>
+      <p>先查 Page Watch 内容档案；没有记录时再从 MissAV 查找准确番号、标题、发行日期和磁力链接。</p>
+      <form className="code-search-form" onSubmit={(event) => void submit(event)}>
+        <label htmlFor="code-search-input">影片番号</label>
+        <div><input id="code-search-input" autoComplete="off" spellCheck={false} maxLength={40} value={code} onChange={(event) => setCode(event.target.value)} />
+          <button className="primary" type="submit" disabled={busy || !code.trim()}>{busy ? '正在检索…' : '检索番号'}</button></div>
+      </form>
+      {history.length > 0 && <div className="code-search-history"><div className="code-search-history-head"><span>最近检索</span><button type="button" disabled={busy} onClick={clearHistory}>清空</button></div><div className="code-search-history-list">{history.map((item) => <button type="button" key={item} disabled={busy} onClick={() => void runSearch(item)}>{item}</button>)}</div></div>}
+    </section>
+    {error && <div className="form-error code-search-error" role="alert">{error}</div>}
+    {subscribeMessage && <div className={`code-search-notice ${subscribeError ? 'error' : ''}`} role="status">{subscribeMessage}</div>}
+    {!result && !busy && !error && <div className="empty-card code-search-empty"><div className="empty-orbit">⌕</div><h3>输入番号开始检索</h3><p>支持带连字符和不带连字符的番号。</p></div>}
+    {busy && <div className="empty code-search-loading" aria-live="polite">正在检查内容档案并查询 MissAV…</div>}
+    {result?.source === 'not_found' && <div className="empty-card code-search-empty"><div className="empty-orbit">⌕</div><h3>没有找到 {result.code}</h3><p>内容档案和 MissAV 搜索结果中都没有完全匹配的番号。</p></div>}
+    {result?.source === 'archive' && <section className="code-search-results">
+      <div className="section-head"><div><h3>内容档案中找到 {result.items.length} 条记录</h3><p>没有访问 MissAV；以下是项目现有数据。</p></div></div>
+      {result.items.map((item) => {
+        const local = localPerformers[item.id];
+        return <article className="code-search-card" key={item.id}>
+          <div className="code-search-card-head"><div><code className="code-search-code">{item.content}</code><span>订阅：{item.subscription_name}</span></div>{item.detail_url && <a href={item.detail_url} target="_blank" rel="noreferrer">打开影片详情 ↗</a>}</div>
+          <h3>{item.title || '暂无标题'}</h3>
+          <div className="code-search-meta"><span>发行日期：{item.release_date || (item.release_status === 'pending' ? '读取中' : item.release_status === 'failed' ? '读取失败' : '暂无数据')}</span>
+            <span>磁链：{item.magnet_status === 'found' ? '已找到' : item.magnet_status === 'pending' ? '检索中' : item.magnet_status === 'failed' ? '检索失败' : item.magnet_status === 'not_found' ? '未找到' : '待补全'}</span>
+            {item.magnet_value && <button className="secondary" type="button" onClick={() => void copyMagnet(item.magnet_value!)}>复制磁链</button>}
+          </div>
+          {item.detail_url && <div className="code-search-actor-actions"><button className="secondary" type="button" disabled={local?.busy} onClick={() => void loadLocalPerformers(item)}>{local?.busy ? '正在读取女优…' : local?.performers.length ? '重新读取女优' : '读取可订阅女优'}</button></div>}
+          {local?.searchId && renderPerformers(local.searchId, local.performers, local.error)}
+          {!local?.searchId && local?.error && <p className="field-note">{local.error}</p>}
+        </article>;
+      })}
+    </section>}
+    {result?.source === 'missav' && <section className="code-search-results">
+      <div className="section-head"><div><h3>MissAV 找到准确匹配</h3><p>番号匹配成功后读取详情页数据。</p></div></div>
+      <article className="code-search-card">
+        <div className="code-search-card-head"><code className="code-search-code">{result.code}</code><a href={result.detailUrl} target="_blank" rel="noreferrer">打开影片详情 ↗</a></div>
+        <h3>{result.title || '暂无标题'}</h3>
+        <div className="code-search-meta"><span>发行日期：{result.releaseDate.status === 'found' ? result.releaseDate.releaseDate : result.releaseDate.status === 'pending' ? '读取中' : result.releaseDate.status === 'failed' ? '读取失败' : '未找到'}{result.releaseDate.status !== 'found' && result.releaseDate.status !== 'pending' ? ` · ${result.releaseDate.reason}` : ''}</span>
+          <span>磁链：{result.magnet.status === 'found' ? '已找到' : result.magnet.status === 'pending' ? '检索中' : result.magnet.status === 'not_found' ? '未找到' : result.magnet.status === 'failed' ? '检索失败' : '未启用'}</span>
+          {result.magnet.status === 'found' && <button className="secondary" type="button" onClick={() => void copyMagnet(result.magnet.value)}>复制磁链</button>}
+          {result.magnet.status === 'failed' && <button className="secondary" type="button" onClick={() => void loadMagnet(result.searchId, true)}>重试磁链检索</button>}
+        </div>
+        {result.magnet.status !== 'found' && result.magnet.status !== 'pending' && <p className="field-note">{result.magnet.reason}</p>}
+        {renderPerformers(result.searchId, result.performers, result.performerError)}
+      </article>
+    </section>}
+  </section>;
+}
+
+function ArchivePage({ subscriptions, onNotice, homeRequest }: { subscriptions: Subscription[]; onNotice: (message: string) => void; homeRequest: number }) {
   const [selected, setSelected] = useState<Subscription | null>(null);
   const [entries, setEntries] = useState<ArchiveEntry[]>([]);
   const [archivePage, setArchivePage] = useState(1);
@@ -744,6 +984,16 @@ function ArchivePage({ subscriptions, onNotice }: { subscriptions: Subscription[
   useEffect(() => {
     setSelected((current) => current ? subscriptions.find((item) => item.id === current.id) ?? current : null);
   }, [subscriptions]);
+  useEffect(() => {
+    if (homeRequest) {
+      setSelected(null);
+      setArchivePage(1);
+      setArchiveQuery('');
+      setReleaseFrom('');
+      setReleaseTo('');
+      setError('');
+    }
+  }, [homeRequest]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [releaseBackfillBusy, setReleaseBackfillBusy] = useState(false);
@@ -926,6 +1176,30 @@ type OperationActivity =
   | { type: 'task'; id: string; at: string; level: 'success' | 'error'; task: TaskItem }
   | { type: 'log'; id: string; at: string; level: RuntimeLog['level']; log: RuntimeLog };
 
+function matchesLibrarySyncLog(task: TaskItem, log: RuntimeLog) {
+  if (task.kind !== 'library_sync' || log.source !== 'library') return false;
+  const taskId = Number(task.id.match(/^library_sync-(\d+)$/)?.[1]);
+  if (!Number.isFinite(taskId)) return false;
+  if (log.job_id !== null) return Number(log.job_id) === taskId;
+
+  // Older runtime logs did not carry job_id. Match their completion summary
+  // and nearby timestamp so the combined activity view can still collapse
+  // the two records without hiding a separate sync.
+  const taskAt = Date.parse(task.finishedAt ?? '');
+  const logAt = Date.parse(log.created_at);
+  if (!Number.isFinite(taskAt) || !Number.isFinite(logAt) || Math.abs(taskAt - logAt) > 60_000) return false;
+  if (task.status === 'completed') {
+    const taskResult = task.progress?.label?.match(/^同步完成：(\d+) 个媒体项目，(\d+) 条已入库$/);
+    const logResult = log.message.match(/^Jellyfin 影视库(?:手动|定时)同步任务完成：扫描 (\d+) 个媒体项目，(\d+) 条已入库。?$/);
+    return Boolean(taskResult && logResult && taskResult[1] === logResult[1] && taskResult[2] === logResult[2]);
+  }
+  if (task.status === 'failed' && task.error) {
+    return /^Jellyfin 影视库(?:手动|定时)同步失败：/.test(log.message)
+      && log.message.endsWith(`：${task.error}`);
+  }
+  return false;
+}
+
 /**
  * A selected service is a small operational workspace, not two pages glued
  * together. Live queue work stays at the top; settled queue results and the
@@ -954,7 +1228,11 @@ function ServiceOperationsPage({ data, error, scope }: { data: TasksResponse | n
     ...history.map((task) => ({ type: 'task' as const, id: task.id, at: task.finishedAt ?? task.startedAt ?? task.requestedAt ?? '', level: task.status === 'failed' ? 'error' as const : 'success' as const, task })),
     ...logs.map((log) => ({ type: 'log' as const, id: `log-${log.id}`, at: log.created_at, level: log.level, log }))
   ].sort((left, right) => right.at.localeCompare(left.at));
+  const duplicateLibrarySyncLogIds = new Set(logs
+    .filter((log) => history.some((task) => matchesLibrarySyncLog(task, log)))
+    .map((log) => log.id));
   const visibleActivities = activities.filter((activity) => {
+    if (filter === 'all' && activity.type === 'log' && duplicateLibrarySyncLogIds.has(activity.log.id)) return false;
     if (filter === 'all') return true;
     if (filter === 'tasks') return activity.type === 'task';
     if (filter === 'logs') return activity.type === 'log';
@@ -964,11 +1242,13 @@ function ServiceOperationsPage({ data, error, scope }: { data: TasksResponse | n
   const queued = active.filter((task) => task.status === 'queued' || task.status === 'retrying').length;
   const renderLiveTask = (task: TaskItem) => {
     return <article className={`operation-queue-entry ${task.status}`} key={task.id}>
-      <header><span className={`task-state ${task.status}`}>{taskStatusLabel[task.status]}</span>{task.priority >= 10 && <span className="task-priority">手动</span>}<time>{formatTime(task.startedAt ?? task.requestedAt)}</time></header>
-      <strong>{task.subscriptionName ?? (task.kind === 'library_sync' ? 'Jellyfin 影视库' : '系统任务')}</strong>
-      <p>{[task.content, task.title].filter(Boolean).join(' · ') || task.progress?.label || '等待 Worker 开始处理'}</p>
-      {task.status === 'retrying' && task.retryAfter && <small>将在 {formatTime(task.retryAfter)} 后重试</small>}
-      {task.error && <small className="task-error" title={task.error}>{task.error}</small>}
+      <header><span className={`task-state ${task.status}`}>{taskStatusLabel[task.status]}</span>{task.priority >= 10 && <span className="task-priority">手动</span>}</header>
+      <div className="operation-queue-copy">
+        <p>{task.content?.trim() || task.progress?.label || '等待 Worker 开始处理'}</p>
+        {task.status === 'retrying' && task.retryAfter && <small>将在 {formatTime(task.retryAfter)} 后重试</small>}
+        {task.error && <small className="task-error" title={task.error}>{task.error}</small>}
+      </div>
+      <time>{formatTime(task.startedAt ?? task.requestedAt)}</time>
     </article>;
   };
   return <section className="operation-detail-page">
@@ -976,9 +1256,10 @@ function ServiceOperationsPage({ data, error, scope }: { data: TasksResponse | n
     <section className="operation-activity-section"><div className="operation-section-heading"><div><h2>执行记录</h2><p>任务完成、失败与 Worker 日志按发生时间汇总显示。</p></div><span>实时更新</span></div><div className="operation-activity-filter" role="group" aria-label="执行记录筛选">{([['all', '全部'], ['tasks', '任务结果'], ['logs', '运行日志'], ['errors', '异常']] as const).map(([key, label]) => <button type="button" key={key} className={filter === key ? 'active' : ''} onClick={() => setFilter(key)}>{label}</button>)}</div>{logsError ? <div className="form-error">{logsError}</div> : logsLoading && !activities.length ? <div className="empty">正在读取执行记录…</div> : visibleActivities.length ? <div className="operation-activity-list">{visibleActivities.map((activity) => {
       if (activity.type === 'task') {
         const task = activity.task;
-        const target = [task.subscriptionName, task.content, task.title].filter(Boolean).join(' · ') || '系统任务';
-        const detail = task.error ?? task.progress?.label;
-        return <article className={`operation-activity-entry ${activity.level}`} key={activity.id}><div className="operation-activity-meta"><span className={`task-state ${task.status}`}>{task.status === 'failed' ? '任务失败' : '任务完成'}</span><span>{taskKindLabel[task.kind]}</span><p title={target}>{target}</p>{detail && <small className={task.error ? 'task-error' : undefined} title={detail}>{detail}</small>}<time>{formatTime(activity.at)}</time></div></article>;
+        const pairedLibrarySyncLog = task.kind === 'library_sync' ? logs.find((log) => matchesLibrarySyncLog(task, log)) : undefined;
+        const target = task.kind === 'library_sync' ? 'Jellyfin 影视库' : [task.subscriptionName, task.content, task.title].filter(Boolean).join(' · ') || '系统任务';
+        const detail = task.error ?? (pairedLibrarySyncLog?.message.replace(/^Jellyfin 影视库/, '') || task.progress?.label);
+        return <article className={`operation-activity-entry ${activity.level} ${task.kind === 'library_sync' ? 'library-sync-activity' : ''}`} key={activity.id}><div className="operation-activity-meta"><span className={`task-state ${task.status}`}>{task.status === 'failed' ? '任务失败' : '任务完成'}</span><span>{task.kind === 'library_sync' ? '同步' : taskKindLabel[task.kind]}</span><p title={target}>{target}</p>{detail && <small className={task.error ? 'task-error' : undefined} title={detail}>{detail}</small>}<time>{formatTime(activity.at)}</time></div></article>;
       }
       const log = activity.log;
       const isMagnetNotFound = log.level === 'info' && /^磁力检索(?:未找到|完成)/.test(log.message);
@@ -1020,8 +1301,21 @@ function PerformanceOverview({ metrics, error, integrations, range, onRange }: {
     { label: '统一执行引擎', state: engineState, tone: runtime.engineState === 'error' ? 'error' : runtime.engineState === 'running' || runtime.engineState === 'starting' ? 'busy' : 'sleeping', detail: `本次运行已启动 ${runtime.engineStartCount} 次${runtime.engineLastStartedAt ? ` · 最近启动 ${formatTime(runtime.engineLastStartedAt)}` : ''}` },
     { label: '空闲内存回收', state: runtime.engineMemoryReclaim.state === 'restarting' ? '正在回收' : runtime.engineMemoryReclaim.state === 'process_exit' ? '已释放' : '已启用', tone: runtime.engineMemoryReclaim.state === 'restarting' ? 'busy' : 'sleeping', detail: reclaimState }
   ];
+  const hasContainerMemory = runtime.containerMemoryBytes !== null && runtime.containerMemoryBytes > 0;
+  const memoryProcesses = [
+    ['API', runtime.apiRssBytes],
+    ['引擎', runtime.runnerRssBytes],
+    ['网页执行器', runtime.webExecutorRssBytes],
+    ['影视库同步器', runtime.librarySyncRssBytes]
+  ] as const;
+  const activeMemoryProcesses = memoryProcesses.filter(([, bytes]) => bytes !== null && bytes > 0);
+  const processMemoryBytes = activeMemoryProcesses.reduce((sum, [, bytes]) => sum + (bytes ?? 0), 0);
+  const displayedMemoryBytes = hasContainerMemory ? runtime.containerMemoryBytes : processMemoryBytes || null;
+  const memoryDetail = activeMemoryProcesses.length
+    ? `${hasContainerMemory ? '进程明细：' : ''}${activeMemoryProcesses.map(([label, bytes]) => `${label} ${formatBytes(bytes)}`).join(' · ')}`
+    : '等待进程内存数据';
   return <section className="performance-overview" aria-label="长期性能指标">
-    <div className="operation-section-heading"><div><h2>性能概览</h2><p>指标仅记录聚合计数与耗时；分钟数据保留 30 天，之后按小时汇总至 180 天。</p></div><div className="metric-range" role="group" aria-label="性能指标时间范围">{(['24h', '7d', '30d', '180d'] as const).map((item) => <button type="button" key={item} className={range === item ? 'active' : ''} onClick={() => onRange(item)}>{item}</button>)}</div></div>
+    <div className="operation-section-heading"><div><h2>性能概览</h2><p>指标仅记录聚合计数与耗时；性能数据按分钟保留最近 7 天，到期自动删除。</p></div><div className="metric-range" role="group" aria-label="性能指标时间范围">{(['24h', '7d'] as const).map((item) => <button type="button" key={item} className={range === item ? 'active' : ''} onClick={() => onRange(item)}>{item}</button>)}</div></div>
     {!metrics ? <div className={`operation-queue-empty ${error ? 'metric-load-error' : ''}`}>{error || '正在读取长期性能指标…'}</div> : <>
       <div className="external-integrations" aria-label="外部服务状态">{integrations.map((integration) => {
         const label = integration.name === 'jellyfin' ? 'Jellyfin' : 'qBittorrent';
@@ -1029,7 +1323,7 @@ function PerformanceOverview({ metrics, error, integrations, range, onRange }: {
         return <article className={integration.status} key={integration.name}><strong>{label}</strong><span>{status}</span><small title={integration.detail ?? undefined}>{integration.status === 'degraded' ? (integration.detail ?? '最近连接失败，核心服务仍可使用。') : integration.status === 'disabled' ? '未纳入核心就绪检查' : integration.configured ? '不纳入 Docker 就绪门槛' : '尚未完成连接配置'}</small></article>;
       })}</div>
       <div className="performance-cards">
-        <article><span>容器内存</span><strong>{formatBytes(runtime.containerMemoryBytes)}</strong><small>API {formatBytes(runtime.apiRssBytes)} · 引擎 {formatBytes(runtime.runnerRssBytes)}</small></article>
+        <article><span>{hasContainerMemory ? '容器内存' : '进程内存合计'}</span><strong>{formatBytes(displayedMemoryBytes)}</strong><small>{memoryDetail}</small></article>
         <article><span>Jellyfin 缓存命中率</span><strong>{metrics.jellyfinCache.hitRate === null ? '—' : `${Math.round(metrics.jellyfinCache.hitRate * 100)}%`}</strong><small>{metrics.jellyfinCache.hit} 命中 · {metrics.jellyfinCache.miss} 未命中</small></article>
         <article><span>Chromium 重建</span><strong>{rebuilds.reduce((total, item) => total + item.count, 0)}</strong><small>{rebuilds.length ? rebuilds.map((item) => `${metricWorkerLabel[item.scope as keyof typeof metricWorkerLabel] ?? item.scope} ${chromiumReasonLabel[item.reason] ?? item.reason} ${item.count}`).join(' · ') : '当前范围内没有重建'}</small></article>
         <article><span>自动重试</span><strong>{retries.reduce((total, item) => total + item.count, 0)}</strong><small>{retries.length ? retries.slice(0, 3).map((item) => `${retryReasonLabel[item.reason] ?? item.reason} ${item.count}`).join(' · ') : '当前范围内没有自动重试'}</small></article>
@@ -1683,11 +1977,12 @@ function NotificationSettingsModal({ onClose, onNotice, embedded = false }: { on
   const channelInputPresent = form.channel === 'wecom' ? Boolean(form.wecomWebhook.trim()) : form.channel === 'dingtalk' ? Boolean(form.dingtalkWebhook.trim()) : Boolean(form.webhookUrl.trim());
   const formContent = <form className={`editor notification-settings ${embedded ? 'embedded-settings-form' : ''}`} onSubmit={(event) => void submit(event)}>
     <header><div><p className="eyebrow">通知与告警</p><h2 id="notification-title">通知设置</h2></div>{onClose && <button type="button" className="close" onClick={onClose}>×</button>}</header>
-    <p className="network-copy">默认只提醒新内容与任务最终失败；中间重试不会发送。相同失败会在 30 分钟内合并。</p>
+    <p className="network-copy">全量检索完成后发送一条汇总；普通检查和下载进展可分别设置。中间重试不会发送，相同失败会在 30 分钟内合并。</p>
     <label className="toggle"><input type="checkbox" checked={form.enabled} disabled={loading || busy} onChange={(event) => update('enabled', event.target.checked)} /><span />启用通知</label>
     <label>主通知渠道<select disabled={loading || busy} value={form.channel} onChange={(event) => update('channel', event.target.value as NotificationChannel)}><option value="wecom">企业微信机器人</option><option value="dingtalk">钉钉机器人</option><option value="webhook">通用 Webhook</option></select><span className="field-note">一次只向一个主渠道发送；切换不会删除其他渠道的已保存地址。</span></label>
-    <section className="runtime-settings-card"><div><strong>通知事件</strong><small>成功类进展默认关闭，需要时可单独开启。</small></div>
+    <section className="runtime-settings-card"><div><strong>通知事件</strong><small>全量检索汇总默认开启，其他成功类进展可单独设置。</small></div>
       <label className="toggle"><input type="checkbox" checked={form.events.content_discovered} disabled={loading || busy} onChange={(event) => updateEvent('content_discovered', event.target.checked)} /><span />发现新内容</label>
+      <label className="toggle"><input type="checkbox" checked={form.events.full_scan_completed} disabled={loading || busy} onChange={(event) => updateEvent('full_scan_completed', event.target.checked)} /><span />全量检索完成汇总</label>
       <label className="toggle"><input type="checkbox" checked={form.events.operation_failed} disabled={loading || busy} onChange={(event) => updateEvent('operation_failed', event.target.checked)} /><span />任务最终失败</label>
       <label className="toggle"><input type="checkbox" checked={form.events.magnet_found} disabled={loading || busy} onChange={(event) => updateEvent('magnet_found', event.target.checked)} /><span />已找到磁力链接</label>
       <label className="toggle"><input type="checkbox" checked={form.events.download_completed} disabled={loading || busy} onChange={(event) => updateEvent('download_completed', event.target.checked)} /><span />qBittorrent 下载完成</label>

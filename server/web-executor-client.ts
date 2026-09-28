@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { reportRuntimeMetrics, type Subscription } from './db.js';
 import type { ReleaseDateRule } from './inspection-rules.js';
 import type { MagnetRule } from './inspection-rules.js';
+import type { MissavCodeSearchResponse, MissavPerformer, MissavSearchResult } from './missav-search.js';
 
 type BrowserSnapshot = { state: 'active' | 'idle' | 'closed'; activePages: number; queuedPages: number; navigationCount: number; openedAt: string | null };
 type ExecutorState = 'offline' | 'starting' | 'busy' | 'idle' | 'browser_idle';
@@ -49,6 +50,18 @@ export class WebExecutorClient {
 
   async preview(payload: Pick<Subscription, 'url' | 'selector' | 'render_mode' | 'content_source' | 'attribute_name' | 'match_pattern' | 'title_selector' | 'title_content_source' | 'title_attribute_name' | 'title_match_pattern' | 'result_mode'>) {
     return this.request('preview', payload);
+  }
+
+  async codeSearch(code: string, priority = 0): Promise<({ status: 'found'; film: MissavSearchResult; releaseDate: { status: 'found'; releaseDate: string } | { status: 'unavailable'; reason: string } | { status: 'failed'; reason: string } }) | Extract<MissavCodeSearchResponse, { status: 'not_found' }>> {
+    return this.request('code-search', { code, priority });
+  }
+
+  async performers(detailUrl: string): Promise<MissavPerformer[]> {
+    return this.request('performers', { detailUrl });
+  }
+
+  async actressName(actressUrl: string): Promise<{ name: string; profileUrl: string }> {
+    return this.request('actress-name', { actressUrl });
   }
 
   async close() {

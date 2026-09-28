@@ -83,6 +83,7 @@ export async function ensureMySqlSchema(pool: Pool) {
     release_status VARCHAR(16) NOT NULL DEFAULT 'unsearched',
     release_checked_at VARCHAR(40) NULL,
     release_error TEXT NULL,
+    full_scan_batch_id VARCHAR(64) NULL,
     magnet_status VARCHAR(16) NOT NULL DEFAULT 'unsearched',
     magnet_value MEDIUMTEXT NULL,
     magnet_checked_at VARCHAR(40) NULL,
@@ -111,7 +112,24 @@ export async function ensureMySqlSchema(pool: Pool) {
     updated_at VARCHAR(40) NOT NULL,
     PRIMARY KEY (id),
     UNIQUE KEY idx_archive_subscription_hash (subscription_id, content_hash),
-    KEY idx_archive_entries_seen (first_seen_at DESC)
+    KEY idx_archive_entries_seen (first_seen_at DESC),
+    KEY idx_archive_full_scan_batch (full_scan_batch_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+
+  await pool.query(`CREATE TABLE IF NOT EXISTS full_scan_batches (
+    id VARCHAR(64) NOT NULL,
+    subscription_id INT NOT NULL,
+    subscription_name VARCHAR(255) NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'scanning',
+    is_initial TINYINT NOT NULL DEFAULT 0,
+    page_count INT NULL,
+    scanned_count INT NULL,
+    archived_count INT NULL,
+    created_at VARCHAR(40) NOT NULL,
+    completed_at VARCHAR(40) NULL,
+    PRIMARY KEY (id),
+    KEY idx_full_scan_batches_ready (status, created_at),
+    KEY idx_full_scan_batches_subscription (subscription_id, status, created_at)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 
   // Read models for the subscription and operations pages. Keeping these
@@ -399,6 +417,7 @@ export async function ensureMySqlSchema(pool: Pool) {
   await addColumnIfMissing(pool, 'archive_entries', 'release_status', "VARCHAR(16) NOT NULL DEFAULT 'unsearched'");
   await addColumnIfMissing(pool, 'archive_entries', 'release_checked_at', 'VARCHAR(40) NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'release_error', 'TEXT NULL');
+  await addColumnIfMissing(pool, 'archive_entries', 'full_scan_batch_id', 'VARCHAR(64) NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'auto_download_suppressed', 'TINYINT NOT NULL DEFAULT 0');
   await addColumnIfMissing(pool, 'archive_entries', 'download_status', "VARCHAR(16) NOT NULL DEFAULT 'not_queued'");
   await addColumnIfMissing(pool, 'archive_entries', 'download_completion_notified_at', 'VARCHAR(40) NULL');
@@ -467,6 +486,7 @@ export async function ensureMySqlSchema(pool: Pool) {
   await addIndexIfMissing(pool, 'download_jobs', 'idx_download_jobs_priority', 'KEY idx_download_jobs_priority (status, priority, requested_at)');
   await addIndexIfMissing(pool, 'library_sync_jobs', 'idx_library_sync_jobs_priority', 'KEY idx_library_sync_jobs_priority (status, priority, requested_at)');
   await addIndexIfMissing(pool, 'archive_entries', 'idx_archive_entries_code', 'KEY idx_archive_entries_code (archive_code)');
+  await addIndexIfMissing(pool, 'archive_entries', 'idx_archive_full_scan_batch', 'KEY idx_archive_full_scan_batch (full_scan_batch_id)');
 }
 
 async function addColumnIfMissing(pool: Pool, table: string, column: string, definition: string) {

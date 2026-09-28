@@ -83,14 +83,15 @@ async function runNextJob() {
   const started = await db.run("UPDATE jobs SET status = 'running', started_at = ?, retry_after = NULL WHERE id = ? AND status = 'queued'", [now, job.id]);
   if (!started.changes) return;
   let subscription: Subscription | undefined;
+  let fullScan = false;
   const startedAtMs = Date.now();
   try {
     subscription = await getSubscription(job.subscription_id);
     if (!subscription) throw new Error('订阅已删除。');
-    const fullScan = Boolean(subscription.pagination_selector && !subscription.initial_scan_completed);
+    fullScan = Boolean(subscription.pagination_selector && !subscription.initial_scan_completed);
     activeTask = { kind: fullScan ? 'full_scan' : 'check', subscriptionId: subscription.id, current: fullScan ? subscription.initial_scan_pages_completed : null, total: fullScan ? subscription.initial_scan_total : null, label: fullScan ? `下一个页面：${subscription.initial_scan_next_page}` : '正在读取网页内容' };
     await heartbeat();
-    await appendRuntimeLog({ level: 'info', source: 'worker', subscriptionId: subscription.id, jobId: job.id, message: fullScan ? (subscription.initial_scan_run_id ? `恢复全量检查：从第 ${subscription.initial_scan_next_page} 页继续。` : '开始全量检查。') : '开始检查第一页。' });
+    await appendRuntimeLog({ level: 'info', source: 'worker', subscriptionId: subscription.id, jobId: job.id, message: fullScan ? (subscription.initial_scan_run_id && subscription.initial_scan_pages_completed > 0 ? `恢复全量检查：从第 ${subscription.initial_scan_next_page} 页继续。` : '开始全量检查。') : '开始检查第一页。' });
     const result = await webExecutor.capture(subscription, job.priority);
     await db.run("UPDATE jobs SET status = 'completed', finished_at = ? WHERE id = ?", [new Date().toISOString(), job.id]);
     const additions = result.addedCount ? `，新增 ${result.addedCount} 条内容` : '，没有新增内容';
@@ -116,6 +117,7 @@ async function runNextJob() {
       const failedAt = new Date().toISOString();
       await db.transaction(async (tx) => {
         await tx.run("UPDATE jobs SET status = 'failed', finished_at = ?, error = ?, attempt_count = ?, retry_after = NULL WHERE id = ?", [failedAt, message, attempt, job.id]);
+        if (fullScan && subscription) await tx.run(`UPDATE full_scan_batches SET status = 'scan_failed', completed_at = ? WHERE subscription_id = ? AND status = 'scanning'`, [failedAt, subscription.id]);
         if (subscription) await enqueueNotification(createOperationFailureNotification({ operation: '网页检查', error: message, subscription, jobId: job.id, occurredAt: failedAt }), tx);
       });
       await appendRuntimeLog({ level: 'error', source: 'worker', subscriptionId: job.subscription_id, jobId: job.id, message: `检查失败：${message}` });

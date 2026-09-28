@@ -629,20 +629,10 @@ export async function flushTelemetry() {
   return telemetryFlushing;
 }
 
-/** Compact old minute buckets to hourly totals, then expire long-lived telemetry. */
+/** Keep performance history as a rolling seven-day window. */
 export async function maintainPerformanceMetrics() {
-  // Keep aggregation and source deletion atomic. If the process stops in the
-  // middle, no hourly bucket is double-counted on the next daily maintenance.
-  await db.transaction(async (tx) => {
-    await tx.run(`INSERT INTO performance_metrics (granularity, bucket_start, scope, metric, dimension, sample_count, duration_ms)
-      SELECT 'hour', DATE_FORMAT(bucket_start, '%Y-%m-%d %H:00:00'), scope, metric, dimension, SUM(sample_count), SUM(duration_ms)
-      FROM performance_metrics
-      WHERE granularity = 'minute' AND bucket_start < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 30 DAY)
-      GROUP BY DATE_FORMAT(bucket_start, '%Y-%m-%d %H:00:00'), scope, metric, dimension
-      ON DUPLICATE KEY UPDATE sample_count = sample_count + VALUES(sample_count), duration_ms = duration_ms + VALUES(duration_ms)`);
-    await tx.run("DELETE FROM performance_metrics WHERE granularity = 'minute' AND bucket_start < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 30 DAY)");
-    await tx.run("DELETE FROM performance_metrics WHERE granularity = 'hour' AND bucket_start < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 180 DAY)");
-  });
+  // This also clears hourly aggregates left behind by older versions.
+  await db.run("DELETE FROM performance_metrics WHERE bucket_start < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 7 DAY)");
 }
 
 export type RuntimeMetric = { key: string; value?: number | null; text?: string | null };

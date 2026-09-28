@@ -16,6 +16,7 @@ type MagnetJob = {
   subscription_name: string;
   attempt_count: number;
   auto_download_suppressed: number;
+  full_scan_batch_status: string | null;
 };
 
 async function remainingJobs(subscriptionId: number) {
@@ -36,8 +37,9 @@ async function logProgress(subscriptionId: number) {
 
 async function runNextMagnetJob() {
   if (isExecutionEngineDraining()) return;
-  const job = await db.get<MagnetJob>(`SELECT j.id, j.archive_entry_id, j.attempt_count, a.subscription_id, a.content, a.auto_download_suppressed, s.name AS subscription_name
+  const job = await db.get<MagnetJob>(`SELECT j.id, j.archive_entry_id, j.attempt_count, a.subscription_id, a.content, a.auto_download_suppressed, s.name AS subscription_name, b.status AS full_scan_batch_status
     FROM magnet_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id
+    LEFT JOIN full_scan_batches b ON b.id = a.full_scan_batch_id
     WHERE j.status = 'queued' AND (j.retry_after IS NULL OR j.retry_after <= ?) ORDER BY j.priority DESC, j.requested_at ASC, j.id ASC LIMIT 1`, [new Date().toISOString()]);
   if (!job) return;
   if (isExecutionEngineDraining()) return;
@@ -75,7 +77,9 @@ async function runNextMagnetJob() {
             download_filter_min_size_bytes = NULL, updated_at = ?
             WHERE id = ?`, [finishedAt, finishedAt, job.archive_entry_id]);
         }
-        await enqueueNotification(createMagnetFoundNotification({ subscription: { id: job.subscription_id, name: job.subscription_name }, content: job.content, occurredAt: finishedAt }), tx);
+        if (!['scanning', 'processing'].includes(job.full_scan_batch_status ?? '')) {
+          await enqueueNotification(createMagnetFoundNotification({ subscription: { id: job.subscription_id, name: job.subscription_name }, content: job.content, occurredAt: finishedAt }), tx);
+        }
       } else {
         await tx.run(`UPDATE archive_entries SET magnet_status = 'not_found', magnet_value = NULL, magnet_checked_at = ?, magnet_error = ?, updated_at = ?
           WHERE id = ?`, [finishedAt, result.reason, finishedAt, job.archive_entry_id]);
@@ -105,7 +109,9 @@ async function runNextMagnetJob() {
         await tx.run("UPDATE magnet_jobs SET status = 'queued', started_at = NULL, finished_at = NULL, error = ?, attempt_count = ?, retry_after = ? WHERE id = ?", [message, attempt, new Date(Date.now() + retryDelayMs(attempt)).toISOString(), job.id]);
       } else {
         await tx.run("UPDATE magnet_jobs SET status = 'failed', finished_at = ?, error = ?, attempt_count = ?, retry_after = NULL WHERE id = ?", [finishedAt, message, attempt, job.id]);
-        await enqueueNotification(createOperationFailureNotification({ operation: '磁力检索', error: message, subscription: { id: job.subscription_id, name: job.subscription_name }, jobId: job.id, content: job.content, occurredAt: finishedAt }), tx);
+        if (!['scanning', 'processing'].includes(job.full_scan_batch_status ?? '')) {
+          await enqueueNotification(createOperationFailureNotification({ operation: '磁力检索', error: message, subscription: { id: job.subscription_id, name: job.subscription_name }, jobId: job.id, content: job.content, occurredAt: finishedAt }), tx);
+        }
       }
     });
     scheduleSubscriptionProgressRebuild(job.subscription_id);

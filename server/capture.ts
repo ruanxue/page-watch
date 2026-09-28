@@ -6,6 +6,7 @@ import { browserPool } from './browser-pool.js';
 import { describeError } from './error-details.js';
 import { expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
 import { archiveKey } from './jellyfin-match.js';
+import { productCodeKeys, productCodeSearchPatterns } from './code-search-parser.js';
 import { missavBackupUrl, missavFallbackFailure, shouldTryMissavBackup } from './site-fallback.js';
 import { assertSafeUrl as validateSafeUrl } from './url-safety.js';
 import { readResponseText } from './bounded-body.js';
@@ -168,7 +169,7 @@ function archiveItems(content: string) {
   return [...new Set(content.split('\n').map((item) => item.trim()).filter(Boolean))];
 }
 
-async function archiveNewItems(subscription: Subscription, items: CapturedItem[], capturedAt: string, client: DatabaseClient, suppressAutoDownload = false) {
+async function archiveNewItems(subscription: Subscription, items: CapturedItem[], capturedAt: string, client: DatabaseClient, suppressAutoDownload = false, fullScanBatchId: string | null = null) {
   const rules = getInspectionRules();
   const jellyfin = getJellyfinSettings();
   const currentItems = uniqueItems(items);
@@ -176,13 +177,32 @@ async function archiveNewItems(subscription: Subscription, items: CapturedItem[]
   const previousItems = new Set(archiveItems(subscription.last_content ?? ''));
   const additions = (archivedCount?.count ?? 0) === 0 ? currentItems : currentItems.filter((item) => !previousItems.has(item.content));
   const insertedItems: CapturedItem[] = [];
+  const candidateCodes = [...new Set(additions.map((item) => archiveKey(item.content)).filter((code): code is string => code !== null))];
+  const existingCodes = new Set<string>();
+  if (candidateCodes.length) {
+    const archiveCodeClause = `archive_code IN (${candidateCodes.map(() => '?').join(', ')})`;
+    const legacyClauses = candidateCodes.map((code) => {
+      const patterns = productCodeSearchPatterns(code);
+      return `(${[...patterns.map(() => 'LOWER(content) LIKE ?'), ...patterns.map(() => 'LOWER(COALESCE(title, \'\')) LIKE ?')].join(' OR ')})`;
+    });
+    const rows = await client.all<{ archive_code: string | null; content: string; title: string | null }>(`SELECT archive_code, content, title FROM archive_entries
+      WHERE subscription_id = ? AND (${archiveCodeClause} OR (${legacyClauses.join(' OR ')}))`,
+    [subscription.id, ...candidateCodes, ...candidateCodes.flatMap((code) => [...productCodeSearchPatterns(code), ...productCodeSearchPatterns(code)])]);
+    const candidateSet = new Set(candidateCodes);
+    for (const row of rows) {
+      if (row.archive_code && candidateSet.has(row.archive_code.toLowerCase())) existingCodes.add(row.archive_code.toLowerCase());
+      for (const key of [...productCodeKeys(row.content), ...productCodeKeys(row.title ?? '')]) if (candidateSet.has(key)) existingCodes.add(key);
+    }
+  }
   for (const item of additions) {
+    const code = archiveKey(item.content);
+    if (code && existingCodes.has(code)) continue;
     const detailUrl = item.detailUrl;
     const releaseUrl = rules.releaseDate.enabled ? expandReleaseUrl(rules.releaseDate.urlTemplate, { detailUrl, subscriptionUrl: subscription.url, content: item.content }) : null;
     const shouldCheckLibraryFirst = rules.magnet.enabled && jellyfin.enabled && jellyfin.libraryIds.length > 0 && jellyfin.skipMagnetWhenAvailable;
     const result = await client.run(`INSERT IGNORE INTO archive_entries
-      (subscription_id, content, title, archive_code, content_hash, first_seen_at, detail_url, release_status, magnet_status, auto_download_suppressed, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [subscription.id, item.content, item.title, archiveKey(item.content), hash(item.content), capturedAt, detailUrl, releaseUrl ? 'pending' : 'unsearched', rules.magnet.enabled && !shouldCheckLibraryFirst ? 'pending' : 'unsearched', suppressAutoDownload ? 1 : 0, capturedAt]);
+      (subscription_id, content, title, archive_code, content_hash, first_seen_at, detail_url, release_status, magnet_status, auto_download_suppressed, full_scan_batch_id, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [subscription.id, item.content, item.title, archiveKey(item.content), hash(item.content), capturedAt, detailUrl, releaseUrl ? 'pending' : 'unsearched', rules.magnet.enabled && !shouldCheckLibraryFirst ? 'pending' : 'unsearched', suppressAutoDownload ? 1 : 0, fullScanBatchId, capturedAt]);
     if (result.changes) {
       insertedItems.push(item);
       if (rules.magnet.enabled) {
@@ -193,10 +213,12 @@ async function archiveNewItems(subscription: Subscription, items: CapturedItem[]
       }
       if (releaseUrl) await queueReleaseJob(result.lastInsertRowid, client);
     }
+    if (code) existingCodes.add(code);
   }
   for (const item of currentItems) {
+    const code = archiveKey(item.content);
     if (item.title) await client.run(`UPDATE archive_entries SET title = ?, updated_at = ?
-      WHERE subscription_id = ? AND content_hash = ? AND (title IS NULL OR title <> ?)`, [item.title, capturedAt, subscription.id, hash(item.content), item.title]);
+      WHERE subscription_id = ? AND (content_hash = ? OR (? IS NOT NULL AND archive_code = ?)) AND (title IS NULL OR title <> ?)`, [item.title, capturedAt, subscription.id, hash(item.content), code, code, item.title]);
   }
   return insertedItems;
 }
@@ -272,22 +294,30 @@ async function stagePage(subscription: Subscription, scanId: string, page: numbe
 }
 
 async function captureInitialFullScan(subscription: Subscription, browserPriority = 0) {
-  let scanId = subscription.initial_scan_run_id;
+  const pendingBatch = subscription.initial_scan_run_id ? undefined : await db.get<{ id: string }>(`SELECT id FROM full_scan_batches
+    WHERE subscription_id = ? AND status = 'scanning' ORDER BY created_at DESC, id DESC LIMIT 1`, [subscription.id]);
+  let scanId = subscription.initial_scan_run_id ?? pendingBatch?.id ?? crypto.randomUUID();
   let total = subscription.initial_scan_total ?? 0;
   let first: CaptureResult | null = null;
   let nextPage = Math.max(1, subscription.initial_scan_next_page || 1);
-  if (!scanId) {
+  if (!subscription.initial_scan_run_id || !subscription.initial_scan_total) {
     try { first = await capturePage(subscription, subscription.url, true, browserPriority); }
     catch (error) { throw new Error(describeError(error, { action: '第 1 页读取', target: new URL(subscription.url).hostname, proxyUrl: getOutboundProxyUrl() }), { cause: error }); }
-    scanId = crypto.randomUUID();
     total = first.pageCount ?? 1;
     const now = new Date().toISOString();
     await db.transaction(async (tx) => {
       await tx.run('DELETE FROM initial_scan_items WHERE subscription_id = ?', [subscription.id]);
       await tx.run(`UPDATE subscriptions SET initial_scan_run_id = ?, initial_scan_total = ?, initial_scan_pages_completed = 0, initial_scan_next_page = 1, last_error = NULL, updated_at = ? WHERE id = ?`, [scanId, total, now, subscription.id]);
+      await tx.run(`INSERT INTO full_scan_batches (id, subscription_id, subscription_name, status, is_initial, page_count, scanned_count, archived_count, created_at)
+        VALUES (?, ?, ?, 'scanning', ?, ?, 0, 0, ?)
+        ON DUPLICATE KEY UPDATE subscription_name = VALUES(subscription_name), page_count = VALUES(page_count), status = 'scanning'`,
+      [scanId, subscription.id, subscription.name, subscription.last_hash ? 0 : 1, total, now]);
     });
     await stagePage(subscription, scanId, 1, first.items);
     nextPage = 2;
+  } else {
+    await db.run(`INSERT IGNORE INTO full_scan_batches (id, subscription_id, subscription_name, status, is_initial, page_count, scanned_count, archived_count, created_at)
+      VALUES (?, ?, ?, 'scanning', ?, ?, 0, 0, ?)`, [scanId, subscription.id, subscription.name, subscription.last_hash ? 0 : 1, total, new Date().toISOString()]);
   }
   for (let page = nextPage; page <= total; page += 1) {
     const url = new URL(subscription.url);
@@ -303,7 +333,6 @@ async function captureInitialFullScan(subscription: Subscription, browserPriorit
   let content = '';
   const contentHash = crypto.createHash('sha256');
   let addedCount = 0;
-  const addedItems: CapturedItem[] = [];
   let stored = false;
   await db.transaction(async (tx) => {
     // Keep the staged archive invisible until all pages have arrived and this
@@ -336,13 +365,18 @@ async function captureInitialFullScan(subscription: Subscription, browserPriorit
         WHERE subscription_id = ? AND scan_id = ? AND id > ? ORDER BY page_number ASC, item_position ASC, id ASC LIMIT 200`, [subscription.id, scanId, cursor]);
       if (!batch.length) break;
       cursor = batch[batch.length - 1].id;
-      const inserted = await archiveNewItems(subscription, batch.map((item) => ({ content: item.content, title: item.title, detailUrl: item.detail_url })), now, tx, !subscription.last_hash);
+      const inserted = await archiveNewItems(subscription, batch.map((item) => ({ content: item.content, title: item.title, detailUrl: item.detail_url })), now, tx, !subscription.last_hash, scanId);
       addedCount += inserted.length;
-      if (addedItems.length < 5) addedItems.push(...inserted.slice(0, 5 - addedItems.length));
     }
-    if (subscription.last_hash && addedCount) {
-      await enqueueNotification(createContentDiscoveredNotification({ subscription, count: addedCount, items: addedItems, occurredAt: now }), tx);
+    if (!subscription.last_hash) {
+      // A one-click subscription may have inserted and started enriching its
+      // searched film before the first paginated scan began. Include it in
+      // that initial scan's summary as well.
+      await tx.run(`UPDATE archive_entries SET full_scan_batch_id = ? WHERE subscription_id = ? AND full_scan_batch_id IS NULL`, [scanId, subscription.id]);
     }
+    const batchCount = await tx.get<{ count: number }>('SELECT COUNT(*) AS count FROM archive_entries WHERE full_scan_batch_id = ?', [scanId]);
+    await tx.run(`UPDATE full_scan_batches SET status = 'processing', subscription_name = ?, page_count = ?, scanned_count = ?, archived_count = ?, completed_at = ? WHERE id = ?`,
+    [subscription.name, total, itemCount, Number(batchCount?.count ?? addedCount), now, scanId]);
     await tx.run('DELETE FROM initial_scan_items WHERE subscription_id = ? AND scan_id = ?', [subscription.id, scanId]);
   });
   if (stored && addedCount) scheduleSubscriptionProgressRebuild(subscription.id);

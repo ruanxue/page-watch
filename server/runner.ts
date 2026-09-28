@@ -29,7 +29,12 @@ async function runnableHandlers() {
     EXISTS(SELECT 1 FROM magnet_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) AS magnet,
     EXISTS(SELECT 1 FROM download_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) AS download,
     EXISTS(SELECT 1 FROM library_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) OR EXISTS(SELECT 1 FROM library_sync_jobs WHERE status = 'queued') AS library,
-    EXISTS(SELECT 1 FROM notification_outbox WHERE status = 'queued' AND next_attempt_at <= ?) AS notification`, [now, now, now, now, now, now, now]);
+    EXISTS(SELECT 1 FROM notification_outbox WHERE status = 'queued' AND next_attempt_at <= ?) OR EXISTS(
+      SELECT 1 FROM full_scan_batches b WHERE b.status = 'processing'
+        AND NOT EXISTS(SELECT 1 FROM archive_entries a JOIN release_jobs j ON j.archive_entry_id = a.id WHERE a.full_scan_batch_id = b.id AND j.status IN ('queued','running'))
+        AND NOT EXISTS(SELECT 1 FROM archive_entries a JOIN magnet_jobs j ON j.archive_entry_id = a.id WHERE a.full_scan_batch_id = b.id AND j.status IN ('queued','running'))
+        AND NOT EXISTS(SELECT 1 FROM archive_entries a JOIN library_jobs j ON j.archive_entry_id = a.id WHERE a.full_scan_batch_id = b.id AND j.status IN ('queued','running'))
+    ) AS notification`, [now, now, now, now, now, now, now]);
   const jellyfin = getJellyfinSettings();
   const dueLibrarySync = jellyfin.enabled && jellyfin.libraryIds.length && (!Date.parse(getSetting('jellyfin_last_synced_at')) || Date.now() - Date.parse(getSetting('jellyfin_last_synced_at')) >= jellyfin.syncIntervalMinutes * 60_000);
   return {
