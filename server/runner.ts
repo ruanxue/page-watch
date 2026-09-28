@@ -24,12 +24,13 @@ function reportState(state: 'running' | 'sleeping', detail: string) { send({ typ
 
 async function runnableHandlers() {
   const now = new Date().toISOString();
-  const rows = await db.get<Record<HandlerName, number>>(`SELECT
+  const rows = await db.get<Record<HandlerName | 'librarySyncRunning', number>>(`SELECT
     EXISTS(SELECT 1 FROM jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) OR EXISTS(SELECT 1 FROM subscriptions WHERE is_active = 1 AND (next_scheduled_at IS NULL OR next_scheduled_at <= ?)) AS capture,
     EXISTS(SELECT 1 FROM release_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) AS \`release\`,
     EXISTS(SELECT 1 FROM magnet_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) AS magnet,
     EXISTS(SELECT 1 FROM download_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) AS download,
     EXISTS(SELECT 1 FROM library_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) OR EXISTS(SELECT 1 FROM library_sync_jobs WHERE status = 'queued') AS library,
+    EXISTS(SELECT 1 FROM library_sync_jobs WHERE status = 'running') AS librarySyncRunning,
     EXISTS(SELECT 1 FROM notification_outbox WHERE status = 'queued' AND next_attempt_at <= ?) OR EXISTS(
       SELECT 1 FROM full_scan_batches b WHERE b.status = 'processing'
         AND NOT EXISTS(SELECT 1 FROM archive_entries a JOIN release_jobs j ON j.archive_entry_id = a.id WHERE a.full_scan_batch_id = b.id AND j.status IN ('queued','running'))
@@ -48,7 +49,7 @@ async function runnableHandlers() {
     release: Boolean(rows?.release),
     magnet: Boolean(rows?.magnet),
     download: Boolean(rows?.download),
-    library: Boolean(rows?.library) || dueLibrarySync,
+    library: Boolean(rows?.library) || (dueLibrarySync && !Boolean(rows?.librarySyncRunning)),
     notification: Boolean(rows?.notification)
   };
 }

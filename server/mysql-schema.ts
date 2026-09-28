@@ -373,6 +373,7 @@ export async function ensureMySqlSchema(pool: Pool) {
     status VARCHAR(16) NOT NULL DEFAULT 'queued',
     requested_at VARCHAR(40) NOT NULL,
     started_at VARCHAR(40) NULL,
+    heartbeat_at VARCHAR(40) NULL,
     finished_at VARCHAR(40) NULL,
     error TEXT NULL,
     priority INT NOT NULL DEFAULT 0,
@@ -474,6 +475,7 @@ export async function ensureMySqlSchema(pool: Pool) {
   await addColumnIfMissing(pool, 'subscription_presets', 'pagination_parameter', "VARCHAR(64) NOT NULL DEFAULT 'page'");
   await addColumnIfMissing(pool, 'subscription_presets', 'pagination_match_pattern', 'VARCHAR(1024) NULL');
   await addColumnIfMissing(pool, 'library_sync_jobs', 'trigger_type', "VARCHAR(16) NOT NULL DEFAULT 'scheduled'");
+  await addColumnIfMissing(pool, 'library_sync_jobs', 'heartbeat_at', 'VARCHAR(40) NULL');
   await addColumnIfMissing(pool, 'library_sync_jobs', 'progress_phase', 'VARCHAR(32) NULL');
   await addColumnIfMissing(pool, 'library_sync_jobs', 'progress_current', 'INT NULL');
   await addColumnIfMissing(pool, 'library_sync_jobs', 'progress_total', 'INT NULL');

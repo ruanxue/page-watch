@@ -29,8 +29,13 @@ async function runNextLibrarySync() {
     WHERE status = 'queued' ORDER BY priority DESC, requested_at ASC, id ASC LIMIT 1`);
   if (!job) return false;
   const startedAt = new Date().toISOString();
-  if (!(await db.run("UPDATE library_sync_jobs SET status = 'running', started_at = ?, error = NULL WHERE id = ? AND status = 'queued'", [startedAt, job.id])).changes) return true;
+  if (!(await db.run("UPDATE library_sync_jobs SET status = 'running', started_at = ?, heartbeat_at = ?, error = NULL WHERE id = ? AND status = 'queued'", [startedAt, startedAt, job.id])).changes) return true;
   await setSetting('jellyfin_last_sync_attempt_at', startedAt);
+  const heartbeatTimer = setInterval(() => {
+    void db.run("UPDATE library_sync_jobs SET heartbeat_at = ? WHERE id = ? AND status = 'running'", [new Date().toISOString(), job.id])
+      .catch((error) => console.warn(`Unable to renew Jellyfin sync heartbeat: ${error instanceof Error ? error.message : String(error)}`));
+  }, 30_000);
+  heartbeatTimer.unref();
   syncing = true;
   syncTask = { kind: 'library_sync', current: 0, total: null, label: '正在启动 Jellyfin 同步器' };
   await syncHeartbeat();
@@ -38,14 +43,15 @@ async function runNextLibrarySync() {
   try {
     const result = await librarySyncExecutor.run(job.trigger_type, async (progress) => {
       syncTask = { kind: 'library_sync', current: progress.current, total: progress.total, label: progress.label };
-      await db.run(`UPDATE library_sync_jobs SET progress_phase = ?, progress_current = ?, progress_total = ?, progress_label = ? WHERE id = ?`,
+      await db.run(`UPDATE library_sync_jobs SET progress_phase = ?, progress_current = ?, progress_total = ?, progress_label = ? WHERE id = ? AND status = 'running'`,
         [progress.phase, progress.current, progress.total, progress.label.slice(0, 255), job.id]);
       await syncHeartbeat();
     });
     const finished = new Date().toISOString();
-    await db.run(`UPDATE library_sync_jobs SET status = 'completed', finished_at = ?, error = NULL,
-      progress_phase = 'completed', progress_label = ?, progress_current = ?, progress_total = ? WHERE id = ?`,
+    const completion = await db.run(`UPDATE library_sync_jobs SET status = 'completed', finished_at = ?, error = NULL,
+      progress_phase = 'completed', progress_label = ?, progress_current = ?, progress_total = ? WHERE id = ? AND status = 'running'`,
     [finished, `同步完成：${result.scanned} 个媒体项目，${result.matched} 条已入库`, result.scanned, result.scanned, job.id]);
+    if (!completion.changes) return true;
     // The complete sync runs in a short-lived child process. Its settings
     // writes update that child's cache only, whereas this long-lived runner
     // immediately decides whether another sync is due. Mirror the confirmed
@@ -65,13 +71,16 @@ async function runNextLibrarySync() {
   } catch (error) {
     const message = error instanceof Error ? error.message : '未知 Jellyfin 同步错误';
     const failedAt = new Date().toISOString();
-    await db.transaction(async (tx) => {
-      await tx.run("UPDATE library_sync_jobs SET status = 'failed', finished_at = ?, error = ?, progress_phase = 'failed', progress_label = ? WHERE id = ?", [failedAt, message, '同步失败', job.id]);
-      await enqueueNotification(createOperationFailureNotification({ operation: 'Jellyfin 影视库同步', error: message, jobId: job.id, occurredAt: failedAt }), tx);
+    const failed = await db.transaction(async (tx) => {
+      const update = await tx.run("UPDATE library_sync_jobs SET status = 'failed', finished_at = ?, error = ?, progress_phase = 'failed', progress_label = ? WHERE id = ? AND status = 'running'", [failedAt, message, '同步失败', job.id]);
+      if (update.changes) await enqueueNotification(createOperationFailureNotification({ operation: 'Jellyfin 影视库同步', error: message, jobId: job.id, occurredAt: failedAt }), tx);
+      return Boolean(update.changes);
     });
+    if (!failed) return true;
     await reportIntegrationStatus('jellyfin', 'degraded', '最近一次媒体库同步失败').catch(() => undefined);
     await appendRuntimeLog({ level: 'error', source: 'library', jobId: job.id, message: `Jellyfin 影视库${job.trigger_type === 'manual' ? '手动' : '定时'}同步失败：${message}` });
   } finally {
+    clearInterval(heartbeatTimer);
     syncing = false;
     syncTask = null;
   }

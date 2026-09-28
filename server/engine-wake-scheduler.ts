@@ -1,4 +1,4 @@
-import { db, getJellyfinSettings, getSetting } from './db.js';
+import { db, getJellyfinSettings, getSetting, recoverStaleLibrarySyncJobs, refreshSettings } from './db.js';
 import type { ExecutionEngineController } from './engine-controller.js';
 import { nextJellyfinSyncAt } from './library-sync-schedule.js';
 
@@ -11,6 +11,7 @@ export class EngineWakeScheduler {
   private timer: NodeJS.Timeout | null = null;
   private fallback: NodeJS.Timeout | null = null;
   private stopped = false;
+  private lastRecoveryCheckAt = 0;
 
   constructor(private readonly engine: ExecutionEngineController) {}
 
@@ -35,6 +36,11 @@ export class EngineWakeScheduler {
   }
 
   private async nextWakeAt() {
+    await refreshSettings();
+    if (Date.now() - this.lastRecoveryCheckAt >= FALLBACK_SCAN_MS) {
+      await recoverStaleLibrarySyncJobs();
+      this.lastRecoveryCheckAt = Date.now();
+    }
     const queue = await db.get<NextWakeRow>(`SELECT MIN(wake_at) AS wake_at FROM (
       SELECT MIN(COALESCE(retry_after, requested_at)) AS wake_at FROM jobs WHERE status = 'queued'
       UNION ALL SELECT MIN(COALESCE(retry_after, requested_at)) FROM release_jobs WHERE status = 'queued'

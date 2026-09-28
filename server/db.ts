@@ -416,6 +416,19 @@ export async function queueLibrarySyncJob(trigger: 'manual' | 'scheduled', prior
   }
 }
 
+/** A runner can exit while its external Jellyfin child is running. Release its
+ * durable active slot only after the owning runner stops renewing the lease. */
+export async function recoverStaleLibrarySyncJobs() {
+  const now = new Date();
+  const cutoff = new Date(now.getTime() - 5 * 60_000).toISOString();
+  const result = await db.run(`UPDATE library_sync_jobs
+    SET status = 'failed', finished_at = ?, error = ?, progress_phase = 'failed', progress_label = ?
+    WHERE status = 'running' AND COALESCE(heartbeat_at, started_at) < ?`,
+  [now.toISOString(), 'Jellyfin 同步进程中断或心跳超时，已自动释放任务。', '同步进程心跳超时', cutoff]);
+  if (result.changes) notifyLive('tasks');
+  return result.changes;
+}
+
 /**
  * The unified runner uses this conservative snapshot before an optional
  * memory-only restart. A queued retry counts as work too: preserving a few
