@@ -862,6 +862,7 @@ function CodeSearchPage({ onNotice, onSubscriptionsChanged }: { onNotice: (messa
   }
 
   const currentSearchId = result?.source === 'missav' ? result.searchId : null;
+  const foundMagnetValue = result?.source === 'missav' && result.magnet.status === 'found' ? result.magnet.value : null;
   useEffect(() => {
     if (!currentSearchId || result?.source !== 'missav' || result.magnet.status !== 'pending') return;
     let active = true;
@@ -960,7 +961,7 @@ function CodeSearchPage({ onNotice, onSubscriptionsChanged }: { onNotice: (messa
         <h3>{result.title || '暂无标题'}</h3>
         <div className="code-search-meta"><span>发行日期：{result.releaseDate.status === 'found' ? result.releaseDate.releaseDate : result.releaseDate.status === 'pending' ? '读取中' : result.releaseDate.status === 'failed' ? '读取失败' : '未找到'}{result.releaseDate.status !== 'found' && result.releaseDate.status !== 'pending' ? ` · ${result.releaseDate.reason}` : ''}</span>
           <span>磁链：{result.magnet.status === 'found' ? '已找到' : result.magnet.status === 'pending' ? '检索中' : result.magnet.status === 'not_found' ? '未找到' : result.magnet.status === 'failed' ? '检索失败' : '未启用'}</span>
-          {result.magnet.status === 'found' && <button className="secondary" type="button" onClick={() => void copyMagnet(result.magnet.value)}>复制磁链</button>}
+          {foundMagnetValue && <button className="secondary" type="button" onClick={() => void copyMagnet(foundMagnetValue)}>复制磁链</button>}
           {result.magnet.status === 'failed' && <button className="secondary" type="button" onClick={() => void loadMagnet(result.searchId, true)}>重试磁链检索</button>}
         </div>
         {result.magnet.status !== 'found' && result.magnet.status !== 'pending' && <p className="field-note">{result.magnet.reason}</p>}
