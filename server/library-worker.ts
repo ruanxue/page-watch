@@ -4,6 +4,7 @@ import { exactJellyfinMatch } from './jellyfin-match.js';
 import { librarySyncExecutor } from './library-sync-client.js';
 import { findCachedJellyfinMedia } from './jellyfin-cache.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
+import { isJellyfinSyncDue } from './library-sync-schedule.js';
 import { notifyLive } from './live-events.js';
 import { isExecutionEngineDraining } from './engine-drain.js';
 import { createOperationFailureNotification, enqueueNotification } from './notifications.js';
@@ -166,14 +167,12 @@ async function syncHeartbeat() {
 }
 
 function syncDue() {
-  const last = Date.parse(getSetting('jellyfin_last_synced_at'));
-  const lastAttempt = Date.parse(getSetting('jellyfin_last_sync_attempt_at'));
-  const interval = getJellyfinSettings().syncIntervalMinutes * 60_000;
-  // A failed bootstrap should remain visible as a failed task, not create a
-  // fresh external request every polling tick. The next planned retry is
-  // bounded to five minutes (or the configured interval if shorter).
-  if (!Number.isFinite(last) && Number.isFinite(lastAttempt) && Date.now() - lastAttempt < Math.min(interval, 5 * 60_000)) return false;
-  return !Number.isFinite(last) || Date.now() - last >= interval;
+  return isJellyfinSyncDue({
+    lastSyncedAt: getSetting('jellyfin_last_synced_at'),
+    lastAttemptAt: getSetting('jellyfin_last_sync_attempt_at'),
+    mediaIndexSyncedAt: getSetting('jellyfin_media_index_synced_at'),
+    intervalMinutes: getJellyfinSettings().syncIntervalMinutes
+  });
 }
 
 async function tick() {
@@ -199,7 +198,7 @@ async function tick() {
     // A cache miss after configuration changes must build one complete local
     // snapshot before processing individual archive rows. The durable job lets
     // an on-demand child own that heavy work while this runner stays lean.
-    if (!getSetting('jellyfin_media_index_synced_at') || syncDue()) await queueLibrarySyncJob('scheduled', JOB_PRIORITY.normal);
+    if (syncDue()) await queueLibrarySyncJob('scheduled', JOB_PRIORITY.normal);
     if (await runNextLibrarySync()) return;
     let processed = 0;
     while (processed < LOCAL_MATCH_BATCH_SIZE && await runNextLibraryJob()) processed += 1;

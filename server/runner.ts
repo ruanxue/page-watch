@@ -4,6 +4,7 @@ import { webExecutor } from './web-executor-client.js';
 import { librarySyncExecutor } from './library-sync-client.js';
 import { startRuntimeMemoryReporter } from './runtime-observability.js';
 import { isExecutionEngineDraining } from './engine-drain.js';
+import { isJellyfinSyncDue } from './library-sync-schedule.js';
 
 console.log('Page Watch unified runner started');
 await refreshSettings(true);
@@ -36,7 +37,12 @@ async function runnableHandlers() {
         AND NOT EXISTS(SELECT 1 FROM archive_entries a JOIN library_jobs j ON j.archive_entry_id = a.id WHERE a.full_scan_batch_id = b.id AND j.status IN ('queued','running'))
     ) AS notification`, [now, now, now, now, now, now, now]);
   const jellyfin = getJellyfinSettings();
-  const dueLibrarySync = jellyfin.enabled && jellyfin.libraryIds.length && (!Date.parse(getSetting('jellyfin_last_synced_at')) || Date.now() - Date.parse(getSetting('jellyfin_last_synced_at')) >= jellyfin.syncIntervalMinutes * 60_000);
+  const dueLibrarySync = jellyfin.enabled && jellyfin.libraryIds.length > 0 && isJellyfinSyncDue({
+    lastSyncedAt: getSetting('jellyfin_last_synced_at'),
+    lastAttemptAt: getSetting('jellyfin_last_sync_attempt_at'),
+    mediaIndexSyncedAt: getSetting('jellyfin_media_index_synced_at'),
+    intervalMinutes: jellyfin.syncIntervalMinutes
+  });
   return {
     capture: Boolean(rows?.capture),
     release: Boolean(rows?.release),

@@ -1,5 +1,6 @@
 import { db, getJellyfinSettings, getSetting } from './db.js';
 import type { ExecutionEngineController } from './engine-controller.js';
+import { nextJellyfinSyncAt } from './library-sync-schedule.js';
 
 const FALLBACK_SCAN_MS = 60_000;
 
@@ -47,8 +48,12 @@ export class EngineWakeScheduler {
     let next = queue?.wake_at ? Date.parse(queue.wake_at) : Number.POSITIVE_INFINITY;
     const jellyfin = getJellyfinSettings();
     if (jellyfin.enabled && jellyfin.libraryIds.length) {
-      const last = Date.parse(getSetting('jellyfin_last_synced_at'));
-      next = Math.min(next, Number.isFinite(last) ? last + jellyfin.syncIntervalMinutes * 60_000 : Date.now());
+      next = Math.min(next, nextJellyfinSyncAt({
+        lastSyncedAt: getSetting('jellyfin_last_synced_at'),
+        lastAttemptAt: getSetting('jellyfin_last_sync_attempt_at'),
+        mediaIndexSyncedAt: getSetting('jellyfin_media_index_synced_at'),
+        intervalMinutes: jellyfin.syncIntervalMinutes
+      }));
     }
     return next;
   }
