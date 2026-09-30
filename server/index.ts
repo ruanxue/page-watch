@@ -6,7 +6,7 @@ import fastifyStatic from '@fastify/static';
 import fastifyCompress from '@fastify/compress';
 import { assertSafeUrl as validateSafeUrl } from './url-safety.js';
 import { appendRuntimeLog, configureDatabase, databaseConfigurationError, databaseConfigurationSource, db, getIntegrationStatuses, getJellyfinSettings, getOutboundProxyUrl, getQbittorrentSettings, getRuntimeMetrics, getRuntimeSettings, getSetting, getSubscription, isDatabaseConfigured, JOB_PRIORITY, maintainPerformanceMetrics, queueDownloadJob, queueJob, queueLibraryJob, queueLibrarySyncJob, queueMagnetJob, queueReleaseJob, rebuildSubscriptionProgress, refreshSettings, reportIntegrationStatus, reportRuntimeMetrics, reportWorkerHeartbeat, setRuntimeSettings, setSetting, type IntegrationService, type Subscription } from './db.js';
-import { assertQbittorrentConfig, normalizeQbittorrentUrl, testQbittorrentConnection } from './qbittorrent.js';
+import { assertQbittorrentConfig, getQbittorrentTorrentStates, normalizeQbittorrentUrl, testQbittorrentConnection, torrentHashFromMagnet } from './qbittorrent.js';
 import { assertJellyfinConfig, listJellyfinLibraries, normalizeJellyfinUrl, testJellyfinConnection } from './jellyfin.js';
 import { startRuntimeMemoryReporter } from './runtime-observability.js';
 import { clearJellyfinMediaIndex } from './jellyfin-cache.js';
@@ -15,7 +15,8 @@ import { getInspectionRules, inspectionRulesJson, normalizeInspectionRules } fro
 import { ExecutionEngineController } from './engine-controller.js';
 import { EngineWakeScheduler } from './engine-wake-scheduler.js';
 import { createTestNotification, deliverNotification, getNotificationSettings, normalizeNotificationSettings, publicNotificationSettings, saveNotificationSettings, type NotificationSettingsPayload } from './notifications.js';
-import { buildMissavActressSubscriptionUrl, normalizeMissavActressIdentity, normalizeProductCode, productCodeKeys, productCodeSearchPatterns } from './code-search-parser.js';
+import { buildMissavActressSubscriptionUrl, normalizeMissavActressIdentity, normalizeProductCode, productCodeKeys } from './code-search-parser.js';
+import { backfillArchiveCodeIndex, findArchiveCodeMatches, replaceArchiveCodes } from './archive-code-index.js';
 import { webExecutor } from './web-executor-client.js';
 
 // Docker creates a random private token in its entry script. Keep a fixed,
@@ -1056,9 +1057,9 @@ app.post('/api/code-search', async (request, reply) => {
   const code = typeof input.code === 'string' ? normalizeProductCode(input.code) : null;
   if (!code) return reply.code(400).send({ error: '请输入有效番号，例如 MEYD-568 或 meyd568。' });
   const codeKey = code.toLowerCase();
-  const patterns = productCodeSearchPatterns(code);
-  const legacyMatch = [...patterns.map(() => 'LOWER(a.content) LIKE ?'), ...patterns.map(() => 'LOWER(COALESCE(a.title, \'\')) LIKE ?')].join(' OR ');
-  const archivedCandidates = await db.all<{
+  const matches = await findArchiveCodeMatches(db, [codeKey]);
+  const ids = [...new Set(matches.map((row) => row.id))];
+  const archivedCandidates = ids.length ? await db.all<{
     id: number; content: string; archive_code: string | null; title: string | null; detail_url: string | null; first_seen_at: string;
     release_date: string | null; release_status: string; release_error: string | null;
     magnet_status: string; magnet_value: string | null; magnet_error: string | null;
@@ -1066,8 +1067,8 @@ app.post('/api/code-search', async (request, reply) => {
   }>(`SELECT a.id, a.content, a.title, a.detail_url, a.first_seen_at, a.release_date, a.release_status, a.release_error,
       a.archive_code, a.magnet_status, a.magnet_value, a.magnet_error, s.id AS subscription_id, s.name AS subscription_name, s.url AS subscription_url
     FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
-    WHERE a.archive_code = ? OR (${legacyMatch})
-    ORDER BY a.first_seen_at DESC, a.id DESC LIMIT 500`, [codeKey, ...patterns, ...patterns]);
+    WHERE a.id IN (${ids.map(() => '?').join(', ')})
+    ORDER BY a.first_seen_at DESC, a.id DESC LIMIT 500`, ids) : [];
   const archived = archivedCandidates.filter((item) => item.archive_code?.toLowerCase() === codeKey || productCodeKeys(item.content).includes(codeKey) || productCodeKeys(item.title ?? '').includes(codeKey)).slice(0, 100);
   if (archived.length) return { source: 'archive', code, items: archived };
 
@@ -1187,6 +1188,7 @@ app.post('/api/code-search/subscribe', async (request, reply) => {
         titleSelector: preset.title_selector ?? '', titleContentSource: preset.title_content_source === 'attribute' ? 'attribute' : 'text',
         titleAttributeName: preset.title_attribute_name ?? '', titleMatchPattern: preset.title_match_pattern ?? '',
         resultMode: preset.result_mode === 'all' ? 'all' : 'first', intervalMinutes: preset.interval_minutes,
+        scheduleType: 'hourly', scheduleIntervalHours: Math.max(1, Math.min(168, Math.round(preset.interval_minutes / 60))),
         isActive: true, paginationSelector: preset.pagination_selector ?? '', paginationParameter: preset.pagination_parameter ?? 'page',
         paginationMatchPattern: preset.pagination_match_pattern ?? ''
       });
@@ -1221,12 +1223,8 @@ app.post('/api/code-search/subscribe', async (request, reply) => {
         [fullScanBatchId, subscriptionId, actress.name, duplicate?.last_hash ? 0 : 1, now]);
       }
 
-      const patterns = productCodeSearchPatterns(session.code);
-      const legacyMatch = [...patterns.map(() => 'LOWER(content) LIKE ?'), ...patterns.map(() => 'LOWER(COALESCE(title, \'\')) LIKE ?')].join(' OR ');
-      const existingCandidates = await tx.all<{ id: number; archive_code: string | null; content: string; title: string | null }>(`SELECT id, archive_code, content, title FROM archive_entries
-        WHERE subscription_id = ? AND (archive_code = ? OR (${legacyMatch}))`,
-      [subscriptionId, session.code.toLowerCase(), ...patterns, ...patterns]);
-      const existingEntry = existingCandidates.find((entry) => entry.archive_code?.toLowerCase() === session.code.toLowerCase() || productCodeKeys(entry.content).includes(session.code.toLowerCase()) || productCodeKeys(entry.title ?? '').includes(session.code.toLowerCase()));
+      const existingCandidates = await findArchiveCodeMatches(tx, [session.code.toLowerCase()], subscriptionId, false);
+      const existingEntry = existingCandidates[0];
       let archiveEntryId = existingEntry?.id ?? 0;
       const addedToArchive = !existingEntry;
       if (!existingEntry) {
@@ -1253,6 +1251,7 @@ app.post('/api/code-search/subscribe', async (request, reply) => {
           magnetStatus, session.magnet.status === 'found' ? session.magnet.value : null, magnetStatus === 'pending' ? null : now, magnetError,
           useLibraryFirst ? 'pending' : 'unconfigured', fullScanBatchId, now]);
         archiveEntryId = inserted.lastInsertRowid;
+        await replaceArchiveCodes(tx, [{ id: archiveEntryId, subscription_id: subscriptionId, content: session.code, title: session.title }]);
         if (releaseStatus === 'pending') await queueReleaseJob(archiveEntryId, tx);
         if (useLibraryFirst) await queueLibraryJob(archiveEntryId, tx);
         else if (magnetStatus === 'pending') await queueMagnetJob(archiveEntryId, tx);
@@ -1499,12 +1498,24 @@ app.post('/api/subscriptions/:id/download-backfill', async (request, reply) => {
 
 app.post('/api/archive/:id/download', async (request, reply) => {
   const id = Number((request.params as { id: string }).id);
-  const entry = await db.get<{ id: number; subscription_id: number; content: string; magnet_status: string; magnet_value: string | null; download_status: string }>(
-    'SELECT id, subscription_id, content, magnet_status, magnet_value, download_status FROM archive_entries WHERE id = ?', [id]);
+  const entry = await db.get<{ id: number; subscription_id: number; content: string; magnet_status: string; magnet_value: string | null; download_status: string; download_torrent_hash: string | null }>(
+    'SELECT id, subscription_id, content, magnet_status, magnet_value, download_status, download_torrent_hash FROM archive_entries WHERE id = ?', [id]);
   if (!entry) return reply.code(404).send({ error: '归档内容不存在。' });
   if (!await ensureQbittorrentEnabled(reply)) return;
   if (entry.magnet_status !== 'found' || !entry.magnet_value) return reply.code(400).send({ error: '该内容尚未找到可用的磁力链接。' });
   if (entry.download_status === 'added') return reply.code(409).send({ error: '该内容已提交给 qBittorrent。' });
+  if (entry.download_status === 'completed') {
+    const hash = entry.download_torrent_hash || torrentHashFromMagnet(entry.magnet_value);
+    if (hash) {
+      try {
+        if ((await getQbittorrentTorrentStates(getQbittorrentSettings(), [hash])).length) {
+          return reply.code(409).send({ error: 'qBittorrent 中仍存在这个已完成的种子。请先在 qBittorrent 中删除种子，再点击下载。' });
+        }
+      } catch (error) {
+        return reply.code(502).send({ error: error instanceof Error ? error.message : '无法确认 qBittorrent 中的种子状态。' });
+      }
+    }
+  }
   let queued = false;
   let jobId = 0;
   await db.transaction(async (tx) => {
@@ -1742,11 +1753,14 @@ app.post('/api/subscriptions', async (request, reply) => {
 
 app.put('/api/subscriptions/:id', async (request, reply) => {
   const id = Number((request.params as { id: string }).id);
-  if (!await getSubscription(id)) return reply.code(404).send({ error: '订阅不存在。' });
+  const current = await getSubscription(id);
+  if (!current) return reply.code(404).send({ error: '订阅不存在。' });
   try {
     const values = await normalizePayload(request.body as SubscriptionPayload);
-    await db.run(`UPDATE subscriptions SET name=?, url=?, selector=?, render_mode=?, content_source=?, attribute_name=?, match_pattern=?, title_selector=?, title_content_source=?, title_attribute_name=?, title_match_pattern=?, result_mode=?, interval_minutes=?, schedule_type=?, schedule_interval_hours=?, schedule_time=?, schedule_weekday=?, is_active=?, pagination_selector=?, pagination_parameter=?, pagination_match_pattern=?, initial_scan_completed=CASE WHEN ? IS NULL THEN 1 WHEN pagination_selector IS NULL THEN 0 ELSE initial_scan_completed END, initial_scan_total=CASE WHEN ? IS NOT NULL AND pagination_selector IS NULL THEN NULL ELSE initial_scan_total END, initial_scan_pages_completed=CASE WHEN ? IS NOT NULL AND pagination_selector IS NULL THEN 0 ELSE initial_scan_pages_completed END, updated_at=? WHERE id=?`,
-      [values.name, values.url, values.selector, values.renderMode, values.contentSource, values.attributeName, values.matchPattern, values.titleSelector, values.titleContentSource, values.titleAttributeName, values.titleMatchPattern, values.resultMode, values.interval, values.scheduleType, values.scheduleIntervalHours, values.scheduleTime, values.scheduleWeekday, values.isActive, values.paginationSelector, values.paginationParameter, values.paginationMatchPattern, values.paginationSelector, values.paginationSelector, values.paginationSelector, new Date().toISOString(), id]);
+    const scheduleChanged = current.schedule_type !== values.scheduleType || current.schedule_interval_hours !== values.scheduleIntervalHours
+      || current.schedule_time !== values.scheduleTime || current.schedule_weekday !== values.scheduleWeekday || current.is_active !== values.isActive;
+    await db.run(`UPDATE subscriptions SET name=?, url=?, selector=?, render_mode=?, content_source=?, attribute_name=?, match_pattern=?, title_selector=?, title_content_source=?, title_attribute_name=?, title_match_pattern=?, result_mode=?, interval_minutes=?, schedule_type=?, schedule_interval_hours=?, schedule_time=?, schedule_weekday=?, is_active=?, pagination_selector=?, pagination_parameter=?, pagination_match_pattern=?, initial_scan_completed=CASE WHEN ? IS NULL THEN 1 WHEN pagination_selector IS NULL THEN 0 ELSE initial_scan_completed END, initial_scan_total=CASE WHEN ? IS NOT NULL AND pagination_selector IS NULL THEN NULL ELSE initial_scan_total END, initial_scan_pages_completed=CASE WHEN ? IS NOT NULL AND pagination_selector IS NULL THEN 0 ELSE initial_scan_pages_completed END, next_scheduled_at=CASE WHEN ? THEN NULL ELSE next_scheduled_at END, updated_at=? WHERE id=?`,
+      [values.name, values.url, values.selector, values.renderMode, values.contentSource, values.attributeName, values.matchPattern, values.titleSelector, values.titleContentSource, values.titleAttributeName, values.titleMatchPattern, values.resultMode, values.interval, values.scheduleType, values.scheduleIntervalHours, values.scheduleTime, values.scheduleWeekday, values.isActive, values.paginationSelector, values.paginationParameter, values.paginationMatchPattern, values.paginationSelector, values.paginationSelector, values.paginationSelector, scheduleChanged ? 1 : 0, new Date().toISOString(), id]);
     return await getSubscription(id);
   } catch (error) {
     return reply.code(400).send({ error: error instanceof Error ? error.message : '无法更新订阅。' });
@@ -1760,6 +1774,7 @@ app.delete('/api/subscriptions/:id', async (request, reply) => {
     await tx.run('DELETE r FROM release_jobs r JOIN archive_entries a ON a.id = r.archive_entry_id WHERE a.subscription_id = ?', [id]);
     await tx.run('DELETE m FROM magnet_jobs m JOIN archive_entries a ON a.id = m.archive_entry_id WHERE a.subscription_id = ?', [id]);
     await tx.run('DELETE l FROM library_jobs l JOIN archive_entries a ON a.id = l.archive_entry_id WHERE a.subscription_id = ?', [id]);
+    await tx.run('DELETE FROM archive_entry_codes WHERE subscription_id = ?', [id]);
     await tx.run('DELETE FROM initial_scan_items WHERE subscription_id = ?', [id]);
     await tx.run('DELETE FROM archive_entries WHERE subscription_id = ?', [id]);
     await tx.run('DELETE FROM jobs WHERE subscription_id = ?', [id]);
@@ -1779,6 +1794,7 @@ app.delete('/api/subscriptions/:id/archive', async (request, reply) => {
     await tx.run('DELETE r FROM release_jobs r JOIN archive_entries a ON a.id = r.archive_entry_id WHERE a.subscription_id = ?', [id]);
     await tx.run('DELETE m FROM magnet_jobs m JOIN archive_entries a ON a.id = m.archive_entry_id WHERE a.subscription_id = ?', [id]);
     await tx.run('DELETE l FROM library_jobs l JOIN archive_entries a ON a.id = l.archive_entry_id WHERE a.subscription_id = ?', [id]);
+    await tx.run('DELETE FROM archive_entry_codes WHERE subscription_id = ?', [id]);
     await tx.run('DELETE FROM initial_scan_items WHERE subscription_id = ?', [id]);
     await tx.run('DELETE FROM archive_entries WHERE subscription_id = ?', [id]);
     await tx.run(`INSERT INTO subscription_progress
@@ -1871,6 +1887,11 @@ let operationalServicesStarted = false;
 function startOperationalServices() {
   if (operationalServicesStarted || !isDatabaseConfigured()) return;
   operationalServicesStarted = true;
+  const backfillCodes = () => void backfillArchiveCodeIndex().catch((error) => {
+    app.log.warn(`Unable to backfill archive code index: ${error instanceof Error ? error.message : String(error)}`);
+    setTimeout(backfillCodes, 60_000).unref();
+  });
+  backfillCodes();
   const beat = async () => {
     await reportWorkerHeartbeat('api', `网页服务监听端口 ${port}`).catch((error) => app.log.warn(`Unable to save API heartbeat: ${error instanceof Error ? error.message : String(error)}`));
     if (engineController.snapshot().state === 'sleeping') {
@@ -1897,34 +1918,28 @@ function startOperationalServices() {
   let downloadObserverTimer: NodeJS.Timeout | null = null;
   const scheduleDownloadObserver = async () => {
     try {
-      const getDownloadStateCounts = () => db.get<{ active: number; paused: number; completed: number }>(`SELECT
+      const getDownloadStateCounts = () => db.get<{ active: number; paused: number }>(`SELECT
         SUM(download_status IN ('added', 'waiting', 'downloading')) AS active,
-        SUM(download_status = 'paused') AS paused,
-        SUM(download_status = 'completed') AS completed
-        FROM archive_entries`);
+        SUM(download_status = 'paused') AS paused
+        FROM archive_entries WHERE download_status IN ('added', 'waiting', 'downloading', 'paused')`);
       const initial = await getDownloadStateCounts();
       const activeCount = Number(initial?.active ?? 0);
       const pausedCount = Number(initial?.paused ?? 0);
-      const completedCount = Number(initial?.completed ?? 0);
       let delay = activeCount > 0 ? 10_000 : 60_000;
-      if (activeCount > 0 || pausedCount > 0 || completedCount > 0) {
+      if (activeCount > 0 || pausedCount > 0) {
         process.env.PAGE_WATCH_WORKER_AUTOSTART = '0';
         const observer = await import('./download-worker.js');
         if (await observer.observeQbittorrentDownloads()) await engineWakeScheduler.wake('下载完成通知已入队');
       }
-      const latest = (activeCount > 0 || pausedCount > 0 || completedCount > 0) ? await getDownloadStateCounts() : initial;
+      const latest = (activeCount > 0 || pausedCount > 0) ? await getDownloadStateCounts() : initial;
       const latestActive = Number(latest?.active ?? 0);
       const latestPaused = Number(latest?.paused ?? 0);
-      const latestCompleted = Number(latest?.completed ?? 0);
       delay = latestActive > 0 ? 10_000 : 60_000;
       const queued = await db.get<{ count: number }>("SELECT COUNT(*) AS count FROM download_jobs WHERE status IN ('queued', 'running')");
       if (latestActive > 0) {
         await reportWorkerHeartbeat('download', `正在轻量同步 ${latestActive} 个 qBittorrent 下载状态`, 'busy');
       } else if (Number(queued?.count ?? 0) === 0) {
-        const coldDetails = [
-          latestPaused > 0 ? `${latestPaused} 个 qBittorrent 下载已暂停` : '',
-          latestCompleted > 0 ? `${latestCompleted} 个已完成下载低频检查状态及停止做种` : ''
-        ].filter(Boolean);
+        const coldDetails = [latestPaused > 0 ? `${latestPaused} 个 qBittorrent 下载已暂停` : ''].filter(Boolean);
         const detail = coldDetails.length ? `${coldDetails.join('；')}（每 60 秒检查）` : '下载提交 Worker 按需休眠';
         await reportWorkerHeartbeat('download', detail, 'sleeping');
       }

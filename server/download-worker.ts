@@ -219,8 +219,11 @@ async function stopCompletedTorrents(settings: ReturnType<typeof getQbittorrentS
   if (!settings.stopAfterDownload || !candidates.length) return new Set<number>();
   try {
     await stopQbittorrentTorrents(settings, candidates.map((entry) => entry.hash));
-    for (const entry of candidates) lastStopFailureLogAt.delete(entry.id);
-    return new Set(candidates.map((entry) => entry.id));
+    const states = await getQbittorrentTorrentStates(settings, candidates.map((entry) => entry.hash));
+    const stoppedHashes = new Set(states.filter((torrent) => isStoppedState(torrent.state)).map((torrent) => torrent.hash));
+    const stoppedIds = new Set(candidates.filter((entry) => stoppedHashes.has(entry.hash)).map((entry) => entry.id));
+    for (const id of stoppedIds) lastStopFailureLogAt.delete(id);
+    return stoppedIds;
   } catch (error) {
     const message = error instanceof Error ? error.message : '未知停止做种错误';
     const now = Date.now();
@@ -233,6 +236,15 @@ async function stopCompletedTorrents(settings: ReturnType<typeof getQbittorrentS
   }
 }
 
+function statusAfterStopAttempt(entry: TrackedDownload, torrent: QbittorrentTorrentState, stopAfterDownload: boolean, stoppedIds: Set<number>) {
+  const status = stateForDownload(torrent);
+  // Keep a failed stop attempt in the active observer so it can retry. Once
+  // completed is persisted, the torrent is never polled again.
+  return status === 'completed' && stopAfterDownload && isQbittorrentReadyToStopSeeding(torrent) && !stoppedIds.has(entry.id)
+    ? 'downloading'
+    : status;
+}
+
 /**
  * qBittorrent owns the download lifecycle. Page Watch only mirrors the
  * states for submitted magnets and never sends another add request here.
@@ -242,7 +254,9 @@ async function syncDownloadStates() {
   lastStatusSyncAt = Date.now();
   const settings = getQbittorrentSettings();
   if (!settings.enabled) return false;
-  const [activeEntries, pausedEntries, completedEntries] = await Promise.all([
+  // Completed entries are terminal: neither load them from MySQL nor probe
+  // their qBittorrent hashes during background observation.
+  const [activeEntries, pausedEntries] = await Promise.all([
     db.all<TrackedDownload>(`SELECT a.id, a.subscription_id, s.name AS subscription_name, a.content, a.download_status, a.download_completion_notified_at, a.download_added_at, a.download_checked_at, a.download_torrent_hash, a.magnet_value,
     a.download_progress, a.download_speed, a.download_size, a.downloaded_bytes, a.download_save_path, a.download_content_path, a.download_filter_min_size_bytes
     FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
@@ -250,11 +264,7 @@ async function syncDownloadStates() {
     db.all<TrackedDownload>(`SELECT a.id, a.subscription_id, s.name AS subscription_name, a.content, a.download_status, a.download_completion_notified_at, a.download_added_at, a.download_checked_at, a.download_torrent_hash, a.magnet_value,
     a.download_progress, a.download_speed, a.download_size, a.downloaded_bytes, a.download_save_path, a.download_content_path, a.download_filter_min_size_bytes
     FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
-    WHERE a.download_status = 'paused'`),
-    db.all<TrackedDownload>(`SELECT a.id, a.subscription_id, s.name AS subscription_name, a.content, a.download_status, a.download_completion_notified_at, a.download_added_at, a.download_checked_at, a.download_torrent_hash, a.magnet_value,
-    a.download_progress, a.download_speed, a.download_size, a.downloaded_bytes, a.download_save_path, a.download_content_path, a.download_filter_min_size_bytes
-    FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
-    WHERE a.download_status = 'completed'`)
+    WHERE a.download_status = 'paused'`)
   ]);
 
   const toTracked = (entries: TrackedDownload[]) => entries.map((entry) => ({
@@ -263,11 +273,9 @@ async function syncDownloadStates() {
   })).filter((entry): entry is TrackedDownload & { hash: string } => Boolean(entry.hash));
   const active = toTracked(activeEntries);
   const paused = toTracked(pausedEntries);
-  const previouslyCompleted = toTracked(completedEntries);
   const resumedPaused = new Map<number, TrackedDownload & { hash: string }>();
-  const recheckedCompleted = new Map<number, TrackedDownload & { hash: string }>();
   let coldProbeByHash = new Map<string, QbittorrentTorrentState>();
-  const coldTracked = [...paused, ...previouslyCompleted];
+  const coldTracked = paused;
   if (coldTracked.length && Date.now() - lastColdStatusProbeAt >= COLD_STATUS_PROBE_MS) {
     const coldRemote = await getQbittorrentTorrentStates(settings, coldTracked.map((entry) => entry.hash));
     lastColdStatusProbeAt = Date.now();
@@ -289,31 +297,8 @@ async function syncDownloadStates() {
       coldMissingProbeCounts.delete(entry.id);
       if (!isQbittorrentDownloadPaused(torrent)) resumedPaused.set(entry.id, entry);
     }
-    for (const entry of previouslyCompleted) {
-      const torrent = coldProbeByHash.get(entry.hash);
-      if (!torrent) {
-        const misses = (coldMissingProbeCounts.get(entry.id) ?? 0) + 1;
-        coldMissingProbeCounts.set(entry.id, misses);
-        if (misses >= 2) recheckedCompleted.set(entry.id, entry);
-        continue;
-      }
-      coldMissingProbeCounts.delete(entry.id);
-      if (!isQbittorrentDownloadComplete(torrent)) recheckedCompleted.set(entry.id, entry);
-    }
   }
-
-  const completedStopCandidates = previouslyCompleted.filter((entry) => {
-    const torrent = coldProbeByHash.get(entry.hash);
-    return Boolean(torrent && isQbittorrentDownloadComplete(torrent) && isQbittorrentReadyToStopSeeding(torrent));
-  });
-  const completedStoppedIds = await stopCompletedTorrents(settings, completedStopCandidates);
-  for (const entry of completedStopCandidates) {
-    if (!completedStoppedIds.has(entry.id) || Date.now() - (lastStopSuccessLogAt.get(entry.id) ?? 0) < 5 * 60_000) continue;
-    lastStopSuccessLogAt.set(entry.id, Date.now());
-    await appendRuntimeLog({ level: 'success', source: 'download', subscriptionId: entry.subscription_id, message: `已停止“${entry.content}”做种。` });
-  }
-
-  const transitionedCold = [...resumedPaused.values(), ...recheckedCompleted.values()];
+  const transitionedCold = [...resumedPaused.values()];
   const tracked = [...active, ...transitionedCold];
   if (!tracked.length) return false;
 
@@ -450,7 +435,7 @@ async function syncDownloadStates() {
           continue;
         }
         if (acceptedIds.has(entry.id) && plan) {
-          const next = stateForDownload(torrent);
+          const next = statusAfterStopAttempt(entry, torrent, settings.stopAfterDownload, stoppedIds);
           const status = next === 'paused' ? 'waiting' : next;
           await tx.run(`UPDATE archive_entries SET download_status = ?, download_torrent_hash = ?, download_checked_at = ?,
             download_progress = ?, download_speed = ?, download_size = ?, downloaded_bytes = ?, download_save_path = ?, download_content_path = ?,
@@ -469,7 +454,7 @@ async function syncDownloadStates() {
           continue;
         }
       }
-      const next = stateForDownload(torrent);
+      const next = statusAfterStopAttempt(entry, torrent, settings.stopAfterDownload, stoppedIds);
       if (hasDownloadSnapshotChanged(entry, next, torrent, checkedAtMs)) {
         await tx.run(`UPDATE archive_entries SET download_status = ?, download_torrent_hash = ?, download_checked_at = ?,
           download_progress = ?, download_speed = ?, download_size = ?, downloaded_bytes = ?, download_save_path = ?, download_content_path = ?, download_removed_at = NULL, updated_at = ?
