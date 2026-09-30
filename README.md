@@ -2,36 +2,28 @@
 
 自托管网页订阅与内容变更监测工具。订阅网页地址并用 CSS Selector 提取所需元素；系统保留当前对比基准，将首次发现的内容归档。动态网页使用 Playwright 渲染。
 
-## WSL 本地开发
+## 本地开发
 
-本项目的本地开发目录应位于 WSL 的 Linux 文件系统（例如 `/home/你的用户名/code/page-watch`），不要放在 `/mnt/c` 或 `/mnt/d`。使用 NVM 管理 Node，版本以 [`.nvmrc`](.nvmrc) 为准。
+在 Windows 上直接开发即可，不需要 WSL。请把项目放在本地磁盘目录（例如 `D:\Code\page-watch`），不要放在网络驱动器或同步盘中，否则 Playwright 和 Vite 会明显变慢。Node 版本以 [`.nvmrc`](.nvmrc) 为准。
 
 首次安装或重新执行依赖校验时：
 
-
-```bash
-source "$HOME/.nvm/nvm.sh"
-nvm use
+```powershell
 npm ci
 npx playwright install chromium
 ```
 
-Playwright 的 Chromium 还需要 WSL 系统库。Ubuntu 26.04 可执行：
+启动开发服务：
 
-```bash
-sudo apt update
-sudo apt install -y libnspr4 libnss3 libasound2t64
+```powershell
+npm run dev
 ```
 
-启动开发服务时，推荐使用会主动加载 NVM 的脚本；它也适用于 Codex 等非交互式终端，避免误用 Windows 的 `node`/`npm`：
-
-```bash
-bash scripts/dev-wsl.sh
-```
-
-也可以在已运行 `nvm use` 的 WSL 终端中执行 `npm run dev`。前端通过 Vite 热更新；服务端文件变更会自动重启本地 API。要停止服务，按 `Ctrl+C`。
+前端通过 Vite 热更新；服务端文件变更会自动重启本地 API。要停止服务，按 `Ctrl+C`。
 
 打开 `http://localhost:5173`。API 在 `http://localhost:3030`。
+
+本地开发通常连接 NAS 上的同一个 MySQL 库，本地引擎会直接接续 NAS 容器中的队列；任务状态只保存在 MySQL，因此不会重复执行，但两边会共用同一批数据与运行日志。
 
 ## Docker / NAS
 
@@ -91,7 +83,7 @@ npm run migrate:mysql
 
 也可在 NAS 的 `.env` 中设置 `OUTBOUND_PROXY=http://代理地址:端口`，它会覆盖网页内的设置。若代理运行在 NAS 外的另一台设备，请使用其局域网 IP；容器中的 `127.0.0.1` 指向容器自身。
 
-WSL 本地开发使用项目版本对应的 Playwright Chromium；首次运行前执行 `npx playwright install chromium`，不要依赖 Windows 已安装的 Chrome 或 Edge。NAS 的 Docker 镜像已自带 Chromium。若需指定其他浏览器，可设置 `PLAYWRIGHT_EXECUTABLE_PATH`。网页中的“网络代理”设置同时提供“运行性能”：默认“稳妥”模式只运行一个 MissAV 页面，浏览器空闲 10 分钟自动回收；“性能”模式最多两页并发，会增加内存和站点访问风险。运行中心会分别显示 API、执行引擎、网页执行器与 Jellyfin 同步器的内存；网页执行器显示“已回收”时，承载 Playwright/Cheerio 的 Node 进程和 Chromium 都已退出。大批任务完成后，若网页执行器和 Jellyfin 同步器均已退出、所有队列和 Worker 都持续空闲而执行引擎 RSS 仍超过 160MB，系统会先执行受控 GC；仍未回落才只重启执行引擎。网页 API、SSE 与登录会话不中断，全部任务状态由 MySQL 队列续跑。
+本地开发使用项目版本对应的 Playwright Chromium；首次运行前执行 `npx playwright install chromium`，不要依赖系统已安装的 Chrome 或 Edge。NAS 的 Docker 镜像已自带 Chromium。若需指定其他浏览器，可设置 `PLAYWRIGHT_EXECUTABLE_PATH`。网页中的“网络代理”设置同时提供“运行性能”：默认“稳妥”模式只运行一个 MissAV 页面，浏览器空闲 10 分钟自动回收；“性能”模式最多两页并发，会增加内存和站点访问风险。运行中心会分别显示 API、执行引擎、网页执行器与 Jellyfin 同步器的内存；网页执行器显示“已回收”时，承载 Playwright/Cheerio 的 Node 进程和 Chromium 都已退出。大批任务完成后，若网页执行器和 Jellyfin 同步器均已退出、所有队列和 Worker 都持续空闲而执行引擎 RSS 仍超过 160MB，系统会先执行受控 GC；仍未回落才只重启执行引擎。网页 API、SSE 与登录会话不中断，全部任务状态由 MySQL 队列续跑。
 
 ### 推荐的 NAS 持续部署
 
