@@ -1,10 +1,11 @@
 import { createServer } from 'node:http';
-import { db, flushSubscriptionProgressRebuilds, flushTelemetry, getJellyfinSettings, getSetting, refreshSettings, reportRuntimeMetrics } from './db.js';
+import { db, flushSubscriptionProgressRebuilds, flushTelemetry, getJellyfinSettings, getSetting, refreshSettings, reportRuntimeMetrics, reportWorkerHeartbeat, type WorkerName } from './db.js';
 import { webExecutor } from './web-executor-client.js';
 import { librarySyncExecutor } from './library-sync-client.js';
 import { startRuntimeMemoryReporter } from './runtime-observability.js';
 import { isExecutionEngineDraining } from './engine-drain.js';
 import { isJellyfinSyncDue } from './library-sync-schedule.js';
+import { getInspectionRules } from './inspection-rules.js';
 
 console.log('Page Watch unified runner started');
 await refreshSettings(true);
@@ -12,21 +13,31 @@ startRuntimeMemoryReporter('runner');
 
 const ENGINE_IDLE_EXIT_CODE = 76;
 const ENGINE_IDLE_MS = 2 * 60_000;
+const HEARTBEAT_KEEPALIVE_MS = 15_000;
 let dispatchTimer: NodeJS.Timeout | null = null;
+let heartbeatTimer: NodeJS.Timeout | null = null;
 let idleSince: number | null = null;
 let dispatching = false;
+let dispatchRequested = false;
 let shuttingDown = false;
 type HandlerName = 'capture' | 'release' | 'magnet' | 'download' | 'library' | 'notification';
 const activeHandlers = new Set<HandlerName>();
+// API 的健康检查在 90 秒收不到心跳落库后就把 worker 判为不可用。这里的
+// worker 运行时带着 PAGE_WATCH_WORKER_AUTOSTART=0，它们自己的 15 秒心跳定时器
+// 根本不会启动，而一个长耗时的浏览器批次会让 handler 停在首次心跳里远超 90 秒。
+const heartbeatWorkers: WorkerName[] = ['capture', 'release', 'magnet', 'download', 'library'];
 
 function send(message: unknown) { if (process.send) process.send(message); }
 function reportState(state: 'running' | 'sleeping', detail: string) { send({ type: 'state', state, detail }); }
 
 async function runnableHandlers() {
+  await refreshSettings();
   const now = new Date().toISOString();
   const rows = await db.get<Record<HandlerName | 'librarySyncRunning', number>>(`SELECT
     EXISTS(SELECT 1 FROM jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) OR EXISTS(SELECT 1 FROM subscriptions WHERE is_active = 1 AND (next_scheduled_at IS NULL OR next_scheduled_at <= ?)) AS capture,
-    EXISTS(SELECT 1 FROM release_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) AS \`release\`,
+    EXISTS(SELECT 1 FROM release_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) OR
+      (? = 1 AND EXISTS(SELECT 1 FROM archive_entries WHERE release_status = 'unsearched' OR
+        (release_status = 'unavailable' AND release_error = '详情页未找到标签“发行日期”对应的日期值。'))) AS \`release\`,
     EXISTS(SELECT 1 FROM magnet_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) AS magnet,
     EXISTS(SELECT 1 FROM download_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) AS download,
     EXISTS(SELECT 1 FROM library_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) OR EXISTS(SELECT 1 FROM library_sync_jobs WHERE status = 'queued') AS library,
@@ -36,7 +47,7 @@ async function runnableHandlers() {
         AND NOT EXISTS(SELECT 1 FROM archive_entries a JOIN release_jobs j ON j.archive_entry_id = a.id WHERE a.full_scan_batch_id = b.id AND j.status IN ('queued','running'))
         AND NOT EXISTS(SELECT 1 FROM archive_entries a JOIN magnet_jobs j ON j.archive_entry_id = a.id WHERE a.full_scan_batch_id = b.id AND j.status IN ('queued','running'))
         AND NOT EXISTS(SELECT 1 FROM archive_entries a JOIN library_jobs j ON j.archive_entry_id = a.id WHERE a.full_scan_batch_id = b.id AND j.status IN ('queued','running'))
-    ) AS notification`, [now, now, now, now, now, now, now]);
+    ) AS notification`, [now, now, getInspectionRules().releaseDate.enabled ? 1 : 0, now, now, now, now, now]);
   const jellyfin = getJellyfinSettings();
   const dueLibrarySync = jellyfin.enabled && jellyfin.libraryIds.length > 0 && isJellyfinSyncDue({
     lastSyncedAt: getSetting('jellyfin_last_synced_at'),
@@ -73,7 +84,8 @@ async function runHandler(name: HandlerName) {
 }
 
 async function requestDispatch(_reason = '事件唤醒') {
-  if (dispatching || shuttingDown) return;
+  if (shuttingDown) return;
+  if (dispatching) { dispatchRequested = true; return; }
   dispatching = true;
   try {
     const runnable = await runnableHandlers();
@@ -82,7 +94,9 @@ async function requestDispatch(_reason = '事件唤醒') {
       idleSince = null;
       reportState('running', `正在处理 ${names.length} 类队列`);
       for (const name of names) void runHandler(name);
-      scheduleDispatch(250);
+      // Handler completion triggers the next dispatch immediately. This timer
+      // only recovers a missed event or work added outside the API wake path.
+      scheduleDispatch(5_000);
       return;
     }
     const web = webExecutor.snapshot();
@@ -95,7 +109,7 @@ async function requestDispatch(_reason = '事件唤醒') {
     // starts below.
     if (activeHandlers.size || web.state !== 'offline' || librarySync.active) {
       idleSince = null;
-      scheduleDispatch(500);
+      scheduleDispatch(5_000);
       return;
     }
     idleSince ??= Date.now();
@@ -109,13 +123,31 @@ async function requestDispatch(_reason = '事件唤醒') {
   } catch (error) {
     console.error(`Execution dispatcher failed: ${error instanceof Error ? error.message : String(error)}`);
     scheduleDispatch(5_000);
-  } finally { dispatching = false; }
+  } finally {
+    dispatching = false;
+    if (dispatchRequested && !shuttingDown) {
+      dispatchRequested = false;
+      scheduleDispatch(0);
+    }
+  }
 }
 
 function scheduleDispatch(delay: number) {
   if (dispatchTimer) clearTimeout(dispatchTimer);
   dispatchTimer = setTimeout(() => void requestDispatch('调度定时器'), delay);
   dispatchTimer.unref();
+}
+
+function keepAliveHeartbeats() {
+  for (const name of heartbeatWorkers) {
+    void reportWorkerHeartbeat(name, '正在执行引擎中处理队列', 'busy', null, { force: true })
+      .catch((error) => console.error(`无法续报 ${name} 的心跳：${error instanceof Error ? error.message : String(error)}`));
+  }
+}
+
+function startHeartbeatKeepAlive() {
+  heartbeatTimer ??= setInterval(() => { if (activeHandlers.size && !shuttingDown) keepAliveHeartbeats(); }, HEARTBEAT_KEEPALIVE_MS);
+  heartbeatTimer.unref();
 }
 
 const runnerPort = Number(process.env.RUNNER_INTERNAL_PORT ?? 3031);
@@ -157,6 +189,8 @@ previewServer.listen({ host: '127.0.0.1', port: runnerPort }, () => console.log(
 previewServer.once('listening', () => {
   send({ type: 'ready' });
   reportState('running', '统一执行引擎已启动');
+  startHeartbeatKeepAlive();
+  console.log(`[心跳保活] 定时器已启动（每 ${HEARTBEAT_KEEPALIVE_MS / 1_000} 秒）`);
   void requestDispatch('引擎启动');
 });
 
@@ -167,6 +201,8 @@ process.on('message', (message: { type?: string; reason?: string }) => {
 async function shutdown(exitCode = 0) {
   shuttingDown = true;
   if (dispatchTimer) clearTimeout(dispatchTimer);
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
   await webExecutor.close();
   await librarySyncExecutor.close();
   if (exitCode === ENGINE_IDLE_EXIT_CODE) {

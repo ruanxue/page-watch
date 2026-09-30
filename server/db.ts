@@ -5,6 +5,7 @@ import { databaseBootstrapForStartup, databaseBootstrapNeedsMigration, environme
 import { defaultInspectionRules, inspectionRulesJson } from './inspection-rules.js';
 import { notifyLive } from './live-events.js';
 import { decryptSecret, isEncryptedSecret, isPageWatchEncryptedValue, readOptionalLegacyApplicationEncryptionKey } from './secret-storage.js';
+import { resolveHeartbeatWrite, type WorkerHeartbeatContext, type WorkerHeartbeatOptions, type WorkerName, type WorkerTaskContext } from './worker-heartbeat.js';
 import { defaultRuntimeSettings, normalizeRuntimeSettings, type RuntimeSettings } from './runtime-settings.js';
 
 let pool: Pool | null = null;
@@ -241,22 +242,10 @@ export async function queueJob(subscriptionId: number, priority: JobPriority = J
 export type MagnetStatus = 'unsearched' | 'pending' | 'found' | 'not_found' | 'failed' | 'skipped';
 export type DownloadStatus = 'not_queued' | 'queued' | 'running' | 'added' | 'waiting' | 'downloading' | 'paused' | 'completed' | 'removed' | 'filtered' | 'failed';
 
-export type WorkerName = 'api' | 'capture' | 'release' | 'magnet' | 'download' | 'library';
-export type WorkerTaskContext = {
-  kind?: string | null;
-  subscriptionId?: number | null;
-  archiveEntryId?: number | null;
-  content?: string | null;
-  current?: number | null;
-  total?: number | null;
-  label?: string | null;
-};
-
-const heartbeatCache = new Map<WorkerName, { signature: string; persistedAt: number; hadTask: boolean }>();
-const heartbeatPersistIntervalMs = 60_000;
+export type { WorkerName, WorkerTaskContext } from './worker-heartbeat.js';
 
 /** A tiny, DB-backed heartbeat is reliable across the separate Docker services. */
-export async function reportWorkerHeartbeat(workerName: WorkerName, detail: string, status: 'ready' | 'busy' | 'sleeping' | 'error' = 'ready', task: WorkerTaskContext | null = null) {
+export async function reportWorkerHeartbeat(workerName: WorkerName, detail: string, status: 'ready' | 'busy' | 'sleeping' | 'error' = 'ready', task: WorkerTaskContext | null = null, options: WorkerHeartbeatOptions = {}) {
   const normalized = {
     status,
     detail: detail.slice(0, 255),
@@ -268,21 +257,18 @@ export async function reportWorkerHeartbeat(workerName: WorkerName, detail: stri
     total: task?.total ?? null,
     label: task?.label?.slice(0, 128) ?? null
   };
-  const signature = JSON.stringify(normalized);
   const nowMs = Date.now();
-  const previous = heartbeatCache.get(workerName);
-  const changed = previous?.signature !== signature;
-  // Identical heartbeats only renew readiness in MySQL. They deliberately do
-  // not wake SSE clients or force the task centre to download its queues.
-  if (!changed && previous && nowMs - previous.persistedAt < heartbeatPersistIntervalMs) return;
+  const write = resolveHeartbeatWrite(workerName, normalized, nowMs, options);
+  // 节流窗口内内容未变化的心跳只用于续期在线状态，这件事已由下一次真实写入
+  // 或执行引擎的保活心跳覆盖，这里直接跳过写库。
+  if (!write.signature) return;
   await db.run(`INSERT INTO worker_heartbeats (worker_name, status, detail, task_kind, subscription_id, archive_entry_id, task_content, progress_current, progress_total, progress_label, last_seen_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON DUPLICATE KEY UPDATE status = VALUES(status), detail = VALUES(detail), task_kind = VALUES(task_kind), subscription_id = VALUES(subscription_id), archive_entry_id = VALUES(archive_entry_id), task_content = VALUES(task_content), progress_current = VALUES(progress_current), progress_total = VALUES(progress_total), progress_label = VALUES(progress_label), last_seen_at = VALUES(last_seen_at)`,
   [workerName, normalized.status, normalized.detail, normalized.kind, normalized.subscriptionId, normalized.archiveEntryId, normalized.content, normalized.current, normalized.total, normalized.label, new Date(nowMs).toISOString()]);
-  heartbeatCache.set(workerName, { signature, persistedAt: nowMs, hadTask: Boolean(normalized.kind || normalized.archiveEntryId || normalized.subscriptionId) });
-  if (changed) {
+  if (write.changed) {
     notifyLive('services');
-    if (Boolean(normalized.kind || normalized.archiveEntryId || normalized.subscriptionId) || previous?.hadTask) notifyLive('tasks');
+    if (write.hadTask) notifyLive('tasks');
   }
 }
 
