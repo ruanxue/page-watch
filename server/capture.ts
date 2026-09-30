@@ -6,7 +6,7 @@ import { browserPool } from './browser-pool.js';
 import { describeError } from './error-details.js';
 import { expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
 import { archiveKey } from './jellyfin-match.js';
-import { productCodeKeys, productCodeSearchPatterns } from './code-search-parser.js';
+import { findArchiveCodeMatches, replaceArchiveCodes, type ArchiveCodeRow } from './archive-code-index.js';
 import { missavBackupUrl, missavFallbackFailure, shouldTryMissavBackup } from './site-fallback.js';
 import { assertSafeUrl as validateSafeUrl } from './url-safety.js';
 import { readResponseText } from './bounded-body.js';
@@ -119,7 +119,12 @@ async function getStatic(url: URL, selector: string, contentSource: Subscription
       if (!location) throw new Error('网页重定向没有目标地址。');
       return getStatic(await assertSafeUrl(new URL(location, url).toString()), selector, contentSource, attributeName, matchPattern, resultMode, pageCountSelector, pageCountPattern, titleSelector, titleContentSource, titleAttributeName, titleMatchPattern);
     }
-    if (!response.ok) throw new Error(`网页返回 HTTP ${response.status}`);
+    if (!response.ok) {
+      if (response.status === 403 && /^(?:www\.)?missav123\.com$|^missav\.live$/i.test(url.hostname)) {
+        throw new Error('网页返回 HTTP 403：MissAV 拒绝直接 HTML 抓取。请在“编辑订阅”中改用“浏览器渲染”，或配置能访问该站点的代理。');
+      }
+      throw new Error(`网页返回 HTTP ${response.status}`);
+    }
     const html = await readResponseText(response);
     const $ = cheerio.load(html);
     const elements = $(selector).toArray();
@@ -169,30 +174,21 @@ function archiveItems(content: string) {
   return [...new Set(content.split('\n').map((item) => item.trim()).filter(Boolean))];
 }
 
-async function archiveNewItems(subscription: Subscription, items: CapturedItem[], capturedAt: string, client: DatabaseClient, suppressAutoDownload = false, fullScanBatchId: string | null = null) {
+async function archiveNewItems(subscription: Subscription, items: CapturedItem[], capturedAt: string, client: DatabaseClient, suppressAutoDownload = false, fullScanBatchId: string | null = null, existingState?: { archiveWasEmpty: boolean; previousItems: Set<string> }) {
   const rules = getInspectionRules();
   const jellyfin = getJellyfinSettings();
   const currentItems = uniqueItems(items);
-  const archivedCount = await client.get<{ count: number }>('SELECT COUNT(*) AS count FROM archive_entries WHERE subscription_id = ?', [subscription.id]);
-  const previousItems = new Set(archiveItems(subscription.last_content ?? ''));
-  const additions = (archivedCount?.count ?? 0) === 0 ? currentItems : currentItems.filter((item) => !previousItems.has(item.content));
+  const archivedCount = existingState ? undefined : await client.get<{ count: number }>('SELECT COUNT(*) AS count FROM archive_entries WHERE subscription_id = ?', [subscription.id]);
+  const archiveWasEmpty = existingState?.archiveWasEmpty ?? (archivedCount?.count ?? 0) === 0;
+  const previousItems = existingState?.previousItems ?? new Set(archiveItems(subscription.last_content ?? ''));
+  const additions = archiveWasEmpty ? currentItems : currentItems.filter((item) => !previousItems.has(item.content));
   const insertedItems: CapturedItem[] = [];
+  const insertedRows: ArchiveCodeRow[] = [];
   const candidateCodes = [...new Set(additions.map((item) => archiveKey(item.content)).filter((code): code is string => code !== null))];
   const existingCodes = new Set<string>();
-  if (candidateCodes.length) {
-    const archiveCodeClause = `archive_code IN (${candidateCodes.map(() => '?').join(', ')})`;
-    const legacyClauses = candidateCodes.map((code) => {
-      const patterns = productCodeSearchPatterns(code);
-      return `(${[...patterns.map(() => 'LOWER(content) LIKE ?'), ...patterns.map(() => 'LOWER(COALESCE(title, \'\')) LIKE ?')].join(' OR ')})`;
-    });
-    const rows = await client.all<{ archive_code: string | null; content: string; title: string | null }>(`SELECT archive_code, content, title FROM archive_entries
-      WHERE subscription_id = ? AND (${archiveCodeClause} OR (${legacyClauses.join(' OR ')}))`,
-    [subscription.id, ...candidateCodes, ...candidateCodes.flatMap((code) => [...productCodeSearchPatterns(code), ...productCodeSearchPatterns(code)])]);
-    const candidateSet = new Set(candidateCodes);
-    for (const row of rows) {
-      if (row.archive_code && candidateSet.has(row.archive_code.toLowerCase())) existingCodes.add(row.archive_code.toLowerCase());
-      for (const key of [...productCodeKeys(row.content), ...productCodeKeys(row.title ?? '')]) if (candidateSet.has(key)) existingCodes.add(key);
-    }
+  for (let offset = 0; offset < candidateCodes.length; offset += 100) {
+    const matches = await findArchiveCodeMatches(client, candidateCodes.slice(offset, offset + 100), subscription.id, false);
+    for (const match of matches) existingCodes.add(match.code);
   }
   for (const item of additions) {
     const code = archiveKey(item.content);
@@ -205,6 +201,7 @@ async function archiveNewItems(subscription: Subscription, items: CapturedItem[]
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [subscription.id, item.content, item.title, archiveKey(item.content), hash(item.content), capturedAt, detailUrl, releaseUrl ? 'pending' : 'unsearched', rules.magnet.enabled && !shouldCheckLibraryFirst ? 'pending' : 'unsearched', suppressAutoDownload ? 1 : 0, fullScanBatchId, capturedAt]);
     if (result.changes) {
       insertedItems.push(item);
+      insertedRows.push({ id: result.lastInsertRowid, subscription_id: subscription.id, content: item.content, title: item.title });
       if (rules.magnet.enabled) {
         if (shouldCheckLibraryFirst) {
           await client.run(`UPDATE archive_entries SET jellyfin_status = 'pending', jellyfin_error = NULL, updated_at = ? WHERE id = ?`, [capturedAt, result.lastInsertRowid]);
@@ -215,10 +212,25 @@ async function archiveNewItems(subscription: Subscription, items: CapturedItem[]
     }
     if (code) existingCodes.add(code);
   }
-  for (const item of currentItems) {
-    const code = archiveKey(item.content);
-    if (item.title) await client.run(`UPDATE archive_entries SET title = ?, updated_at = ?
-      WHERE subscription_id = ? AND (content_hash = ? OR (? IS NOT NULL AND archive_code = ?)) AND (title IS NULL OR title <> ?)`, [item.title, capturedAt, subscription.id, hash(item.content), code, code, item.title]);
+  if (insertedRows.length) await replaceArchiveCodes(client, insertedRows);
+  const titled = currentItems.filter((item) => item.title);
+  for (let offset = 0; offset < titled.length; offset += 100) {
+    const batch = titled.slice(offset, offset + 100).map((item) => ({ ...item, contentHash: hash(item.content), code: archiveKey(item.content) }));
+    const hashes = batch.map((item) => item.contentHash);
+    const codes = [...new Set(batch.map((item) => item.code).filter((code): code is string => code !== null))];
+    const rows = await client.all<ArchiveCodeRow & { content_hash: string; archive_code: string | null }>(`SELECT id, subscription_id, content, title, content_hash, archive_code FROM archive_entries
+      WHERE subscription_id = ? AND (content_hash IN (${hashes.map(() => '?').join(', ')})${codes.length ? ` OR archive_code IN (${codes.map(() => '?').join(', ')})` : ''})`,
+    [subscription.id, ...hashes, ...codes]);
+    const updates = new Map<number, ArchiveCodeRow>();
+    for (const item of batch) for (const row of rows) {
+      if (row.content_hash !== item.contentHash && (!item.code || row.archive_code !== item.code)) continue;
+      if (row.title !== item.title) updates.set(row.id, { id: row.id, subscription_id: row.subscription_id, content: row.content, title: item.title });
+    }
+    const changed = [...updates.values()];
+    if (!changed.length) continue;
+    await client.run(`UPDATE archive_entries SET title = CASE id ${changed.map(() => 'WHEN ? THEN ?').join(' ')} ELSE title END, updated_at = ?
+      WHERE id IN (${changed.map(() => '?').join(', ')})`, [...changed.flatMap((row) => [row.id, row.title]), capturedAt, ...changed.map((row) => row.id)]);
+    await replaceArchiveCodes(client, changed);
   }
   return insertedItems;
 }
@@ -360,12 +372,14 @@ async function captureInitialFullScan(subscription: Subscription, browserPriorit
     // optimistic subscription update, matching the prior all-or-nothing
     // semantics without retaining every staged row in memory.
     cursor = 0;
+    const archiveCount = await tx.get<{ count: number }>('SELECT COUNT(*) AS count FROM archive_entries WHERE subscription_id = ?', [subscription.id]);
+    const existingState = { archiveWasEmpty: (archiveCount?.count ?? 0) === 0, previousItems: new Set(archiveItems(subscription.last_content ?? '')) };
     while (true) {
       const batch = await tx.all<{ id: number; content: string; title: string | null; detail_url: string | null }>(`SELECT id, content, title, detail_url FROM initial_scan_items
         WHERE subscription_id = ? AND scan_id = ? AND id > ? ORDER BY page_number ASC, item_position ASC, id ASC LIMIT 200`, [subscription.id, scanId, cursor]);
       if (!batch.length) break;
       cursor = batch[batch.length - 1].id;
-      const inserted = await archiveNewItems(subscription, batch.map((item) => ({ content: item.content, title: item.title, detailUrl: item.detail_url })), now, tx, !subscription.last_hash, scanId);
+      const inserted = await archiveNewItems(subscription, batch.map((item) => ({ content: item.content, title: item.title, detailUrl: item.detail_url })), now, tx, !subscription.last_hash, scanId, existingState);
       addedCount += inserted.length;
     }
     if (!subscription.last_hash) {

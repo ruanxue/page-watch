@@ -116,6 +116,15 @@ export async function ensureMySqlSchema(pool: Pool) {
     KEY idx_archive_full_scan_batch (full_scan_batch_id)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
 
+  await pool.query(`CREATE TABLE IF NOT EXISTS archive_entry_codes (
+    archive_entry_id INT NOT NULL,
+    subscription_id INT NOT NULL,
+    code VARCHAR(32) NOT NULL,
+    PRIMARY KEY (archive_entry_id, code),
+    KEY idx_archive_entry_codes_subscription (subscription_id, code, archive_entry_id),
+    KEY idx_archive_entry_codes_code (code, archive_entry_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+
   await pool.query(`CREATE TABLE IF NOT EXISTS full_scan_batches (
     id VARCHAR(64) NOT NULL,
     subscription_id INT NOT NULL,
@@ -488,6 +497,7 @@ export async function ensureMySqlSchema(pool: Pool) {
   await addIndexIfMissing(pool, 'download_jobs', 'idx_download_jobs_priority', 'KEY idx_download_jobs_priority (status, priority, requested_at)');
   await addIndexIfMissing(pool, 'library_sync_jobs', 'idx_library_sync_jobs_priority', 'KEY idx_library_sync_jobs_priority (status, priority, requested_at)');
   await addIndexIfMissing(pool, 'archive_entries', 'idx_archive_entries_code', 'KEY idx_archive_entries_code (archive_code)');
+  await addIndexIfMissing(pool, 'archive_entries', 'idx_archive_release_status_id', 'KEY idx_archive_release_status_id (release_status, id)');
   await addIndexIfMissing(pool, 'archive_entries', 'idx_archive_full_scan_batch', 'KEY idx_archive_full_scan_batch (full_scan_batch_id)');
 }
 

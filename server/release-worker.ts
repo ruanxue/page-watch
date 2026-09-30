@@ -65,16 +65,16 @@ async function logProgress(subscriptionId: number) {
   else if (remaining % 50 === 0) await appendRuntimeLog({ level: 'info', source: 'worker', subscriptionId, message: `发行日期读取进行中，剩余 ${remaining} 项。` });
 }
 
-async function runNextReleaseJob() {
-  if (isExecutionEngineDraining()) return;
+async function runNextReleaseJob(): Promise<boolean> {
+  if (isExecutionEngineDraining()) return false;
   const job = await db.get<ReleaseJob>(`SELECT j.id, j.archive_entry_id, j.attempt_count, j.priority, a.subscription_id, a.content, a.detail_url, s.url AS subscription_url, s.name AS subscription_name, b.status AS full_scan_batch_status
     FROM release_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id
     LEFT JOIN full_scan_batches b ON b.id = a.full_scan_batch_id
     WHERE j.status = 'queued' AND (j.retry_after IS NULL OR j.retry_after <= ?) ORDER BY j.priority DESC, j.requested_at ASC, j.id ASC LIMIT 1`, [new Date().toISOString()]);
-  if (!job) return;
-  if (isExecutionEngineDraining()) return;
+  if (!job) return false;
+  if (isExecutionEngineDraining()) return false;
   const started = await db.run("UPDATE release_jobs SET status = 'running', started_at = ?, retry_after = NULL WHERE id = ? AND status = 'queued'", [new Date().toISOString(), job.id]);
-  if (!started.changes) return;
+  if (!started.changes) return false;
   const startedAtMs = Date.now();
   activeTask = { kind: 'release', subscriptionId: job.subscription_id, archiveEntryId: job.archive_entry_id, content: job.content, label: '正在读取发行日期详情页' };
   await heartbeat();
@@ -89,7 +89,7 @@ async function runNextReleaseJob() {
       });
       scheduleSubscriptionProgressRebuild(job.subscription_id);
       activeTask = null;
-      return;
+      return true;
     }
     const detailUrl = expandReleaseUrl(rule.urlTemplate, { detailUrl: job.detail_url, subscriptionUrl: job.subscription_url, content: job.content });
     if (!detailUrl) throw new Error('发行日期规则无法生成详情页地址；请检查详情页地址模板或内容链接。');
@@ -137,6 +137,7 @@ async function runNextReleaseJob() {
     notifyLive('tasks');
     activeTask = null;
   }
+  return true;
 }
 
 let working = false;
@@ -172,8 +173,12 @@ async function tick() {
     if (isExecutionEngineDraining()) return;
     await refreshSettings();
     await recoverStalledJobs();
-    await queueLegacyReleaseLookups();
-    await runNextReleaseJob();
+    // Drain current work first. A legacy scan is needed only when the queue
+    // runs dry, not once for every individual film.
+    if (!await runNextReleaseJob()) {
+      await queueLegacyReleaseLookups();
+      await runNextReleaseJob();
+    }
   } catch (error) {
     await reportWorkerHeartbeat('release', '发行日期 Worker 遇到基础设施错误', 'error').catch(() => undefined);
     await reportInfrastructureError(error);

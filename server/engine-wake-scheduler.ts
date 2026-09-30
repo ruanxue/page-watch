@@ -1,6 +1,7 @@
 import { db, getJellyfinSettings, getSetting, recoverStaleLibrarySyncJobs, refreshSettings } from './db.js';
 import type { ExecutionEngineController } from './engine-controller.js';
 import { nextJellyfinSyncAt } from './library-sync-schedule.js';
+import { getInspectionRules } from './inspection-rules.js';
 
 const FALLBACK_SCAN_MS = 60_000;
 
@@ -12,6 +13,8 @@ export class EngineWakeScheduler {
   private fallback: NodeJS.Timeout | null = null;
   private stopped = false;
   private lastRecoveryCheckAt = 0;
+  private unsubscribeEngine: (() => void) | null = null;
+  private scheduleVersion = 0;
 
   constructor(private readonly engine: ExecutionEngineController) {}
 
@@ -22,6 +25,9 @@ export class EngineWakeScheduler {
 
   start() {
     this.stopped = false;
+    this.unsubscribeEngine ??= this.engine.onChange((snapshot) => {
+      if (snapshot.state === 'sleeping') void this.schedule();
+    });
     void this.schedule();
     this.fallback = setInterval(() => void this.schedule(), FALLBACK_SCAN_MS);
     this.fallback.unref();
@@ -29,6 +35,9 @@ export class EngineWakeScheduler {
 
   stop() {
     this.stopped = true;
+    this.scheduleVersion += 1;
+    this.unsubscribeEngine?.();
+    this.unsubscribeEngine = null;
     if (this.timer) clearTimeout(this.timer);
     if (this.fallback) clearInterval(this.fallback);
     this.timer = null;
@@ -52,6 +61,11 @@ export class EngineWakeScheduler {
       UNION ALL SELECT MIN(COALESCE(next_scheduled_at, updated_at)) FROM subscriptions WHERE is_active = 1
     ) AS candidates`);
     let next = queue?.wake_at ? Date.parse(queue.wake_at) : Number.POSITIVE_INFINITY;
+    if (getInspectionRules().releaseDate.enabled && next > Date.now()) {
+      const legacy = await db.get<{ id: number }>(`SELECT id FROM archive_entries WHERE release_status = 'unsearched'
+        OR (release_status = 'unavailable' AND release_error = '详情页未找到标签“发行日期”对应的日期值。') LIMIT 1`);
+      if (legacy) next = Date.now();
+    }
     const jellyfin = getJellyfinSettings();
     if (jellyfin.enabled && jellyfin.libraryIds.length) {
       next = Math.min(next, nextJellyfinSyncAt({
@@ -66,8 +80,10 @@ export class EngineWakeScheduler {
 
   private async schedule() {
     if (this.stopped) return;
+    const version = ++this.scheduleVersion;
     try {
       const next = await this.nextWakeAt();
+      if (this.stopped || version !== this.scheduleVersion) return;
       let delay = Number.isFinite(next) ? Math.max(0, next - Date.now()) : FALLBACK_SCAN_MS;
       if (delay <= 250) {
         await this.engine.wake('计划任务或重试已到期');

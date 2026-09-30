@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
+import { FormEvent, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
 import { resetLiveUpdates, subscribeLive, type LiveEvent } from './live-updates.js';
 
 type Subscription = {
@@ -354,13 +354,15 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
   const [loading, setLoading] = useState(true);
   const [editor, setEditor] = useState<Subscription | null | 'new'>(null);
+  const [editorSection, setEditorSection] = useState<'details' | 'reading'>('details');
   const [deleteTarget, setDeleteTarget] = useState<Subscription | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [deleteError, setDeleteError] = useState('');
   const [archiveHomeRequest, setArchiveHomeRequest] = useState(0);
   const [notice, setNotice] = useState('');
   const [view, setView] = useState<View>(viewFromHash);
-  const [rulesOpen, setRulesOpen] = useState(() => window.location.hash === '#rules');
+  const [subscriptionPage, setSubscriptionPage] = useState<'list' | 'rules'>(() => window.location.hash === '#rules' ? 'rules' : 'list');
+  const subscriptionListScroll = useRef(0);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [taskSummary, setTaskSummary] = useState<TasksResponse['summary'] | null>(null);
   const [integrationOnboarding, setIntegrationOnboarding] = useState<IntegrationOnboarding | null>(null);
@@ -416,16 +418,12 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
   useEffect(() => {
     const syncView = () => {
       setView(viewFromHash());
-      setRulesOpen(window.location.hash === '#rules');
+      if (window.location.hash === '#rules') setSubscriptionPage('rules');
+      else if (window.location.hash === '#subscriptions') setSubscriptionPage('list');
     };
     window.addEventListener('hashchange', syncView);
     return () => window.removeEventListener('hashchange', syncView);
   }, []);
-  useEffect(() => {
-    if (!rulesOpen || window.location.hash !== '#rules') return;
-    const frame = window.requestAnimationFrame(() => document.getElementById('rules-library')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
-    return () => window.cancelAnimationFrame(frame);
-  }, [rulesOpen]);
   useEffect(() => {
     if (!notice) return;
     const timer = window.setTimeout(() => setNotice(''), 4200);
@@ -448,9 +446,16 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const serviceAttention = attentionServices.map((service) => `${service.label}：${service.status === 'missing' ? '尚未启动' : service.detail}`).join('；');
   const taskCount = taskSummary?.running ?? busyServiceCount;
 
-  function openRules() {
-    setRulesOpen(true);
-    window.requestAnimationFrame(() => document.getElementById('rules-library')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+  function showSubscriptionPage(page: 'list' | 'rules') {
+    if (subscriptionPage === 'list' && page === 'rules') subscriptionListScroll.current = window.scrollY;
+    setSubscriptionPage(page);
+    window.location.hash = page === 'rules' ? '#rules' : '#subscriptions';
+    window.requestAnimationFrame(() => window.scrollTo({ top: page === 'rules' ? 0 : subscriptionListScroll.current }));
+  }
+
+  function openEditor(item: Subscription | 'new', section: 'details' | 'reading' = 'details') {
+    setEditorSection(section);
+    setEditor(item);
   }
 
   async function runNow(item: Subscription) {
@@ -495,6 +500,8 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
     try {
       await request(`/api/subscriptions/${deleteTarget.id}`, { method: 'DELETE' });
       setDeleteTarget(null);
+      // 删除入口现在位于编辑订阅窗口内，确认删除后要一并关闭它。
+      setEditor(null);
       setNotice('订阅已删除。');
       await load();
     } catch (error) { setDeleteError(error instanceof Error ? error.message : '删除失败，请稍后重试。'); }
@@ -511,7 +518,7 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
     <aside className="sidebar">
       <div className="brand"><span className="brand-mark">⌁</span><span>PAGE WATCH</span></div>
       <nav aria-label="主导航">
-        <a className={`nav-item ${view === 'subscriptions' ? 'active' : ''}`} href="#subscriptions"><span>◉</span> 订阅中心 <b>{stats.total}</b></a>
+        <a className={`nav-item ${view === 'subscriptions' ? 'active' : ''}`} href="#subscriptions" onClick={() => setSubscriptionPage('list')}><span>◉</span> 订阅中心 <b>{stats.total}</b></a>
         <a className={`nav-item ${view === 'search' ? 'active' : ''}`} href="#search"><span>⌕</span> 番号检索</a>
         <a className={`nav-item ${view === 'archive' ? 'active' : ''}`} href="#archive" onClick={navigateToArchive}><span>◌</span> 内容档案</a>
         <a className={`nav-item ${view === 'operations' ? 'active' : ''}`} href="#operations"><span>◫</span> 运行中心 {taskCount ? <b>{taskCount}</b> : null}</a>
@@ -527,10 +534,10 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
     <section className="workspace">
       <header className="topbar">
         <div><p className="eyebrow">自托管网页监测</p><h1>{view === 'search' ? '番号检索' : view === 'archive' ? '内容档案' : view === 'settings' ? '设置' : view === 'operations' ? '运行中心' : '订阅中心'}</h1></div>
-        {view === 'subscriptions' && <div className="topbar-actions"><button type="button" className="secondary" onClick={() => openRules()}>检查规则</button><button className="primary" onClick={() => setEditor('new')}><span>＋</span> 新建订阅</button></div>}
+        {view === 'subscriptions' && <div className="topbar-actions"><button className="primary" onClick={() => openEditor('new')}><span>＋</span> 新建订阅</button></div>}
       </header>
 
-      {view === 'subscriptions' ? <><section className="summary" aria-label="订阅概览">
+      {view === 'subscriptions' ? <><nav className="subscription-page-tabs" aria-label="订阅中心页面"><button type="button" className={subscriptionPage === 'list' ? 'active' : ''} aria-current={subscriptionPage === 'list' ? 'page' : undefined} onClick={() => showSubscriptionPage('list')}>订阅列表</button><button type="button" className={subscriptionPage === 'rules' ? 'active' : ''} aria-current={subscriptionPage === 'rules' ? 'page' : undefined} onClick={() => showSubscriptionPage('rules')}>检查规则</button></nav>{subscriptionPage === 'list' ? <><section className="summary" aria-label="订阅概览">
         <div><span>全部订阅</span><strong>{stats.total}</strong></div>
         <div><span>正在监测</span><strong>{stats.active}</strong></div>
         <div><span>已入库 / 收录内容</span><strong>{stats.libraryAvailable} / {stats.archived}</strong></div>
@@ -538,16 +545,16 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
 
       <section id="subscriptions" className="list-section">
         <div className="section-head"><div><h2>你的网页订阅</h2><p>用 CSS Selector 精确读取所需内容</p></div><div className="subscription-list-actions"><div className="subscription-view-switch" role="group" aria-label="订阅显示方式"><button type="button" aria-pressed={subscriptionLayout === 'list'} className={subscriptionLayout === 'list' ? 'active' : ''} onClick={() => setSubscriptionLayout('list')}>列表</button><button type="button" aria-pressed={subscriptionLayout === 'compact'} className={subscriptionLayout === 'compact' ? 'active' : ''} onClick={() => setSubscriptionLayout('compact')}>紧凑</button></div><button className="quiet" onClick={() => void load()}>↻ 刷新</button></div></div>
-        {loading ? <div className="empty">正在读取订阅…</div> : subscriptions.length === 0 ? <Empty onCreate={() => setEditor('new')} /> :
+        {loading ? <div className="empty">正在读取订阅…</div> : subscriptions.length === 0 ? <Empty onCreate={() => openEditor('new')} /> :
           <div className={`subscription-grid ${subscriptionLayout}`}>
-            {subscriptions.map((item) => <SubscriptionCard key={item.id} item={item} onRun={runNow} onEdit={setEditor} onToggle={toggleSubscription} onDelete={askDelete} />)}
+            {subscriptions.map((item) => <SubscriptionCard key={item.id} item={item} onRun={runNow} onEdit={(target) => openEditor(target)} onToggle={toggleSubscription} />)}
           </div>}
       </section>
-      <RulesLibrary open={rulesOpen} onToggle={() => setRulesOpen((current) => !current)} onNotice={setNotice} />
+      </> : <RulesLibrary onNotice={setNotice} />}
       </> : view === 'search' ? <CodeSearchPage onNotice={setNotice} onSubscriptionsChanged={load} /> : view === 'archive' ? <ArchivePage subscriptions={subscriptions} onNotice={setNotice} homeRequest={archiveHomeRequest} /> : view === 'settings' ? <SettingsPage onNotice={setNotice} /> : <OperationsCenterPage onSummary={setTaskSummary} />}
       {notice && <div className="toast" role="status">{notice}</div>}
     </section>
-    {editor && <Editor item={editor === 'new' ? null : editor} onClose={() => setEditor(null)} onSaved={async () => { setEditor(null); await load(); setNotice('订阅已保存。'); }} onFullScan={async () => { await load(); setNotice('已加入全量检查队列。'); }} onArchiveCleared={async () => { setEditor(null); await load(); setNotice('订阅数据已重置。'); }} />}
+    {editor && <Editor item={editor === 'new' ? null : editor} initialSection={editorSection} onClose={() => setEditor(null)} onSaved={async () => { setEditor(null); await load(); setNotice('订阅已保存。'); }} onFullScan={async () => { await load(); setNotice('已加入全量检查队列。'); }} onArchiveCleared={async () => { setEditor(null); await load(); setNotice('订阅数据已重置。'); }} onRequestDelete={askDelete} />}
     {deleteTarget && <SubscriptionDeleteDialog item={deleteTarget} busy={deleteBusy} error={deleteError} onCancel={() => { if (!deleteBusy) { setDeleteTarget(null); setDeleteError(''); } }} onConfirm={() => void confirmDelete()} />}
     {integrationOnboarding?.pending && <IntegrationOnboardingGuide
       status={integrationOnboarding}
@@ -699,14 +706,14 @@ function Empty({ onCreate }: { onCreate: () => void }) {
   return <div className="empty-card"><div className="empty-orbit">⌁</div><h3>还没有订阅</h3><p>添加一个网页地址，填入目标元素的 CSS Selector，<br />系统就会为你定时记录内容变化。</p><button className="primary" onClick={onCreate}>新建第一个订阅</button><small>示例：<code>#price</code>、<code>.article-body</code>、<code>[data-status]</code></small></div>;
 }
 
-function SubscriptionCard({ item, onRun, onEdit, onToggle, onDelete }: { item: Subscription; onRun: (item: Subscription) => void; onEdit: (item: Subscription) => void; onToggle: (item: Subscription) => void; onDelete: (item: Subscription) => void }) {
+function SubscriptionCard({ item, onRun, onEdit, onToggle }: { item: Subscription; onRun: (item: Subscription) => void; onEdit: (item: Subscription) => void; onToggle: (item: Subscription) => void }) {
   return <article className={`subscription-card ${item.last_error ? 'has-error' : ''}`}>
-    <div className="card-top"><div className="site-ident">{shortUrl(item.url).slice(0, 1).toUpperCase()}</div><div className="card-title"><h3>{item.name}</h3><a href={item.url} target="_blank" rel="noreferrer">{shortUrl(item.url)} ↗</a></div><button className="icon-button" title="编辑订阅" onClick={() => onEdit(item)}>⋯</button></div>
+    <div className="card-top"><div className="site-ident">{shortUrl(item.url).slice(0, 1).toUpperCase()}</div><div className="card-title"><h3>{item.name}</h3><a href={item.url} target="_blank" rel="noreferrer">{shortUrl(item.url)} ↗</a></div><button className="icon-button" title="编辑订阅" aria-label={`编辑“${item.name}”`} onClick={() => onEdit(item)}>⋯</button></div>
     {item.last_error && <div className="error-line">上次失败：{item.last_error}</div>}
     <footer className="card-footer">
       <div className="card-time-info">{item.is_active && <span className="card-schedule">{scheduleLabel(item)}</span>}<span className="card-last-checked">上次：{formatTime(item.last_checked_at)}</span></div>
       {Boolean(item.full_scan_active) && <span className="scan-progress"><b>{item.initial_scan_total ? `全量 ${item.initial_scan_pages_completed}/${item.initial_scan_total}` : '全量准备中'}</b><i><em style={{ width: item.initial_scan_total ? `${Math.min(100, item.initial_scan_pages_completed / item.initial_scan_total * 100)}%` : '18%' }} /></i></span>}
-      <div className="card-footer-actions"><div className="card-actions"><button disabled={!item.selector} title={!item.selector ? '请先配置读取规则' : undefined} onClick={() => onRun(item)}>立即检查</button><button className="danger" onClick={() => onDelete(item)}>删除</button></div><button type="button" className={`subscription-switch ${item.is_active ? 'on' : ''}`} role="switch" aria-checked={Boolean(item.is_active)} disabled={!item.selector} title={!item.selector ? '请先配置读取规则' : item.is_active ? '暂停订阅' : '启用订阅'} onClick={() => onToggle(item)}><span aria-hidden="true" /><em>{item.is_active ? '已启用' : '已暂停'}</em></button></div>
+      <div className="card-footer-actions"><div className="card-actions"><button disabled={!item.selector} title={!item.selector ? '请先配置读取规则' : undefined} onClick={() => onRun(item)}>立即检查</button></div><button type="button" className={`subscription-switch ${item.is_active ? 'on' : ''}`} role="switch" aria-checked={Boolean(item.is_active)} disabled={!item.selector} title={!item.selector ? '请先配置读取规则' : item.is_active ? '暂停订阅' : '启用订阅'} onClick={() => onToggle(item)}><span aria-hidden="true" /><em>{item.is_active ? '已启用' : '已暂停'}</em></button></div>
     </footer>
   </article>;
 }
@@ -744,12 +751,14 @@ function DownloadCell({ entry, downloadingId, onSubmit }: { entry: ArchiveEntry;
   // prevent a new manual submission. Keep its orange cue unless Jellyfin has
   // confirmed the title is still available, where the normal action applies.
   const wasRemoved = entry.download_status === 'removed';
-  if (entry.download_status === 'not_queued' || entry.download_status === 'failed' || entry.download_status === 'filtered' || wasRemoved) {
+  if (entry.download_status === 'not_queued' || entry.download_status === 'failed' || entry.download_status === 'filtered' || entry.download_status === 'completed' || wasRemoved) {
     const wasFiltered = entry.download_status === 'filtered';
     const title = entry.download_status === 'failed'
       ? (entry.download_error || '提交失败，点击重试')
       : wasFiltered
         ? (entry.download_error || '种子内文件均未达到最小单文件大小；点击可按当前设置重新筛选')
+        : entry.download_status === 'completed'
+          ? '已完成；点击可按需重新提交磁链，qBittorrent 会对现有种子去重'
         : wasRemoved
           ? (entry.jellyfin_status === 'available' ? '影视库已入库；仍可按需重新提交下载' : '上一次下载记录已删除，点击重新提交')
           : '提交给 qBittorrent';
@@ -763,8 +772,7 @@ function DownloadCell({ entry, downloadingId, onSubmit }: { entry: ArchiveEntry;
     return <button className={`download-action ${style}`} type="button" disabled={downloadingId === entry.id} title={title} onClick={() => void onSubmit(entry)}>{entry.download_status === 'failed' ? '重试' : wasFiltered ? '重新筛选' : '下载'}</button>;
   }
   if (entry.download_status === 'queued' || entry.download_status === 'running') return <span className="download-state pending">提交中</span>;
-  const status = entry.download_status === 'completed' ? '完成'
-    : entry.download_status === 'downloading' ? `${Math.round(Math.min(1, asNumber(entry.download_progress)) * 100)}%`
+  const status = entry.download_status === 'downloading' ? `${Math.round(Math.min(1, asNumber(entry.download_progress)) * 100)}%`
       : entry.download_status === 'waiting' ? '等待'
           : entry.download_status === 'paused' ? '暂停'
           : entry.download_status === 'removed' ? '已删除'
@@ -1460,98 +1468,41 @@ function RuleFlow({ children }: { children: ReactNode }) {
 
 type MissavPresetDraft = { presetId: number | null; preset: PresetForm };
 
-function RulesLibrary({ open, onToggle, onNotice }: { open: boolean; onToggle: () => void; onNotice: (message: string) => void }) {
+function RulesLibrary({ onNotice }: { onNotice: (message: string) => void }) {
   const presetDraftRef = useRef<MissavPresetDraft | null>(null);
   const inspectionDraftRef = useRef<InspectionRules | null>(null);
   const [saving, setSaving] = useState(false);
+  const [savedPreset, setSavedPreset] = useState<SubscriptionPreset | null>(null);
   const saveAll = async () => {
     if (!presetDraftRef.current || !inspectionDraftRef.current) { onNotice('规则仍在读取，请稍后再保存。'); return; }
     setSaving(true);
     try {
-      await request('/api/rules/missav', { method: 'PUT', body: JSON.stringify({ ...presetDraftRef.current, inspectionRules: inspectionDraftRef.current }) });
+      const saved = await request<{ preset: SubscriptionPreset; inspectionRules: InspectionRules }>('/api/rules/missav', { method: 'PUT', body: JSON.stringify({ ...presetDraftRef.current, inspectionRules: inspectionDraftRef.current }) });
+      setSavedPreset(saved.preset);
       onNotice('MissAV 检查规则已保存。');
     } catch (reason) { onNotice(reason instanceof Error ? reason.message : 'MissAV 检查规则无法保存。'); }
     finally { setSaving(false); }
   };
-  return <section id="rules-library" className={`rules-library ${open ? 'is-open' : ''}`}>
-    <div className="section-head rules-library-head"><div><p className="eyebrow">MissAV</p><h2>MissAV 检查规则</h2><p>一条检查流程依次读取列表页内容、补全发行日期，再检索磁力链接。</p></div><button type="button" className="secondary" aria-expanded={open} onClick={onToggle}>{open ? '收起检查规则' : '检查规则'}</button></div>
-    {open && <div className="rules-library-content"><div className="rules-library-workbench"><RuleFlow><code>MissAV 列表页</code><i>→</i><strong>番号与标题</strong><i>→</i><code>详情页</code><i>→</i><strong>发行日期</strong><i>→</i><code>磁力搜索</code><i>→</i><strong>磁力链接</strong></RuleFlow><SubscriptionPresetLibrary registerDraft={(draft) => { presetDraftRef.current = draft; }}><InspectionRulesPage embedded onNotice={onNotice} registerDraft={(draft) => { inspectionDraftRef.current = draft; }} /></SubscriptionPresetLibrary><div className="rule-save-actions"><button type="button" className="primary" disabled={saving} onClick={() => void saveAll()}>{saving ? '保存中…' : '保存规则'}</button></div></div></div>}
+  return <section id="rules-library" className="rules-library is-open">
+    <div className="section-head rules-library-head"><div><p className="eyebrow">MissAV · 共用规则</p><h2>检查规则</h2><p>列表预设用于新建订阅；发行日期和磁链规则用于归档补全。</p></div></div>
+    <div className="rules-library-content"><div className="rules-library-workbench"><RuleFlow><code>列表页</code><i>→</i><strong>番号与标题</strong><i>→</i><code>内容档案</code><i>→</i><strong>发行日期与磁链任务</strong><i>→</i><code>详情页／搜索页</code><i>→</i><strong>补全归档</strong></RuleFlow><SubscriptionPresetLibrary savedPreset={savedPreset} registerDraft={(draft) => { presetDraftRef.current = draft; }}><InspectionRulesPage embedded onNotice={onNotice} registerDraft={(draft) => { inspectionDraftRef.current = draft; }} /></SubscriptionPresetLibrary><div className="rule-save-actions"><button type="button" className="primary" disabled={saving} onClick={() => void saveAll()}>{saving ? '保存中…' : '保存规则'}</button></div></div></div>
   </section>;
 }
 
-function SubscriptionReadingRules({ subscriptions, targetSubscriptionId, onSubscriptionsChanged, onNotice }: { subscriptions: Subscription[]; targetSubscriptionId: number | null; onSubscriptionsChanged: () => Promise<void>; onNotice: (message: string) => void }) {
-  const [selectedId, setSelectedId] = useState<number | null>(null);
-  const [form, setForm] = useState<FormData>(blankForm);
-  const [presets, setPresets] = useState<SubscriptionPreset[]>([]);
-  const [preview, setPreview] = useState<{ title: string; content: string; items?: Array<{ content: string; title: string | null }> } | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const selected = subscriptions.find((item) => item.id === selectedId) ?? null;
+function SubscriptionReadingFields({ form, setForm, busy }: { form: FormData; setForm: Dispatch<SetStateAction<FormData>>; busy: boolean }) {
   const update = <K extends keyof FormData>(key: K, value: FormData[K]) => setForm((old) => ({ ...old, [key]: value }));
-
-  useEffect(() => {
-    setSelectedId((current) => {
-      const candidate = targetSubscriptionId ?? current;
-      return subscriptions.some((item) => item.id === candidate) ? candidate : subscriptions[0]?.id ?? null;
-    });
-  }, [subscriptions, targetSubscriptionId]);
-  useEffect(() => {
-    if (!selected) return;
-    setForm(subscriptionToForm(selected)); setPreview(null); setError('');
-  }, [selectedId]);
-  useEffect(() => { void request<SubscriptionPreset[]>('/api/subscription-presets').then(setPresets).catch(() => setPresets([])); }, []);
-
-  function applyPreset(id: string) {
-    const preset = presets.find((item) => String(item.id) === id);
-    if (!preset) return;
-    setForm((old) => ({ ...old, selector: preset.selector, renderMode: preset.render_mode, contentSource: preset.content_source, attributeName: preset.attribute_name ?? '', matchPattern: preset.match_pattern ?? '', titleSelector: preset.title_selector ?? '', titleContentSource: preset.title_content_source ?? 'text', titleAttributeName: preset.title_attribute_name ?? '', titleMatchPattern: preset.title_match_pattern ?? '', resultMode: preset.result_mode, paginationSelector: preset.pagination_selector ?? '', paginationParameter: preset.pagination_parameter ?? 'page', paginationMatchPattern: preset.pagination_match_pattern ?? '' }));
-  }
-  async function saveRules() {
-    if (!selected) return;
-    setBusy(true); setError('');
-    try {
-      const saved = await request<Subscription>(`/api/subscriptions/${selected.id}`, { method: 'PUT', body: JSON.stringify(form) });
-      setForm(subscriptionToForm(saved)); await onSubscriptionsChanged(); onNotice(`“${saved.name}”的读取规则已保存。`);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存读取规则。'); }
-    finally { setBusy(false); }
-  }
-  async function previewCapture() {
-    if (!selected) return;
-    setBusy(true); setError(''); setPreview(null);
-    try { setPreview(await request('/api/subscriptions/preview', { method: 'POST', body: JSON.stringify(form) })); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : '预览失败。'); }
-    finally { setBusy(false); }
-  }
-  async function fullScan() {
-    if (!selected) return;
-    setBusy(true); setError('');
-    try { await request(`/api/subscriptions/${selected.id}/full-scan`, { method: 'POST' }); await onSubscriptionsChanged(); onNotice('已加入全量检查队列。'); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : '无法开始全量检查。'); }
-    finally { setBusy(false); }
-  }
-  async function clearArchive() {
-    if (!selected || !window.confirm(`重置“${selected.name}”的检查数据？内容档案和当前对比基准都会删除，此操作不可恢复。`)) return;
-    setBusy(true); setError('');
-    try { await request(`/api/subscriptions/${selected.id}/archive`, { method: 'DELETE' }); await onSubscriptionsChanged(); onNotice('订阅数据已重置。'); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : '无法重置订阅数据。'); }
-    finally { setBusy(false); }
-  }
-
-  return <section className="subscription-reading-rules">
-    <header className="subscription-rule-head"><div><span className="rule-kind">订阅级</span><h3>订阅页面读取规则</h3><p>内容、标题、分页及读取方式都在此配置；订阅编辑页只保留名称、地址和检查计划。</p></div><div className="subscription-rule-selects"><label>目标订阅<select value={selectedId ?? ''} disabled={!subscriptions.length || busy} onChange={(event) => setSelectedId(Number(event.target.value))}>{subscriptions.map((item) => <option key={item.id} value={item.id}>{item.name} · {shortUrl(item.url)}</option>)}</select></label><label>套用预设<select defaultValue="" disabled={!selected || busy} onChange={(event) => { applyPreset(event.target.value); event.currentTarget.value = ''; }}><option value="">选择预设规则</option>{presets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select></label></div></header>
-    {!selected ? <div className="empty rule-library-empty">请先新建一个订阅，再在这里设置它的页面读取规则。</div> : <>
+  return <section className="subscription-reading-fields">
+    <div className="subscription-reading-intro"><span className="rule-kind">订阅级 · 列表页</span><h3>页面读取规则</h3><p>按页面顺序读取内容、标题和分页；这里的修改只作用于当前订阅。</p></div>
       <RuleFlow><code>列表页</code><i>→</i><code>{form.selector || '内容 Selector'}</code><i>→</i><code>{form.matchPattern || '内容匹配'}</code><i>→</i><code>{form.titleSelector || '标题（可选）'}</code><i>→</i><code>{form.paginationSelector || '分页（可选）'}</code><i>→</i><strong>内容档案</strong></RuleFlow>
-      <div className="rule-grid"><label>内容 CSS Selector<input disabled={busy} value={form.selector} onChange={(event) => update('selector', event.target.value)} placeholder="例如 a.text-secondary[alt]" /></label><label>读取方式<select disabled={busy} value={form.renderMode} onChange={(event) => update('renderMode', event.target.value as FormData['renderMode'])}><option value="static">HTML 抓取（优先）</option><option value="dynamic">浏览器渲染</option></select></label><label>提取内容<select disabled={busy} value={form.contentSource} onChange={(event) => update('contentSource', event.target.value as FormData['contentSource'])}><option value="text">标签中的文字</option><option value="attribute">指定属性的值</option></select></label>{form.contentSource === 'attribute' ? <label>属性名<input disabled={busy} value={form.attributeName} onChange={(event) => update('attributeName', event.target.value)} placeholder="例如 alt、href、data-id" /></label> : <div className="rule-hint">将直接读取所选标签的可见文字。</div>}<label>匹配范围<select disabled={busy} value={form.resultMode} onChange={(event) => update('resultMode', event.target.value as FormData['resultMode'])}><option value="first">仅第一项</option><option value="all">全部匹配项</option></select></label><label>内容匹配规则<input disabled={busy} value={form.matchPattern} onChange={(event) => update('matchPattern', event.target.value)} placeholder="可选；优先保存第一个括号" /></label></div>
+      <div className="rule-grid"><label>内容 CSS Selector<input disabled={busy} value={form.selector} onChange={(event) => update('selector', event.target.value)} placeholder="例如 a.text-secondary[alt]" /></label><label>读取方式<select disabled={busy} value={form.renderMode} onChange={(event) => update('renderMode', event.target.value as FormData['renderMode'])}><option value="static">HTML 抓取</option><option value="dynamic">浏览器渲染</option></select></label><label>提取内容<select disabled={busy} value={form.contentSource} onChange={(event) => update('contentSource', event.target.value as FormData['contentSource'])}><option value="text">标签中的文字</option><option value="attribute">指定属性的值</option></select></label>{form.contentSource === 'attribute' ? <label>属性名<input disabled={busy} value={form.attributeName} onChange={(event) => update('attributeName', event.target.value)} placeholder="例如 alt、href、data-id" /></label> : <div className="rule-hint">将直接读取所选标签的可见文字。</div>}<label>匹配范围<select disabled={busy} value={form.resultMode} onChange={(event) => update('resultMode', event.target.value as FormData['resultMode'])}><option value="first">仅第一项</option><option value="all">全部匹配项</option></select></label><label>内容匹配规则<input disabled={busy} value={form.matchPattern} onChange={(event) => update('matchPattern', event.target.value)} placeholder="可选；优先保存第一个括号" /></label></div>
       <section className="subscription-rule-section"><header><div><h4>标题读取</h4><p>与内容按页面内的条目顺序配对保存。</p></div><label className="toggle"><input type="checkbox" checked={Boolean(form.titleSelector)} disabled={busy} onChange={(event) => setForm((old) => event.target.checked ? { ...old, titleSelector: old.selector, titleContentSource: 'text', titleAttributeName: '', titleMatchPattern: old.titleMatchPattern } : { ...old, titleSelector: '', titleAttributeName: '', titleMatchPattern: '' })} /><span />读取并保存标题</label></header>{form.titleSelector && <div className="rule-grid"><label>标题 CSS Selector<input disabled={busy} value={form.titleSelector} onChange={(event) => update('titleSelector', event.target.value)} /></label><label>标题来源<select disabled={busy} value={form.titleContentSource} onChange={(event) => update('titleContentSource', event.target.value as FormData['titleContentSource'])}><option value="text">标签中的文字</option><option value="attribute">指定属性的值</option></select></label>{form.titleContentSource === 'attribute' ? <label>标题属性名<input disabled={busy} value={form.titleAttributeName} onChange={(event) => update('titleAttributeName', event.target.value)} placeholder="例如 alt" /></label> : <div className="rule-hint">将直接读取标题标签的可见文字。</div>}<label className="rule-wide">标题匹配规则<input disabled={busy} value={form.titleMatchPattern} onChange={(event) => update('titleMatchPattern', event.target.value)} placeholder="可选；优先保存第一个括号" /></label></div>}</section>
       <section className="subscription-rule-section"><header><div><h4>分页读取</h4><p>仅首次检查或点击全量检查时，依页码逐页读取。</p></div><label className="toggle"><input type="checkbox" checked={Boolean(form.paginationSelector)} disabled={busy} onChange={(event) => setForm((old) => event.target.checked ? { ...old, paginationSelector: old.paginationSelector || '#page-count', paginationParameter: old.paginationParameter || 'page', paginationMatchPattern: old.paginationMatchPattern || '(\\d+)' } : { ...old, paginationSelector: '', paginationMatchPattern: '' })} /><span />启用分页读取</label></header>{form.paginationSelector && <div className="rule-grid"><label>页数 CSS Selector<input disabled={busy} value={form.paginationSelector} onChange={(event) => update('paginationSelector', event.target.value)} placeholder="例如 .pagination-total" /></label><label>页码参数名<input disabled={busy} value={form.paginationParameter} onChange={(event) => update('paginationParameter', event.target.value)} placeholder="例如 page" /></label><label className="rule-wide">页数匹配规则<input disabled={busy} value={form.paginationMatchPattern} onChange={(event) => update('paginationMatchPattern', event.target.value)} placeholder="例如 (\\d+)" /><span className="field-note">系统使用正则第一个括号作为总页数，并在网址中追加页码参数。</span></label></div>}</section>
-      {error && <p className="form-error">{error}</p>}{preview && <div className="preview rule-preview"><span>已提取 · {preview.title}</span>{preview.items?.length ? <div className="title-preview">{preview.items.slice(0, 8).map((entry, index) => <div key={`${entry.content}-${index}`}><code>{entry.content}</code><p>{entry.title || '未读取标题'}</p></div>)}</div> : <p>{preview.content}</p>}</div>}
-      <footer className="subscription-rule-actions"><div><button type="button" className="secondary" disabled={busy} onClick={() => void previewCapture()}>{busy ? '处理中…' : '预览抽取'}</button>{selected.pagination_selector && <button type="button" className="secondary" disabled={busy} onClick={() => void fullScan()}>{busy ? '处理中…' : '全量检查'}</button>}<button type="button" className="secondary danger-button" disabled={busy} onClick={() => void clearArchive()}>重置订阅数据</button></div><button type="button" className="primary" disabled={busy} onClick={() => void saveRules()}>{busy ? '保存中…' : '保存读取规则'}</button></footer>
-    </>}
   </section>;
 }
 
-function SubscriptionPresetLibrary({ children, registerDraft }: { children: ReactNode; registerDraft: (draft: MissavPresetDraft) => void }) {
+function SubscriptionPresetLibrary({ children, registerDraft, savedPreset }: { children: ReactNode; registerDraft: (draft: MissavPresetDraft) => void; savedPreset: SubscriptionPreset | null }) {
   const [presets, setPresets] = useState<SubscriptionPreset[]>([]);
+  const [selectedPresetId, setSelectedPresetId] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const loadPresets = async () => {
@@ -1560,10 +1511,13 @@ function SubscriptionPresetLibrary({ children, registerDraft }: { children: Reac
     finally { setLoading(false); }
   };
   useEffect(() => { void loadPresets(); }, []);
+  useEffect(() => {
+    if (savedPreset) setPresets((current) => [savedPreset, ...current.filter((preset) => preset.id !== savedPreset.id)]);
+  }, [savedPreset]);
   return <section className="subscription-preset-library">
-    <div className="preset-library-head"><div><span className="rule-kind">流程第 1 步</span><h3>列表读取</h3><p>读取番号、标题和分页；新建 MissAV 订阅时选择一条列表规则即可填入。</p></div></div>
-    {loading ? <p className="preset-library-loading">正在读取检查规则…</p> : error ? <p className="form-error">{error}</p> : <div className="preset-library-list">{presets.length ? presets.map((preset) => <span key={preset.id} title={preset.description || preset.selector}>{preset.name}</span>) : <span className="preset-library-empty">还没有检查规则</span>}</div>}
-    <div className="rules-editor-content"><PresetManager embedded presets={presets} onClose={() => undefined} onChanged={loadPresets} registerDraft={registerDraft} />{children}</div>
+    <div className="preset-library-head"><div><span className="rule-kind">流程第 1 步</span><h3>列表读取</h3><p>读取番号、标题和分页；此处的预设仅用于新建订阅，现有订阅可在“编辑订阅”中修改读取方式。</p></div></div>
+    {loading ? <p className="preset-library-loading">正在读取检查规则…</p> : error ? <p className="form-error">{error}</p> : <div className="preset-library-list">{presets.length ? presets.map((preset) => <button type="button" key={preset.id} className={(selectedPresetId ?? presets[0]?.id) === preset.id ? 'active' : ''} title={preset.description || preset.selector} onClick={() => setSelectedPresetId(preset.id)}>{preset.name}</button>) : <span className="preset-library-empty">还没有检查规则</span>}</div>}
+    <div className="rules-editor-content">{!loading && !error && <PresetManager embedded presets={presets} requestedPresetId={selectedPresetId} savedPreset={savedPreset} onClose={() => undefined} onChanged={loadPresets} registerDraft={registerDraft} />}{children}</div>
   </section>;
 }
 
@@ -1590,7 +1544,7 @@ function InspectionRulesPage({ onNotice, embedded = false, registerDraft }: { on
   };
   useEffect(() => { if (registerDraft) registerDraft(form); }, [form, registerDraft]);
   return <section id={embedded ? undefined : 'rules'} className={`inspection-rules-page ${embedded ? 'embedded' : ''}`}>
-    {embedded ? <div className="embedded-rule-toolbar"><div><span className="rule-kind">流程第 2、3 步</span><h3>归档补全</h3><p>同一条 MissAV 检查流程中，先从详情页补全发行日期，再按番号检索磁力链接。</p></div><div className="inspection-rule-actions"><button type="button" className="secondary" disabled={loading || busy} onClick={() => void save(freshDefaultInspectionRules(), '已恢复并保存 MissAV 默认规则。')}>恢复默认值</button><button type="button" className="primary" disabled={loading || busy} onClick={() => void save()}>{busy ? '保存中…' : '保存补全规则'}</button></div></div> : <div className="section-head"><div><h2>MissAV 检查规则</h2><p>网页内容、发行日期与磁力检索均按这里显示的条件执行。</p></div><div className="inspection-rule-actions"><button type="button" className="secondary" disabled={loading || busy} onClick={() => void save(freshDefaultInspectionRules(), '已恢复并保存 MissAV 默认规则。')}>恢复默认值</button><button type="button" className="primary" disabled={loading || busy} onClick={() => void save()}>{busy ? '保存中…' : '保存规则'}</button></div></div>}
+    {embedded ? <div className="embedded-rule-toolbar"><div><span className="rule-kind">入档后 · 两项独立任务</span><h3>归档补全</h3><p>番号与标题入档后，发行日期和磁力链接分别由后台任务查询；两项都可在下方完整配置。</p></div><div className="inspection-rule-actions"><button type="button" className="secondary" disabled={loading || busy} onClick={() => void save(freshDefaultInspectionRules(), '已恢复并保存 MissAV 默认规则。')}>恢复默认值</button><button type="button" className="primary" disabled={loading || busy} onClick={() => void save()}>{busy ? '保存中…' : '保存补全规则'}</button></div></div> : <div className="section-head"><div><h2>MissAV 检查规则</h2><p>网页内容、发行日期与磁力检索均按这里显示的条件执行。</p></div><div className="inspection-rule-actions"><button type="button" className="secondary" disabled={loading || busy} onClick={() => void save(freshDefaultInspectionRules(), '已恢复并保存 MissAV 默认规则。')}>恢复默认值</button><button type="button" className="primary" disabled={loading || busy} onClick={() => void save()}>{busy ? '保存中…' : '保存规则'}</button></div></div>}
     {error && <p className="form-error">{error}</p>}
     {loading ? <div className="empty">正在读取检查规则…</div> : <div className="inspection-rule-list">
       <section className={`inspection-rule-card ${form.releaseDate.enabled ? '' : 'disabled'}`}>
@@ -1762,8 +1716,11 @@ function JellyfinSettingsPanel({ onNotice }: { onNotice: (message: string) => vo
   </form></section>;
 }
 
-function Editor({ item, onClose, onSaved, onFullScan, onArchiveCleared }: { item: Subscription | null; onClose: () => void; onSaved: () => Promise<void>; onFullScan: () => Promise<void>; onArchiveCleared: () => Promise<void> }) {
+function Editor({ item, initialSection, onClose, onSaved, onFullScan, onArchiveCleared, onRequestDelete }: { item: Subscription | null; initialSection: 'details' | 'reading'; onClose: () => void; onSaved: () => Promise<void>; onFullScan: () => Promise<void>; onArchiveCleared: () => Promise<void>; onRequestDelete?: (item: Subscription) => void }) {
   const [form, setForm] = useState<FormData>(item ? subscriptionToForm(item) : blankForm);
+  const [section, setSection] = useState<'details' | 'reading'>(initialSection);
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
   const [presetId, setPresetId] = useState('');
   const [presets, setPresets] = useState<SubscriptionPreset[]>([]);
   const [preview, setPreview] = useState<{ title: string; content: string; items?: Array<{ content: string; title: string | null }> } | null>(null);
@@ -1773,11 +1730,13 @@ function Editor({ item, onClose, onSaved, onFullScan, onArchiveCleared }: { item
   const selectedPreset = presets.find((preset) => String(preset.id) === presetId);
   const loadPresets = async () => setPresets(await request<SubscriptionPreset[]>('/api/subscription-presets'));
   useEffect(() => { if (!item) void loadPresets().catch((reason) => setError(reason instanceof Error ? reason.message : '无法读取检查规则。')); }, [item]);
+  useEffect(() => { if (bodyRef.current) bodyRef.current.scrollTop = 0; }, [section]);
   function applyPreset(id: string) {
     setPresetId(id);
     const preset = presets.find((candidate) => String(candidate.id) === id);
     if (!preset) return;
-    setForm((old) => ({ ...old, selector: preset.selector, renderMode: preset.render_mode, contentSource: preset.content_source, attributeName: preset.attribute_name ?? '', matchPattern: preset.match_pattern ?? '', titleSelector: preset.title_selector ?? '', titleContentSource: preset.title_content_source ?? 'text', titleAttributeName: preset.title_attribute_name ?? '', titleMatchPattern: preset.title_match_pattern ?? '', resultMode: preset.result_mode, paginationSelector: preset.pagination_selector ?? '', paginationParameter: preset.pagination_parameter ?? 'page', paginationMatchPattern: preset.pagination_match_pattern ?? '' }));
+    const hours = Math.max(1, Math.min(168, Math.round(preset.interval_minutes / 60)));
+    setForm((old) => ({ ...old, selector: preset.selector, renderMode: preset.render_mode, contentSource: preset.content_source, attributeName: preset.attribute_name ?? '', matchPattern: preset.match_pattern ?? '', titleSelector: preset.title_selector ?? '', titleContentSource: preset.title_content_source ?? 'text', titleAttributeName: preset.title_attribute_name ?? '', titleMatchPattern: preset.title_match_pattern ?? '', resultMode: preset.result_mode, paginationSelector: preset.pagination_selector ?? '', paginationParameter: preset.pagination_parameter ?? 'page', paginationMatchPattern: preset.pagination_match_pattern ?? '', scheduleType: 'hourly', scheduleIntervalHours: hours, intervalMinutes: hours * 60, isActive: Boolean(preset.is_active) }));
   }
   async function previewCapture() {
     setBusy(true); setError(''); setPreview(null);
@@ -1800,33 +1759,35 @@ function Editor({ item, onClose, onSaved, onFullScan, onArchiveCleared }: { item
     finally { setBusy(false); }
   }
   async function submit(event: FormEvent) {
-    event.preventDefault(); setBusy(true); setError('');
+    event.preventDefault();
+    if (!form.selector.trim()) { setSection('reading'); setError('请先填写内容 CSS Selector。'); return; }
+    setBusy(true); setError('');
     try {
       await request(item ? `/api/subscriptions/${item.id}` : '/api/subscriptions', { method: item ? 'PUT' : 'POST', body: JSON.stringify(form) });
       await onSaved();
     } catch (reason) { setError(reason instanceof Error ? reason.message : '保存失败。'); }
     finally { setBusy(false); }
   }
-  return <div className="overlay" role="dialog" aria-modal="true" aria-labelledby="editor-title" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><form className="editor subscription-editor" onSubmit={submit}>
-    <header><div><p className="eyebrow">网页订阅</p><h2 id="editor-title">{item ? '编辑订阅' : '新建订阅'}</h2></div><button type="button" className="close" onClick={onClose}>×</button></header>
-    <div className="editor-body">
-    {!item && <section className="subscription-rule-picker"><label>检查规则<select value={presetId} onChange={(event) => applyPreset(event.target.value)}><option value="">请选择检查规则</option>{presets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select></label>{selectedPreset && <p>{selectedPreset.description || '已填入内容、标题与分页读取条件。'}{form.paginationSelector ? ' 首次计划检查会自动读取全部分页；保存后也可手动全量检查。' : ''}</p>}</section>}
-    <label>订阅名称<input autoFocus value={form.name} onChange={(e) => update('name', e.target.value)} placeholder="例如：商品价格" /></label>
-    <label>网页地址<input type="url" value={form.url} onChange={(e) => update('url', e.target.value)} placeholder="https://example.com/page" /></label>
-    <ScheduleControls form={form} update={update} />
-    {!item && <p className="editor-note">检查规则会在保存时一并写入订阅；规则内容可在订阅中心的“检查规则库”中维护。</p>}
-    {error && <p className="form-error">{error}</p>}
-    {preview && <div className="preview"><span>已提取 · {preview.title}</span>{preview.items?.length ? <div className="title-preview">{preview.items.slice(0, 8).map((entry, index) => <div key={`${entry.content}-${index}`}><code>{entry.content}</code><p>{entry.title || '未读取标题'}</p></div>)}</div> : <p>{preview.content}</p>}</div>}
+  const hasUnsavedChanges = JSON.stringify(form) !== JSON.stringify(item ? subscriptionToForm(item) : blankForm);
+  function requestClose() { if (busy) return; if (hasUnsavedChanges) setConfirmDiscard(true); else onClose(); }
+  return <div className="overlay" role="dialog" aria-modal="true" aria-labelledby="editor-title" onMouseDown={(event) => { if (event.target === event.currentTarget) requestClose(); }}><form className="editor subscription-editor" onSubmit={submit}>
+    <header><div><p className="eyebrow">网页订阅</p><h2 id="editor-title">{item ? `编辑订阅 · ${item.name}` : '新建订阅'}</h2></div><button type="button" className="close" aria-label="关闭编辑订阅" onClick={requestClose}>×</button></header>
+    <div className="subscription-editor-tabs" role="tablist" aria-label="订阅设置"><button type="button" role="tab" aria-selected={section === 'details'} className={section === 'details' ? 'active' : ''} onClick={() => setSection('details')}>基本信息与检查计划</button><button type="button" role="tab" aria-selected={section === 'reading'} className={section === 'reading' ? 'active' : ''} onClick={() => setSection('reading')}>页面读取</button></div>
+    <div className="editor-body" ref={bodyRef}>
+      {section === 'details' ? <><label>订阅名称<input autoFocus value={form.name} onChange={(e) => update('name', e.target.value)} placeholder="例如：商品价格" /></label><label>网页地址<input type="url" value={form.url} onChange={(e) => update('url', e.target.value)} placeholder="https://example.com/page" /></label><ScheduleControls form={form} update={update} /><label className="toggle subscription-editor-active"><input type="checkbox" checked={form.isActive} disabled={busy} onChange={(event) => update('isActive', event.target.checked)} />启用定时检查</label>{item && <section className="subscription-maintenance"><h3>订阅操作</h3><div><button type="button" className="secondary" disabled={busy || hasUnsavedChanges || !form.paginationSelector} title={hasUnsavedChanges ? '请先保存当前更改' : undefined} onClick={() => void fullScan()}>全量检查</button><button type="button" className="secondary danger-button" disabled={busy || hasUnsavedChanges} title={hasUnsavedChanges ? '请先保存当前更改' : undefined} onClick={() => void clearArchive()}>重置订阅数据</button><button type="button" className="secondary danger-button" disabled={busy || hasUnsavedChanges} title={hasUnsavedChanges ? '请先保存或放弃当前更改' : undefined} onClick={() => onRequestDelete?.(item)}>删除订阅</button></div></section>}</> : <>{!item && <section className="subscription-rule-picker"><label>套用列表预设<select value={presetId} onChange={(event) => applyPreset(event.target.value)}><option value="">请选择检查规则</option>{presets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select></label>{selectedPreset && <p>{selectedPreset.description || '已填入内容、标题与分页读取条件。'}{form.paginationSelector ? ' 首次计划检查会自动读取全部分页；保存后也可手动全量检查。' : ''}</p>}</section>}<SubscriptionReadingFields form={form} setForm={setForm} busy={busy} />{form.renderMode === 'static' && /^https?:\/\/(?:www\.)?missav123\.com(?:[/:?]|$)/i.test(form.url) && <p className="editor-note visible">MissAV 可能拒绝直接 HTTP 请求并返回 403；若检查失败，请使用浏览器渲染或配置可访问的代理。</p>}{preview && <div className="preview"><span>已提取 · {preview.title}</span>{preview.items?.length ? <div className="title-preview">{preview.items.slice(0, 8).map((entry, index) => <div key={`${entry.content}-${index}`}><code>{entry.content}</code><p>{entry.title || '未读取标题'}</p></div>)}</div> : <p>{preview.content}</p>}</div>}</>}
     </div>
-    <footer><div className="editor-footer-actions">{item?.pagination_selector && <button type="button" className="secondary" disabled={busy} onClick={() => void fullScan()}>{busy ? '处理中…' : '全量检查'}</button>}<button type="button" className="secondary" disabled={busy || (!item && !form.selector)} onClick={() => void previewCapture()}>{busy ? '处理中…' : '预览抽取'}</button>{item && <button type="button" className="secondary danger-button" disabled={busy} onClick={() => void clearArchive()}>重置订阅数据</button>}</div><button className="primary" disabled={busy} type="submit">{busy ? '保存中…' : '保存订阅'}</button></footer>
+    {error && <p className="form-error subscription-editor-error">{error}</p>}
+    <footer><div className="editor-footer-actions">{section === 'reading' && <button type="button" className="secondary" disabled={busy || !form.selector} onClick={() => void previewCapture()}>{busy ? '处理中…' : '预览抽取'}</button>}</div><button className="primary" disabled={busy} type="submit">{busy ? '保存中…' : '保存订阅'}</button></footer>
+    {confirmDiscard && <div className="subscription-discard-backdrop"><div className="subscription-discard-card" role="alertdialog" aria-modal="true" aria-labelledby="discard-title" aria-describedby="discard-description"><h3 id="discard-title">放弃未保存的修改？</h3><p id="discard-description">基本信息和页面读取规则的改动都将丢失。</p><div><button type="button" className="secondary" onClick={() => setConfirmDiscard(false)}>继续编辑</button><button type="button" className="danger-button" onClick={onClose}>放弃修改</button></div></div></div>}
   </form></div>;
 }
 
 function presetToForm(preset: SubscriptionPreset): PresetForm {
-  return { name: preset.name, description: preset.description, selector: preset.selector, renderMode: preset.render_mode, contentSource: preset.content_source, attributeName: preset.attribute_name ?? '', matchPattern: preset.match_pattern ?? '', titleSelector: preset.title_selector ?? '', titleContentSource: preset.title_content_source ?? 'text', titleAttributeName: preset.title_attribute_name ?? '', titleMatchPattern: preset.title_match_pattern ?? '', resultMode: preset.result_mode, intervalMinutes: preset.interval_minutes, scheduleType: 'hourly', scheduleIntervalHours: Math.max(1, Math.round(preset.interval_minutes / 60)), scheduleTime: '09:00', scheduleWeekday: 1, isActive: Boolean(preset.is_active), paginationSelector: preset.pagination_selector ?? '', paginationParameter: preset.pagination_parameter ?? 'page', paginationMatchPattern: preset.pagination_match_pattern ?? '' };
+  const hours = Math.max(1, Math.min(168, Math.round(preset.interval_minutes / 60)));
+  return { name: preset.name, description: preset.description, selector: preset.selector, renderMode: preset.render_mode, contentSource: preset.content_source, attributeName: preset.attribute_name ?? '', matchPattern: preset.match_pattern ?? '', titleSelector: preset.title_selector ?? '', titleContentSource: preset.title_content_source ?? 'text', titleAttributeName: preset.title_attribute_name ?? '', titleMatchPattern: preset.title_match_pattern ?? '', resultMode: preset.result_mode, intervalMinutes: hours * 60, scheduleType: 'hourly', scheduleIntervalHours: hours, scheduleTime: '09:00', scheduleWeekday: 1, isActive: Boolean(preset.is_active), paginationSelector: preset.pagination_selector ?? '', paginationParameter: preset.pagination_parameter ?? 'page', paginationMatchPattern: preset.pagination_match_pattern ?? '' };
 }
 
-function PresetManager({ presets, onClose, onChanged, embedded = false, registerDraft }: { presets: SubscriptionPreset[]; onClose: () => void; onChanged: () => Promise<void>; embedded?: boolean; registerDraft?: (draft: MissavPresetDraft) => void }) {
+function PresetManager({ presets, onClose, onChanged, embedded = false, registerDraft, savedPreset, requestedPresetId }: { presets: SubscriptionPreset[]; onClose: () => void; onChanged: () => Promise<void>; embedded?: boolean; registerDraft?: (draft: MissavPresetDraft) => void; savedPreset?: SubscriptionPreset | null; requestedPresetId?: number | null }) {
   const [editing, setEditing] = useState<SubscriptionPreset | 'new' | null>(null);
   const [form, setForm] = useState<PresetForm>(blankPresetForm);
   const [busy, setBusy] = useState(false);
@@ -1836,12 +1797,21 @@ function PresetManager({ presets, onClose, onChanged, embedded = false, register
   useEffect(() => {
     if (embedded && !editing) startEdit(presets[0] ?? 'new');
   }, [embedded, editing, presets]);
+  useEffect(() => {
+    if (embedded && savedPreset) startEdit(savedPreset);
+  }, [embedded, savedPreset]);
+  useEffect(() => {
+    if (!embedded || requestedPresetId === null || requestedPresetId === undefined) return;
+    const requested = presets.find((preset) => preset.id === requestedPresetId);
+    if (requested) startEdit(requested);
+  }, [embedded, requestedPresetId]);
   const save = async (): Promise<boolean> => {
     if (!editing) return false;
     setBusy(true); setError('');
     try {
-      await request(editing === 'new' ? '/api/subscription-presets' : `/api/subscription-presets/${editing.id}`, { method: editing === 'new' ? 'POST' : 'PUT', body: JSON.stringify(form) });
-      await onChanged(); if (!embedded) setEditing(null); return true;
+      const saved = await request<SubscriptionPreset>(editing === 'new' ? '/api/subscription-presets' : `/api/subscription-presets/${editing.id}`, { method: editing === 'new' ? 'POST' : 'PUT', body: JSON.stringify(form) });
+      if (embedded) startEdit(saved); else setEditing(null);
+      await onChanged(); return true;
     } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存规则。'); return false; }
     finally { setBusy(false); }
   };
@@ -1857,15 +1827,15 @@ function PresetManager({ presets, onClose, onChanged, embedded = false, register
   };
   if (editing) return <section className={`preset-manager ${embedded ? 'embedded' : ''}`} aria-label="编辑 MissAV 列表读取规则">
     <div className="preset-manager-head"><div><strong>{editing === 'new' ? '新建列表读取规则' : '列表读取规则'}</strong><small>保存后可在新建 MissAV 订阅时直接选择。</small></div>{!embedded && <button type="button" className="close" onClick={() => setEditing(null)}>×</button>}</div>
-    <label>规则名称<input autoFocus value={form.name} maxLength={80} onChange={(event) => update('name', event.target.value)} /></label>
+    <label>规则名称<input autoFocus={!embedded} value={form.name} maxLength={80} onChange={(event) => update('name', event.target.value)} /></label>
     <label>规则说明<input value={form.description} maxLength={200} onChange={(event) => update('description', event.target.value)} placeholder="可选，说明适用的网页和内容" /></label>
     <label>CSS Selector<input value={form.selector} onChange={(event) => update('selector', event.target.value)} placeholder="例如 a.text-secondary[alt]" /></label>
     <div className="two-col"><label>提取内容<select value={form.contentSource} onChange={(event) => update('contentSource', event.target.value as PresetForm['contentSource'])}><option value="text">标签中的文字</option><option value="attribute">指定属性的值</option></select></label>{form.contentSource === 'attribute' ? <label>属性名<input value={form.attributeName} onChange={(event) => update('attributeName', event.target.value)} placeholder="例如 alt" /></label> : <div className="attribute-hint">读取所选标签中的可见文字</div>}</div>
     <div className="two-col"><label>匹配范围<select value={form.resultMode} onChange={(event) => update('resultMode', event.target.value as PresetForm['resultMode'])}><option value="first">仅第一项</option><option value="all">全部匹配项</option></select></label><label>内容匹配规则<input value={form.matchPattern} onChange={(event) => update('matchPattern', event.target.value)} placeholder="可选的正则表达式" /></label></div>
     <section className="preset-title-settings"><label className="toggle"><input type="checkbox" checked={Boolean(form.titleSelector)} onChange={(event) => setForm((old) => event.target.checked ? { ...old, titleSelector: old.selector, titleContentSource: 'text', titleAttributeName: '', titleMatchPattern: old.titleMatchPattern } : { ...old, titleSelector: '', titleAttributeName: '', titleMatchPattern: '' })} /><span />同时读取标题</label>{form.titleSelector && <><label>标题 CSS Selector<input value={form.titleSelector} onChange={(event) => update('titleSelector', event.target.value)} /></label><div className="two-col"><label>标题来源<select value={form.titleContentSource} onChange={(event) => update('titleContentSource', event.target.value as PresetForm['titleContentSource'])}><option value="text">标签中的文字</option><option value="attribute">指定属性的值</option></select></label>{form.titleContentSource === 'attribute' ? <label>标题属性名<input value={form.titleAttributeName} onChange={(event) => update('titleAttributeName', event.target.value)} placeholder="例如 alt" /></label> : <div className="attribute-hint">按条目顺序与内容配对</div>}</div><label>标题匹配规则<input value={form.titleMatchPattern} onChange={(event) => update('titleMatchPattern', event.target.value)} placeholder="可选的正则表达式" /></label></>}</section>
     <section className="preset-title-settings"><label className="toggle"><input type="checkbox" checked={Boolean(form.paginationSelector)} onChange={(event) => setForm((old) => event.target.checked ? { ...old, paginationSelector: old.paginationSelector || '#page-count', paginationParameter: old.paginationParameter || 'page', paginationMatchPattern: old.paginationMatchPattern || '(\\d+)' } : { ...old, paginationSelector: '', paginationMatchPattern: '' })} /><span />包含分页读取</label>{form.paginationSelector && <><label>页数 CSS Selector<input value={form.paginationSelector} onChange={(event) => update('paginationSelector', event.target.value)} /></label><div className="two-col"><label>页码参数名<input value={form.paginationParameter} onChange={(event) => update('paginationParameter', event.target.value)} /></label><label>页数匹配规则<input value={form.paginationMatchPattern} onChange={(event) => update('paginationMatchPattern', event.target.value)} placeholder={'例如 /\\s*(\\d+)'} /></label></div></>}</section>
-    <div className="two-col"><label>读取方式<select value={form.renderMode} onChange={(event) => update('renderMode', event.target.value as PresetForm['renderMode'])}><option value="static">HTML 抓取</option><option value="dynamic">浏览器渲染</option></select></label><label>检查间隔（分钟）<input type="number" min="1" max="10080" value={form.intervalMinutes} onChange={(event) => update('intervalMinutes', Number(event.target.value))} /></label></div>
-    <label className="toggle"><input type="checkbox" checked={form.isActive} onChange={(event) => update('isActive', event.target.checked)} /><span />默认启用定时检查</label>{error && <p className="form-error">{error}</p>}<div className="preset-manager-actions">{!embedded && <button type="button" className="secondary" onClick={() => setEditing(null)}>返回列表</button>}<button type="button" className="primary" disabled={busy} onClick={() => void save()}>{busy ? '保存中…' : '保存列表规则'}</button></div>
+    <div className="two-col"><label>读取方式<select value={form.renderMode} onChange={(event) => update('renderMode', event.target.value as PresetForm['renderMode'])}><option value="static">HTML 抓取</option><option value="dynamic">浏览器渲染</option></select></label><label>默认检查间隔（小时）<input type="number" min="1" max="168" value={form.scheduleIntervalHours} onChange={(event) => { const hours = Number(event.target.value); setForm((old) => ({ ...old, scheduleIntervalHours: hours, intervalMinutes: hours * 60 })); }} /></label></div>
+    <label className="toggle"><input type="checkbox" checked={form.isActive} onChange={(event) => update('isActive', event.target.checked)} /><span />手动新建订阅时默认启用</label>{error && <p className="form-error">{error}</p>}<div className="preset-manager-actions">{!embedded && <button type="button" className="secondary" onClick={() => setEditing(null)}>返回列表</button>}<button type="button" className="primary" disabled={busy} onClick={() => void save()}>{busy ? '保存中…' : '保存列表规则'}</button></div>
   </section>;
   return <section className={`preset-manager ${embedded ? 'embedded' : ''}`} aria-label="管理 MissAV 列表读取规则">{!embedded && <div className="preset-manager-head"><div><strong>列表读取规则</strong><small>可自由新增、编辑或删除新建订阅可套用的列表读取规则。</small></div><button type="button" className="close" onClick={onClose}>×</button></div>}{error && <p className="form-error">{error}</p>}<div className="preset-rule-list">{presets.map((preset) => <article key={preset.id}><div><strong>{preset.name}</strong><small>{preset.description || preset.selector}</small></div><code>{preset.selector}</code><div><button type="button" onClick={() => startEdit(preset)}>编辑</button><button type="button" className="danger" disabled={busy} onClick={() => void remove(preset)}>删除</button></div></article>)}</div><div className="preset-manager-actions">{!embedded && <button type="button" className="secondary" onClick={onClose}>完成</button>}<button type="button" className="primary" onClick={() => startEdit('new')}>＋ 新建规则</button></div></section>;
 }
