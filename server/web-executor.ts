@@ -62,9 +62,10 @@ function scheduleIdleExit() {
 
 async function execute(request: ExecutorRequest) {
   await refreshSettings();
+  const sites = getInspectionRules().sites;
   switch (request.operation) {
     case 'capture': return captureSubscription(request.payload.subscription, request.payload.priority);
-    case 'release': return lookupReleaseDate(request.payload.detailUrl, request.payload.rule, request.payload.priority);
+    case 'release': return lookupReleaseDate(request.payload.detailUrl, request.payload.rule, request.payload.priority, sites);
     case 'magnet': return lookupMagnet(request.payload.content, request.payload.rule);
     case 'preview': return previewCapture(request.payload);
     case 'code-search': {
@@ -74,7 +75,7 @@ async function execute(request: ExecutorRequest) {
       const rule = getInspectionRules().releaseDate;
       if (!rule.enabled) return { status: 'found', film, releaseDate: { status: 'unavailable', reason: '发行日期检索规则已停用。' } };
       let releaseDate: { status: 'found'; releaseDate: string } | { status: 'unavailable'; reason: string } | { status: 'failed'; reason: string };
-      try { releaseDate = await lookupReleaseDate(film.detailUrl, rule, request.payload.priority); }
+      try { releaseDate = await lookupReleaseDate(film.detailUrl, rule, request.payload.priority, sites); }
       catch (error) { releaseDate = { status: 'failed', reason: error instanceof Error ? error.message : String(error) }; }
       return { status: 'found', film, releaseDate };
     }

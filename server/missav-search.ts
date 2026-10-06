@@ -2,10 +2,24 @@ import type { Page } from 'playwright';
 import { browserPool } from './browser-pool.js';
 import { assertSafeUrl as validateSafeUrl } from './url-safety.js';
 import { getOutboundProxyUrl } from './db.js';
-import { missavBackupUrl, missavFallbackFailure, shouldTryMissavBackup } from './site-fallback.js';
+import { defaultSites, getInspectionRules } from './inspection-rules.js';
+import { siteFallbackUrl, missavFallbackFailure, shouldTryMissavBackup } from './site-fallback.js';
 import { findMissavFilmCandidate, normalizeProductCode, productCodeKeys, safeMissavDetailUrl, type MissavSearchAnchor } from './code-search-parser.js';
 
-const missavHosts = new Set(['missav123.com', 'www.missav123.com', 'missav.live', 'www.missav.live']);
+/** 番号检索页、影片详情页和女优页同样使用「检查规则」里配置的站点列表。 */
+function configuredSites() {
+  const sites = getInspectionRules().sites;
+  return sites.length ? sites : defaultSites;
+}
+
+function hostsFor(sites: string[]) {
+  return new Set(sites.flatMap((site) => {
+    try {
+      const hostname = new URL(site).hostname.toLowerCase();
+      return [hostname, `www.${hostname}`];
+    } catch { return []; }
+  }));
+}
 
 export type MissavPerformer = { name: string; url: string };
 export type MissavSearchResult = { code: string; title: string; detailUrl: string; performers: MissavPerformer[]; performerError: string | null };
@@ -13,14 +27,14 @@ export type MissavCodeSearchResponse = { status: 'found'; film: MissavSearchResu
 
 async function assertMissavUrl(raw: string) {
   const url = await validateSafeUrl(raw, { allowUnresolvedViaProxy: true, hasOutboundProxy: Boolean(getOutboundProxyUrl()) });
-  if (url.protocol !== 'https:' || (url.port && url.port !== '443') || !missavHosts.has(url.hostname.toLowerCase())) throw new Error('只允许访问 MissAV 官方页面。');
+  if (url.protocol !== 'https:' || (url.port && url.port !== '443') || !hostsFor(configuredSites()).has(url.hostname.toLowerCase())) throw new Error('只允许访问「检查规则」中配置的站点页面。');
   return url;
 }
 
 function actressUrl(raw: string, base: URL) {
   try {
     const url = new URL(raw, base);
-    if (url.protocol !== 'https:' || (url.port && url.port !== '443') || !missavHosts.has(url.hostname.toLowerCase())) return null;
+    if (url.protocol !== 'https:' || (url.port && url.port !== '443') || !hostsFor(configuredSites()).has(url.hostname.toLowerCase())) return null;
     if (!/^\/(?:dm\d+\/)?cn\/actresses\/[^/]+\/?$/i.test(url.pathname)) return null;
     url.hash = '';
     return url.toString();
@@ -45,7 +59,7 @@ function checkPage(title: string, body: string, responseStatus: number | null, l
 async function withMissavFallback<T>(url: URL, read: (target: URL) => Promise<T>) {
   try { return await read(url); }
   catch (error) {
-    const backup = missavBackupUrl(url);
+    const backup = siteFallbackUrl(url, configuredSites());
     if (!backup || !shouldTryMissavBackup(error)) throw error;
     try { return await read(await assertMissavUrl(backup.toString())); }
     catch (backupError) { throw missavFallbackFailure(url, backup, error, backupError); }
@@ -61,6 +75,7 @@ function browserLaunchError(error: unknown) {
 }
 
 async function readSearchPage(url: URL, wantedCode: string) {
+  const allowedHosts = hostsFor(configuredSites());
   return readPage(url, async (page, responseStatus) => {
     await page.waitForFunction((code) => {
       const normalizedCode = code.toLowerCase().replace('-', '');
@@ -84,7 +99,7 @@ async function readSearchPage(url: URL, wantedCode: string) {
       title: node.getAttribute('title')
     } satisfies MissavSearchAnchor)));
     const baseUrl = diagnostic.url;
-    const film = findMissavFilmCandidate(anchors, wantedCode, baseUrl);
+    const film = findMissavFilmCandidate(anchors, wantedCode, baseUrl, allowedHosts);
     if (film) return film;
     if (productCodeKeys(diagnostic.cardText).includes(wantedCode.toLowerCase())) {
       throw new Error(`MissAV 搜索页出现了 ${wantedCode}，但无法识别对应影片链接；页面结构可能已变化。`);
@@ -93,9 +108,9 @@ async function readSearchPage(url: URL, wantedCode: string) {
     // Some site versions redirect a single exact search result straight to its
     // detail page instead of rendering a list card.
     const current = new URL(diagnostic.url);
-    const currentDetail = safeMissavDetailUrl(current.toString(), current.toString());
+    const currentDetail = safeMissavDetailUrl(current.toString(), current.toString(), allowedHosts);
     const currentCode = current.pathname.split('/').at(-1) ?? '';
-    const redirected = findMissavFilmCandidate([{ href: current.toString(), text: diagnostic.title, title: currentCode }], wantedCode, diagnostic.url);
+    const redirected = findMissavFilmCandidate([{ href: current.toString(), text: diagnostic.title, title: currentCode }], wantedCode, diagnostic.url, allowedHosts);
     if (currentDetail && redirected) return { ...redirected, detailUrl: currentDetail };
     if (!diagnostic.resultCards && !/没有找到|未找到|无结果|暂无|no results|not found|no items|nothing found/i.test(diagnostic.body)) {
       throw new Error('MissAV 搜索页结构发生变化，未识别到搜索结果卡片。');
@@ -126,7 +141,8 @@ async function readPerformersPage(url: URL): Promise<MissavPerformer[]> {
 export async function searchMissavCode(rawCode: string): Promise<MissavCodeSearchResponse> {
   const code = normalizeProductCode(rawCode);
   if (!code) throw new Error('请输入有效番号，例如 MEYD-568 或 meyd568。');
-  const searchUrl = new URL(`/cn/search/${encodeURIComponent(code.replace('-', '').toLowerCase())}`, 'https://missav123.com');
+  // 搜索页从配置列表的第一个站点开始，可用性故障时再换下一个。
+  const searchUrl = new URL(`/cn/search/${encodeURIComponent(code.replace('-', '').toLowerCase())}`, configuredSites()[0]);
   const film = await withMissavFallback(await assertMissavUrl(searchUrl.toString()), read => readSearchPage(read, code)).catch((error) => { throw browserLaunchError(error); });
   if (!film) return { status: 'not_found', code };
   const url = await assertMissavUrl(film.detailUrl);

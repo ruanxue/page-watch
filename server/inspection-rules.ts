@@ -1,4 +1,5 @@
 import { getSetting } from './db.js';
+import { defaultSites, normalizeSiteList, validateSiteList, type SitesRule } from './site-list.js';
 
 export type ValueSource = 'text' | 'attribute';
 
@@ -34,11 +35,14 @@ export type MagnetRule = {
 };
 
 export type InspectionRules = {
+  /** 读取番号、标题、发行日期和女优页所用的站点，按顺序尝试。 */
+  sites: SitesRule;
   releaseDate: ReleaseDateRule;
   magnet: MagnetRule;
 };
 
 export const defaultInspectionRules: InspectionRules = {
+  sites: [...defaultSites],
   releaseDate: {
     enabled: true,
     // The list-page link is stored with every archive item, so this default is
@@ -115,6 +119,18 @@ function filenameMarkers(value: unknown, fallback: string[]) {
     .slice(0, 8);
 }
 
+// 站点列表的解析、校验与切换逻辑放在不依赖数据库的 site-list 模块里，
+// 这里只负责与其他读取规则一起读写。
+export {
+  allowedSiteHosts,
+  defaultSites,
+  MAX_SITES,
+  nextSiteUrl,
+  normalizeSiteList,
+  normalizeSiteUrl,
+  type SitesRule
+} from './site-list.js';
+
 /** Returns a safe, complete config even when a database value was written by an older release. */
 export function coerceInspectionRules(value: unknown): InspectionRules {
   const defaults = cloneDefaults();
@@ -122,6 +138,7 @@ export function coerceInspectionRules(value: unknown): InspectionRules {
   const release = data.releaseDate && typeof data.releaseDate === 'object' ? data.releaseDate as Record<string, unknown> : {};
   const magnet = data.magnet && typeof data.magnet === 'object' ? data.magnet as Record<string, unknown> : {};
   return {
+    sites: normalizeSiteList(data.sites, defaults.sites),
     releaseDate: {
       enabled: boolean(release.enabled, defaults.releaseDate.enabled),
       urlTemplate: nonEmptyString(release.urlTemplate, defaults.releaseDate.urlTemplate),
@@ -180,6 +197,7 @@ export function normalizeInspectionRules(payload: unknown): InspectionRules {
   const rules = coerceInspectionRules(payload);
   const release = rules.releaseDate;
   const magnet = rules.magnet;
+  validateSiteList(rules.sites);
   if (release.enabled) {
     validateUrlTemplate(release.urlTemplate, '详情页地址模板', ['{{detailUrl}}', '{{baseUrl}}', '{{content}}']);
     validateRegex(release.valueMatchPattern, '发行日期匹配规则');

@@ -1,22 +1,18 @@
-/**
- * MissAV exposes compatible content from more than one public origin. Keep
- * this small routing rule separate from extraction rules: selectors continue
- * to describe the page, while this only supplies a second route when the
- * primary origin is unavailable.
- */
-const missavPrimaryHosts = new Set(['missav123.com', 'www.missav123.com']);
-const missavBackupOrigin = 'https://missav.live';
+import { nextSiteUrl, type SitesRule } from './site-list.js';
 
-export function missavBackupUrl(url: URL) {
-  if (!missavPrimaryHosts.has(url.hostname.toLowerCase())) return null;
-  const backup = new URL(url.pathname + url.search + url.hash, missavBackupOrigin);
-  return backup;
+/**
+ * MissAV 有多个可用的公开站点。站点列表由「检查规则」页面配置，这里只负责
+ * 在可用性故障时给出下一个候选地址：选择器、正则等读取规则继续描述页面，
+ * 换站不会掩盖规则错误。
+ */
+
+export function siteFallbackUrl(url: URL, sites: SitesRule) {
+  return nextSiteUrl(url, sites);
 }
 
 /**
- * Only availability failures trigger a host switch. Selector, regex and date
- * extraction errors must stay visible instead of being hidden by a retry on a
- * different domain.
+ * 只有可用性故障才换站。选择器、正则和日期提取错误必须暴露出来，而不是被
+ * 另一个域名上的重试掩盖。
  */
 export function shouldTryMissavBackup(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
@@ -26,5 +22,7 @@ export function shouldTryMissavBackup(error: unknown) {
 export function missavFallbackFailure(primary: URL, backup: URL, primaryError: unknown, backupError: unknown) {
   const primaryMessage = primaryError instanceof Error ? primaryError.message : String(primaryError);
   const backupMessage = backupError instanceof Error ? backupError.message : String(backupError);
-  return new Error(`主站 ${primary.hostname} 暂不可用，已尝试备用站 ${backup.hostname}；备用站也未成功：${backupMessage}`, { cause: new Error(primaryMessage) });
+  // 当前地址可能就是配置里的第二个站点，此时 backup 会回到第一个站点，用
+  // 「下一个站点」描述比「备用站」更准确。
+  return new Error(`站点 ${primary.hostname} 暂不可用，已尝试 ${backup.hostname}；它也未能成功：${backupMessage}`, { cause: new Error(primaryMessage) });
 }

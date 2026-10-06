@@ -5,7 +5,7 @@ import { getOutboundProxyUrl } from './db.js';
 import { browserPool } from './browser-pool.js';
 import { describeError } from './error-details.js';
 import type { ReleaseDateRule } from './inspection-rules.js';
-import { missavBackupUrl, missavFallbackFailure, shouldTryMissavBackup } from './site-fallback.js';
+import { siteFallbackUrl, missavFallbackFailure, shouldTryMissavBackup } from './site-fallback.js';
 import { readResponseText } from './bounded-body.js';
 
 const REQUEST_TIMEOUT_MS = 25_000;
@@ -212,7 +212,7 @@ async function inspectReleaseDateInBrowser(url: URL, rule: ReleaseDateRule, prio
   }
 }
 
-export async function lookupReleaseDate(rawUrl: string, rule: ReleaseDateRule, priority = 0): Promise<ReleaseDateLookupResult> {
+export async function lookupReleaseDate(rawUrl: string, rule: ReleaseDateRule, priority = 0, sites: string[] = []): Promise<ReleaseDateLookupResult> {
   const url = await assertSafeUrl(rawUrl);
   const read = async (target: URL) => {
     const result = rule.renderMode === 'dynamic'
@@ -229,7 +229,7 @@ export async function lookupReleaseDate(rawUrl: string, rule: ReleaseDateRule, p
     if (primaryError) throw primaryError;
     return primaryResult!;
   }
-  const backup = missavBackupUrl(url);
+  const backup = siteFallbackUrl(url, sites);
   if (!backup) {
     if (primaryError) throw primaryError;
     return primaryResult!;

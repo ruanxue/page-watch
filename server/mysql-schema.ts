@@ -22,10 +22,14 @@ export async function ensureMySqlSchema(pool: Pool) {
     schedule_time VARCHAR(5) NOT NULL DEFAULT '09:00',
     schedule_weekday TINYINT NOT NULL DEFAULT 1,
     is_active TINYINT NOT NULL DEFAULT 1,
+    rule_family VARCHAR(32) NOT NULL DEFAULT 'legacy_custom',
+    preset_id INT NULL,
+    render_mode_override VARCHAR(16) NULL,
     last_checked_at VARCHAR(40) NULL,
     last_hash CHAR(64) NULL,
     last_content MEDIUMTEXT NULL,
     last_error TEXT NULL,
+    last_scan_added_count INT NOT NULL DEFAULT 0,
     pagination_selector TEXT NULL,
     pagination_parameter VARCHAR(64) NOT NULL DEFAULT 'page',
     pagination_match_pattern VARCHAR(1024) NULL,
@@ -473,6 +477,10 @@ export async function ensureMySqlSchema(pool: Pool) {
   await addColumnIfMissing(pool, 'subscriptions', 'next_scheduled_at', 'VARCHAR(40) NULL');
   await addColumnIfMissing(pool, 'subscriptions', 'pagination_parameter', "VARCHAR(64) NOT NULL DEFAULT 'page'");
   await addColumnIfMissing(pool, 'subscriptions', 'pagination_match_pattern', 'VARCHAR(1024) NULL');
+  await addColumnIfMissing(pool, 'subscriptions', 'last_scan_added_count', 'INT NOT NULL DEFAULT 0');
+  await addColumnIfMissing(pool, 'subscriptions', 'rule_family', "VARCHAR(32) NOT NULL DEFAULT 'legacy_custom'");
+  await addColumnIfMissing(pool, 'subscriptions', 'preset_id', 'INT NULL');
+  await addColumnIfMissing(pool, 'subscriptions', 'render_mode_override', 'VARCHAR(16) NULL');
   await addColumnIfMissing(pool, 'worker_heartbeats', 'task_kind', 'VARCHAR(32) NULL');
   await addColumnIfMissing(pool, 'worker_heartbeats', 'subscription_id', 'INT NULL');
   await addColumnIfMissing(pool, 'worker_heartbeats', 'archive_entry_id', 'INT NULL');
@@ -499,6 +507,7 @@ export async function ensureMySqlSchema(pool: Pool) {
   await addIndexIfMissing(pool, 'archive_entries', 'idx_archive_entries_code', 'KEY idx_archive_entries_code (archive_code)');
   await addIndexIfMissing(pool, 'archive_entries', 'idx_archive_release_status_id', 'KEY idx_archive_release_status_id (release_status, id)');
   await addIndexIfMissing(pool, 'archive_entries', 'idx_archive_full_scan_batch', 'KEY idx_archive_full_scan_batch (full_scan_batch_id)');
+  await addIndexIfMissing(pool, 'subscriptions', 'idx_subscriptions_rule_group', 'KEY idx_subscriptions_rule_group (rule_family, preset_id)');
 }
 
 async function addColumnIfMissing(pool: Pool, table: string, column: string, definition: string) {

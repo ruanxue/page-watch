@@ -11,7 +11,16 @@ export type MissavFilmCandidate = {
   detailUrl: string;
 };
 
-const missavHosts = new Set(['missav123.com', 'www.missav123.com', 'missav.live', 'www.missav.live']);
+/**
+ * 允许的站点主机名。默认值用于单元测试与旧调用；运行时由「检查规则」里配置
+ * 的站点列表传入，站点改动无需修改本模块。
+ */
+export const defaultAllowedHosts = new Set(['missav123.com', 'www.missav123.com', 'missav.live', 'www.missav.live']);
+
+export function isAllowedHost(hostname: string, allowedHosts: Set<string> = defaultAllowedHosts) {
+  const host = hostname.toLowerCase();
+  return allowedHosts.has(host) || allowedHosts.has(host.replace(/^www\./, ''));
+}
 
 export function normalizeProductCode(value: string) {
   const match = value.trim().match(/^([a-z]{2,16})[-_\s]?(\d{2,8})$/i);
@@ -39,10 +48,10 @@ export function productCodeSearchPatterns(value: string) {
   return [`%${prefix}-${number}%`, `%${prefix}_${number}%`, `%${prefix} ${number}%`, `%${prefix}${number}%`];
 }
 
-export function safeMissavDetailUrl(raw: string, baseUrl: string) {
+export function safeMissavDetailUrl(raw: string, baseUrl: string, allowedHosts: Set<string> = defaultAllowedHosts) {
   try {
     const url = new URL(raw, baseUrl);
-    if (url.protocol !== 'https:' || (url.port && url.port !== '443') || !missavHosts.has(url.hostname.toLowerCase())) return null;
+    if (url.protocol !== 'https:' || (url.port && url.port !== '443') || !isAllowedHost(url.hostname, allowedHosts)) return null;
     const path = url.pathname.match(/^\/(?:dm\d+\/)?cn\/([^/]+)\/?$/i);
     if (!path || /^(?:actresses|search)$/i.test(path[1])) return null;
     url.search = '';
@@ -59,12 +68,12 @@ function displayTitle(value: string, code: string) {
 }
 
 /** Match by the exact product code found in a result card, never by position. */
-export function findMissavFilmCandidate(anchors: MissavSearchAnchor[], wantedCode: string, baseUrl: string): MissavFilmCandidate | null {
+export function findMissavFilmCandidate(anchors: MissavSearchAnchor[], wantedCode: string, baseUrl: string, allowedHosts: Set<string> = defaultAllowedHosts): MissavFilmCandidate | null {
   const wantedKey = productCodeKey(wantedCode);
   if (!wantedKey) return null;
   const byUrl = new Map<string, { codeMatched: boolean; title: string; code: string }>();
   for (const anchor of anchors) {
-    const detailUrl = safeMissavDetailUrl(anchor.href, baseUrl);
+    const detailUrl = safeMissavDetailUrl(anchor.href, baseUrl, allowedHosts);
     if (!detailUrl) continue;
     const url = new URL(detailUrl);
     const slug = url.pathname.split('/').at(-1) ?? '';
@@ -84,10 +93,10 @@ export function findMissavFilmCandidate(anchors: MissavSearchAnchor[], wantedCod
   return detailUrl && match?.codeMatched ? { code: match.code, title: match.title || match.code, detailUrl } : null;
 }
 
-export function normalizeMissavActressIdentity(raw: string) {
+export function normalizeMissavActressIdentity(raw: string, allowedHosts: Set<string> = defaultAllowedHosts) {
   try {
     const url = new URL(raw);
-    if (url.protocol !== 'https:' || (url.port && url.port !== '443') || !missavHosts.has(url.hostname.toLowerCase())) return null;
+    if (url.protocol !== 'https:' || (url.port && url.port !== '443') || !isAllowedHost(url.hostname, allowedHosts)) return null;
     const path = url.pathname.replace(/^\/dm\d+(?=\/)/i, '');
     const match = path.match(/^\/cn\/actresses\/([^/]+)\/?$/i);
     if (!match) return null;

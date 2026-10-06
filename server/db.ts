@@ -178,10 +178,14 @@ export type Subscription = {
   schedule_time: string;
   schedule_weekday: number;
   is_active: number;
+  rule_family: 'missav' | 'legacy_custom';
+  preset_id: number | null;
+  render_mode_override: 'static' | 'dynamic' | null;
   last_checked_at: string | null;
   last_hash: string | null;
   last_content: string | null;
   last_error: string | null;
+  last_scan_added_count: number;
   pagination_selector: string | null;
   pagination_parameter: string;
   pagination_match_pattern: string | null;
@@ -829,6 +833,39 @@ async function seedDefaultInspectionRules() {
   await setSetting('inspection_rules', inspectionRulesJson(defaultInspectionRules));
 }
 
+/** 只建立旧订阅与规则组的归属，不改写它们当前的读取设置。 */
+async function assignLegacyMissavRules() {
+  const migrationKey = 'missav_rule_family_v1';
+  if (getSetting(migrationKey)) return;
+  const sites = (() => {
+    try { return JSON.parse(getSetting('inspection_rules')).sites as string[]; }
+    catch { return defaultInspectionRules.sites; }
+  })();
+  const hosts = [...new Set([...defaultInspectionRules.sites, ...(Array.isArray(sites) ? sites : [])].map((site) => {
+    try { return new URL(site).hostname.toLowerCase(); } catch { return ''; }
+  }).filter(Boolean))];
+  const presets = await db.all<{ id: number; selector: string; render_mode: 'static' | 'dynamic'; content_source: string; attribute_name: string | null; pagination_selector: string | null }>('SELECT id, selector, render_mode, content_source, attribute_name, pagination_selector FROM subscription_presets ORDER BY id');
+  const fallback = presets[0];
+  const now = new Date().toISOString();
+  await db.transaction(async (tx) => {
+    let lastId = 0;
+    while (true) {
+      const batch = await tx.all<Pick<Subscription, 'id' | 'url' | 'selector' | 'render_mode' | 'content_source' | 'attribute_name' | 'pagination_selector'>>('SELECT id, url, selector, render_mode, content_source, attribute_name, pagination_selector FROM subscriptions WHERE id > ? ORDER BY id LIMIT 100', [lastId]);
+      if (!batch.length) break;
+      for (const subscription of batch) {
+        let host = '';
+        try { host = new URL(subscription.url).hostname.toLowerCase(); } catch { continue; }
+        if (!hosts.includes(host) || !fallback) continue;
+        const matched = presets.find((preset) => preset.selector === subscription.selector && preset.content_source === subscription.content_source && preset.attribute_name === subscription.attribute_name && preset.pagination_selector === subscription.pagination_selector) ?? fallback;
+        await tx.run("UPDATE subscriptions SET rule_family='missav', preset_id=?, render_mode_override=? WHERE id=? AND rule_family='legacy_custom'", [matched.id, matched.render_mode === subscription.render_mode ? null : subscription.render_mode, subscription.id]);
+      }
+      lastId = batch[batch.length - 1].id;
+    }
+    await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, '1', ?) ON DUPLICATE KEY UPDATE value=VALUES(value), updated_at=VALUES(updated_at)`, [migrationKey, now]);
+  });
+  settings.set(migrationKey, '1');
+}
+
 let initialization: Promise<void> | null = null;
 
 /**
@@ -846,6 +883,7 @@ export function initializeDatabase() {
     await seedDefaultSubscriptionPresets();
     await backfillMissavPaginationDefaults();
     await seedDefaultInspectionRules();
+    await assignLegacyMissavRules();
     await rebuildSubscriptionProgress();
   })();
   return initialization;

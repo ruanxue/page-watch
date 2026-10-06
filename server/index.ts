@@ -5,13 +5,13 @@ import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
 import fastifyCompress from '@fastify/compress';
 import { assertSafeUrl as validateSafeUrl } from './url-safety.js';
-import { appendRuntimeLog, configureDatabase, databaseConfigurationError, databaseConfigurationSource, db, getIntegrationStatuses, getJellyfinSettings, getOutboundProxyUrl, getQbittorrentSettings, getRuntimeMetrics, getRuntimeSettings, getSetting, getSubscription, isDatabaseConfigured, JOB_PRIORITY, maintainPerformanceMetrics, queueDownloadJob, queueJob, queueLibraryJob, queueLibrarySyncJob, queueMagnetJob, queueReleaseJob, rebuildSubscriptionProgress, refreshSettings, reportIntegrationStatus, reportRuntimeMetrics, reportWorkerHeartbeat, setRuntimeSettings, setSetting, type IntegrationService, type Subscription } from './db.js';
+import { appendRuntimeLog, configureDatabase, databaseConfigurationError, databaseConfigurationSource, db, getIntegrationStatuses, getJellyfinSettings, getOutboundProxyUrl, getQbittorrentSettings, getRuntimeMetrics, getRuntimeSettings, getSetting, getSubscription, isDatabaseConfigured, JOB_PRIORITY, maintainPerformanceMetrics, queueDownloadJob, queueJob, queueLibraryJob, queueLibrarySyncJob, queueMagnetJob, queueReleaseJob, rebuildSubscriptionProgress, refreshSettings, reportIntegrationStatus, reportRuntimeMetrics, reportWorkerHeartbeat, setRuntimeSettings, setSetting, type DatabaseClient, type IntegrationService, type Subscription } from './db.js';
 import { assertQbittorrentConfig, getQbittorrentTorrentStates, normalizeQbittorrentUrl, testQbittorrentConnection, torrentHashFromMagnet } from './qbittorrent.js';
 import { assertJellyfinConfig, listJellyfinLibraries, normalizeJellyfinUrl, testJellyfinConnection } from './jellyfin.js';
 import { startRuntimeMemoryReporter } from './runtime-observability.js';
 import { clearJellyfinMediaIndex } from './jellyfin-cache.js';
 import { authenticate, clearSessionCookie, configurePassword, createSession, sessionCookie, statusFor, validatePassword } from './auth.js';
-import { getInspectionRules, inspectionRulesJson, normalizeInspectionRules } from './inspection-rules.js';
+import { defaultInspectionRules, getInspectionRules, inspectionRulesJson, normalizeInspectionRules, normalizeSiteUrl } from './inspection-rules.js';
 import { ExecutionEngineController } from './engine-controller.js';
 import { EngineWakeScheduler } from './engine-wake-scheduler.js';
 import { createTestNotification, deliverNotification, getNotificationSettings, normalizeNotificationSettings, publicNotificationSettings, saveNotificationSettings, type NotificationSettingsPayload } from './notifications.js';
@@ -327,6 +327,9 @@ app.addHook('onRequest', async (request, reply) => {
 
 type SubscriptionPayload = {
   name: string;
+  ruleFamily?: 'missav' | 'legacy_custom';
+  presetId?: number | null;
+  renderModeOverride?: 'static' | 'dynamic' | null;
   url: string;
   selector: string;
   renderMode?: 'static' | 'dynamic';
@@ -350,7 +353,10 @@ type SubscriptionPayload = {
 };
 
 type SubscriptionPresetPayload = Omit<SubscriptionPayload, 'url'> & { description?: string };
-type MissavRulesPayload = { presetId?: number; preset?: SubscriptionPresetPayload; inspectionRules?: unknown };
+/** 列表读取规则的一次提交：带已有 id 的更新，没有 id 的新建。 */
+type PresetListRow = SubscriptionPresetPayload & { id?: number | null };
+type MissavRulesPayload = { presetId?: number; preset?: SubscriptionPresetPayload; presets?: PresetListRow[]; sites?: unknown; inspectionRules?: unknown };
+type MissavPresetListPayload = { presets?: PresetListRow[]; sites?: unknown; inspectionRules?: unknown };
 type QbittorrentSettingsPayload = {
   enabled?: boolean;
   url?: string;
@@ -388,6 +394,45 @@ function normalizePaginationPayload(payload: Pick<SubscriptionPayload, 'paginati
     try { new RegExp(matchPattern, 'i'); } catch { throw new Error('分页页数匹配规则不是有效的正则表达式。'); }
   }
   return { paginationSelector: selector, paginationParameter: parameter, paginationMatchPattern: matchPattern };
+}
+
+/** 一次保存整组列表读取规则：已存在的更新，没有 id 的新建，未提交的删除。 */
+async function updatePresetList(tx: Pick<DatabaseClient, 'run' | 'get'>, rows: PresetListRow[], now: string) {
+  const keptIds: number[] = [];
+  for (const row of rows) {
+    const values = normalizePresetPayload(row as unknown as SubscriptionPresetPayload);
+    const id = Number(row.id);
+    if (Number.isInteger(id) && id > 0) {
+      if (!await tx.get('SELECT id FROM subscription_presets WHERE id=?', [id])) throw new Error('读取规则已被删除，请刷新页面后重试。');
+      await tx.run(`UPDATE subscription_presets SET name=?, description=?, selector=?, render_mode=?, content_source=?, attribute_name=?, match_pattern=?, title_selector=?, title_content_source=?, title_attribute_name=?, title_match_pattern=?, result_mode=?, interval_minutes=?, pagination_selector=?, pagination_parameter=?, pagination_match_pattern=?, is_active=?, updated_at=? WHERE id=?`,
+        [values.name, values.description, values.selector, values.renderMode, values.contentSource, values.attributeName, values.matchPattern, values.titleSelector, values.titleContentSource, values.titleAttributeName, values.titleMatchPattern, values.resultMode, values.interval, values.paginationSelector, values.paginationParameter, values.paginationMatchPattern, values.isActive, now, id]);
+      keptIds.push(id); continue;
+    }
+    const inserted = await tx.run(`INSERT INTO subscription_presets (name, description, selector, render_mode, content_source, attribute_name, match_pattern, title_selector, title_content_source, title_attribute_name, title_match_pattern, result_mode, interval_minutes, pagination_selector, pagination_parameter, pagination_match_pattern, is_active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [values.name, values.description, values.selector, values.renderMode, values.contentSource, values.attributeName, values.matchPattern, values.titleSelector, values.titleContentSource, values.titleAttributeName, values.titleMatchPattern, values.resultMode, values.interval, values.paginationSelector, values.paginationParameter, values.paginationMatchPattern, values.isActive, now, now]);
+    keptIds.push(inserted.lastInsertRowid);
+  }
+  if (keptIds.length) await tx.run(`DELETE FROM subscription_presets WHERE id NOT IN (${keptIds.map(() => '?').join(', ')})`, keptIds);
+  else await tx.run('DELETE FROM subscription_presets');
+  return keptIds;
+}
+
+function simplifiedPreset(row: PresetListRow): PresetListRow {
+  return { name: row.name, description: row.description, renderMode: row.renderMode, selector: 'a.text-secondary[alt]', contentSource: 'attribute', attributeName: 'alt', matchPattern: '', titleSelector: 'a.text-secondary[alt]', titleContentSource: 'text', titleAttributeName: '', titleMatchPattern: '^[A-Za-z]+-\\d+\\s*(.+)$', resultMode: 'all', intervalMinutes: 60, paginationSelector: '#price-currency', paginationParameter: 'page', paginationMatchPattern: '/\\s*(\\d+)', isActive: true, id: row.id };
+}
+
+async function resolveMissavPayload(payload: SubscriptionPayload): Promise<{ values: Awaited<ReturnType<typeof normalizePayload>>; family: 'missav' | 'legacy_custom'; presetId: number | null; override: 'static' | 'dynamic' | null }> {
+  if (payload.ruleFamily !== 'missav') return { values: await normalizePayload(payload), family: 'legacy_custom', presetId: null, override: null };
+  const host = new URL((await assertSafeUrl(payload.url)).toString()).hostname.toLowerCase();
+  const missavHosts = [...defaultInspectionRules.sites, ...getInspectionRules().sites].map((site) => new URL(site).hostname.toLowerCase());
+  if (!missavHosts.includes(host)) throw new Error('MissAV 读取规则只适用于已配置的 MissAV 站点。');
+  const presetId = Number(payload.presetId);
+  const preset = await db.get<Subscription>(`SELECT * FROM subscription_presets WHERE id=?`, [presetId]);
+  if (!preset) throw new Error('请选择有效的 MissAV 读取规则。');
+  const override = payload.renderModeOverride === 'static' || payload.renderModeOverride === 'dynamic' ? payload.renderModeOverride : null;
+  const values = await normalizePayload({ ...payload, selector: preset.selector, renderMode: override ?? preset.render_mode, contentSource: preset.content_source, attributeName: preset.attribute_name ?? '', matchPattern: preset.match_pattern ?? '', titleSelector: preset.title_selector ?? '', titleContentSource: preset.title_content_source, titleAttributeName: preset.title_attribute_name ?? '', titleMatchPattern: preset.title_match_pattern ?? '', resultMode: preset.result_mode, paginationSelector: preset.pagination_selector ?? '', paginationParameter: preset.pagination_parameter, paginationMatchPattern: preset.pagination_match_pattern ?? '' });
+  return { values, family: 'missav', presetId, override };
 }
 
 function normalizePresetPayload(payload: SubscriptionPresetPayload) {
@@ -472,6 +517,7 @@ async function normalizePayload(payload: SubscriptionPayload) {
 
 async function listSubscriptions() {
   return db.all(`SELECT s.*,
+    rule.name AS preset_name,
     COALESCE(p.archive_total, 0) AS archive_count,
     COALESCE(p.jellyfin_available, 0) AS jellyfin_available_count,
     JSON_OBJECT(
@@ -487,7 +533,10 @@ async function listSubscriptions() {
         AND (s.initial_scan_run_id IS NOT NULL OR EXISTS(SELECT 1 FROM jobs j WHERE j.subscription_id = s.id AND j.status IN ('queued', 'running')))
       THEN 1 ELSE NULL
     END AS full_scan_active
-    FROM subscriptions s LEFT JOIN subscription_progress p ON p.subscription_id = s.id ORDER BY s.id ASC`);
+    FROM subscriptions s
+    LEFT JOIN subscription_presets rule ON rule.id = s.preset_id
+    LEFT JOIN subscription_progress p ON p.subscription_id = s.id
+    ORDER BY s.id ASC`);
 }
 
 app.get('/api/health', async () => ({ ok: true }));
@@ -1010,13 +1059,68 @@ app.put('/api/inspection-rules', async (request, reply) => {
     return rules;
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '检查规则无法保存。' }); }
 });
+/**
+ * 「检查规则」页面把列表读取规则、站点和归档补全放在一起编辑，因此这里提供
+ * 一次性保存全部内容的入口：预设列表整体替换，站点与补全规则同时更新。
+ */
+app.put('/api/rules/missav/presets', async (request, reply) => {
+  try {
+    const payload = request.body as MissavPresetListPayload;
+    const rows = Array.isArray(payload.presets) ? payload.presets : [];
+    if (!rows.length) throw new Error('请至少保留一组列表读取规则。');
+    if (new Set(rows.map((row) => row.name?.trim())).size !== rows.length) throw new Error('每组读取规则需要不同的名称。');
+    const incoming = payload.inspectionRules as Partial<typeof defaultInspectionRules> | undefined;
+    if (!Array.isArray(payload.sites) || !payload.sites.length || payload.sites.some((site) => typeof site !== 'string' || !normalizeSiteUrl(site))) throw new Error('请填写至少一个完整的读取站点地址。');
+    if (!Array.isArray(incoming?.magnet?.origins) || !incoming.magnet.origins.length) throw new Error('请至少填写一个磁力检索节点。');
+    for (const interval of [incoming?.releaseDate?.requestIntervalMs, incoming?.magnet?.requestIntervalMs]) {
+      if (!Number.isInteger(interval) || Number(interval) < 250 || Number(interval) > 60000) throw new Error('访问间隔需在 250 到 60000 毫秒之间。');
+    }
+    const rules = normalizeInspectionRules({
+      sites: payload.sites,
+      releaseDate: { ...defaultInspectionRules.releaseDate, renderMode: incoming?.releaseDate?.renderMode, requestIntervalMs: incoming?.releaseDate?.requestIntervalMs, enabled: true },
+      magnet: { ...defaultInspectionRules.magnet, origins: incoming?.magnet?.origins, filenamePrefix: incoming?.magnet?.filenamePrefix, fallbackFilenamePrefixes: incoming?.magnet?.fallbackFilenamePrefixes, requestIntervalMs: incoming?.magnet?.requestIntervalMs, enabled: true }
+    });
+    // 先校验全部内容，再写库，避免出现只保存了一半的规则。
+    const now = new Date().toISOString();
+    await db.transaction(async (tx) => {
+      const keptIds = await updatePresetList(tx, rows.map(simplifiedPreset), now);
+      await tx.run(`UPDATE subscriptions SET preset_id=? WHERE rule_family='missav' AND (preset_id IS NULL OR preset_id NOT IN (${keptIds.map(() => '?').join(',')}))`, [keptIds[0], ...keptIds]);
+      await tx.run(`UPDATE subscriptions s JOIN subscription_presets p ON p.id=s.preset_id
+        SET s.initial_scan_completed=0, s.initial_scan_total=NULL, s.initial_scan_pages_completed=0, s.initial_scan_next_page=1
+        WHERE s.rule_family='missav' AND s.pagination_selector IS NULL AND p.pagination_selector IS NOT NULL AND s.initial_scan_run_id IS NULL`);
+      await tx.run(`UPDATE subscriptions s JOIN subscription_presets p ON p.id=s.preset_id SET
+        s.selector=p.selector, s.render_mode=COALESCE(s.render_mode_override,p.render_mode), s.content_source=p.content_source,
+        s.attribute_name=p.attribute_name, s.match_pattern=p.match_pattern, s.title_selector=p.title_selector,
+        s.title_content_source=p.title_content_source, s.title_attribute_name=p.title_attribute_name,
+        s.title_match_pattern=p.title_match_pattern, s.result_mode=p.result_mode, s.pagination_selector=p.pagination_selector,
+        s.pagination_parameter=p.pagination_parameter, s.pagination_match_pattern=p.pagination_match_pattern, s.updated_at=?
+        WHERE s.rule_family='missav'`, [now]);
+      await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES ('inspection_rules', ?, ?)
+        ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`, [inspectionRulesJson(rules), now]);
+      if (!rules.releaseDate.enabled) {
+        await tx.run("UPDATE release_jobs SET status = 'completed', finished_at = ?, error = '发行日期规则已停用' WHERE status = 'queued'", [now]);
+        await tx.run("UPDATE archive_entries SET release_status = 'unsearched', release_error = NULL, updated_at = ? WHERE release_status = 'pending'", [now]);
+      }
+      if (!rules.magnet.enabled) {
+        await tx.run("UPDATE magnet_jobs SET status = 'completed', finished_at = ?, error = '磁力检索规则已停用' WHERE status = 'queued'", [now]);
+        await tx.run("UPDATE archive_entries SET magnet_status = 'unsearched', magnet_error = NULL, updated_at = ? WHERE magnet_status = 'pending'", [now]);
+      }
+    });
+    await refreshSettings(true);
+    await appendRuntimeLog({ level: 'success', source: 'system', message: '检查规则已更新；后续归档会按新规则执行。' });
+    return { presets: await db.all('SELECT * FROM subscription_presets ORDER BY id ASC'), inspectionRules: rules };
+  } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '检查规则无法保存。' }); }
+});
+
 app.put('/api/rules/missav', async (request, reply) => {
   try {
     const payload = request.body as MissavRulesPayload;
     // Validate both documents before opening the write transaction. This keeps
     // malformed companion rules from ever partially updating the preset.
     const preset = normalizePresetPayload(payload.preset ?? {} as SubscriptionPresetPayload);
-    const rules = normalizeInspectionRules(payload.inspectionRules);
+    // 界面把站点列表放在「检查规则」顶部，保存时与预设、补全规则一起提交，
+    // 因此这里合并成同一份文档后再统一校验与写入。
+    const rules = normalizeInspectionRules({ ...(payload.inspectionRules ?? {} as Record<string, unknown>), sites: payload.sites });
     const requestedId = Number(payload.presetId);
     const now = new Date().toISOString();
     const presetId = await db.transaction(async (tx) => {
@@ -1173,12 +1277,14 @@ app.post('/api/code-search/subscribe', async (request, reply) => {
       } catch { return false; }
     });
     let presetValues: Awaited<ReturnType<typeof normalizePayload>> | null = null;
+    let presetIdForNewSubscription: number | null = null;
     if (!duplicate) {
       const preset = await db.get<{
+        id: number;
         selector: string; render_mode: string; content_source: string; attribute_name: string | null; match_pattern: string | null;
         title_selector: string | null; title_content_source: string; title_attribute_name: string | null; title_match_pattern: string | null;
         result_mode: string; interval_minutes: number; pagination_selector: string | null; pagination_parameter: string; pagination_match_pattern: string | null;
-      }>("SELECT selector, render_mode, content_source, attribute_name, match_pattern, title_selector, title_content_source, title_attribute_name, title_match_pattern, result_mode, interval_minutes, pagination_selector, pagination_parameter, pagination_match_pattern FROM subscription_presets WHERE name = 'MissAV 番号列表' ORDER BY updated_at DESC, id DESC LIMIT 1");
+      }>("SELECT id, selector, render_mode, content_source, attribute_name, match_pattern, title_selector, title_content_source, title_attribute_name, title_match_pattern, result_mode, interval_minutes, pagination_selector, pagination_parameter, pagination_match_pattern FROM subscription_presets ORDER BY CASE WHEN name='MissAV 番号列表' THEN 0 ELSE 1 END, id ASC LIMIT 1");
       if (!preset) return reply.code(409).send({ error: '找不到“MissAV 番号列表”预设，请在订阅规则中恢复该预设后重试。' });
       presetValues = await normalizePayload({
         name: actress.name, url: subscriptionUrl, selector: preset.selector,
@@ -1192,6 +1298,7 @@ app.post('/api/code-search/subscribe', async (request, reply) => {
         isActive: true, paginationSelector: preset.pagination_selector ?? '', paginationParameter: preset.pagination_parameter ?? 'page',
         paginationMatchPattern: preset.pagination_match_pattern ?? ''
       });
+      presetIdForNewSubscription = preset.id;
     }
 
     let fullScanBatchId: string | null = null;
@@ -1210,9 +1317,9 @@ app.post('/api/code-search/subscribe', async (request, reply) => {
       let created = false;
       if (!subscriptionId && presetValues) {
         const inserted = await tx.run(`INSERT INTO subscriptions
-          (name, url, selector, render_mode, content_source, attribute_name, match_pattern, title_selector, title_content_source, title_attribute_name, title_match_pattern, result_mode, interval_minutes, schedule_type, schedule_interval_hours, schedule_time, schedule_weekday, is_active, pagination_selector, pagination_parameter, pagination_match_pattern, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [actress.name, subscriptionUrl, presetValues.selector, presetValues.renderMode, presetValues.contentSource, presetValues.attributeName, presetValues.matchPattern, presetValues.titleSelector, presetValues.titleContentSource, presetValues.titleAttributeName, presetValues.titleMatchPattern, presetValues.resultMode, presetValues.interval, presetValues.scheduleType, presetValues.scheduleIntervalHours, presetValues.scheduleTime, presetValues.scheduleWeekday, presetValues.isActive, presetValues.paginationSelector, presetValues.paginationParameter, presetValues.paginationMatchPattern, now, now]);
+          (name, url, selector, render_mode, content_source, attribute_name, match_pattern, title_selector, title_content_source, title_attribute_name, title_match_pattern, result_mode, interval_minutes, schedule_type, schedule_interval_hours, schedule_time, schedule_weekday, is_active, pagination_selector, pagination_parameter, pagination_match_pattern, rule_family, preset_id, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [actress.name, subscriptionUrl, presetValues.selector, presetValues.renderMode, presetValues.contentSource, presetValues.attributeName, presetValues.matchPattern, presetValues.titleSelector, presetValues.titleContentSource, presetValues.titleAttributeName, presetValues.titleMatchPattern, presetValues.resultMode, presetValues.interval, presetValues.scheduleType, presetValues.scheduleIntervalHours, presetValues.scheduleTime, presetValues.scheduleWeekday, presetValues.isActive, presetValues.paginationSelector, presetValues.paginationParameter, presetValues.paginationMatchPattern, 'missav', presetIdForNewSubscription, now, now]);
         subscriptionId = inserted.lastInsertRowid;
         created = true;
       }
@@ -1307,6 +1414,7 @@ app.post('/api/subscriptions/:id/magnet-backfill', async (request, reply) => {
   const id = Number((request.params as { id: string }).id);
   const subscription = await getSubscription(id);
   if (!subscription) return reply.code(404).send({ error: '订阅不存在。' });
+  if (subscription.rule_family !== 'missav') return reply.code(400).send({ error: '此订阅不使用 MissAV 磁力规则。' });
   if (!getInspectionRules().magnet.enabled) return reply.code(400).send({ error: '磁力检索规则当前已停用，请先在“检查规则”中启用。' });
   const candidates = await db.all<{ id: number }>(`SELECT id FROM archive_entries
     WHERE subscription_id = ? AND magnet_status IN ('unsearched', 'failed', 'skipped') ORDER BY id ASC`, [id]);
@@ -1328,6 +1436,7 @@ app.post('/api/subscriptions/:id/release-backfill', async (request, reply) => {
   const id = Number((request.params as { id: string }).id);
   const subscription = await getSubscription(id);
   if (!subscription) return reply.code(404).send({ error: '订阅不存在。' });
+  if (subscription.rule_family !== 'missav') return reply.code(400).send({ error: '此订阅不使用 MissAV 发行日期规则。' });
   if (!getInspectionRules().releaseDate.enabled) return reply.code(400).send({ error: '发行日期规则当前已停用，请先在“检查规则”中启用。' });
   const candidates = await db.all<{ id: number }>(`SELECT id FROM archive_entries
     WHERE subscription_id = ? AND release_status IN ('unsearched', 'unavailable', 'failed') ORDER BY id ASC`, [id]);
@@ -1348,9 +1457,10 @@ app.post('/api/subscriptions/:id/release-backfill', async (request, reply) => {
 
 app.post('/api/archive/:id/magnet-retry', async (request, reply) => {
   const id = Number((request.params as { id: string }).id);
-  const entry = await db.get<{ id: number; subscription_id: number; content: string; magnet_status: string; subscription_name: string }>(`SELECT a.id, a.subscription_id, a.content, a.magnet_status, s.name AS subscription_name
+  const entry = await db.get<{ id: number; subscription_id: number; content: string; magnet_status: string; subscription_name: string; rule_family: string }>(`SELECT a.id, a.subscription_id, a.content, a.magnet_status, s.name AS subscription_name, s.rule_family
     FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id WHERE a.id = ?`, [id]);
   if (!entry) return reply.code(404).send({ error: '归档内容不存在。' });
+  if (entry.rule_family !== 'missav') return reply.code(400).send({ error: '此档案不使用 MissAV 磁力规则。' });
   if (!getInspectionRules().magnet.enabled) return reply.code(400).send({ error: '磁力检索规则当前已停用，请先在“检查规则”中启用。' });
   if (entry.magnet_status === 'found') return reply.code(409).send({ error: '该内容已找到磁力链接，无需重试。' });
   if (entry.magnet_status === 'pending') return reply.code(409).send({ error: '该内容正在检索中。' });
@@ -1738,12 +1848,12 @@ app.put('/api/settings/preset-names', async (request, reply) => {
 
 app.post('/api/subscriptions', async (request, reply) => {
   try {
-    const values = await normalizePayload(request.body as SubscriptionPayload);
+    const { values, family, presetId, override } = await resolveMissavPayload(request.body as SubscriptionPayload);
     const now = new Date().toISOString();
     const result = await db.run(`INSERT INTO subscriptions
-      (name, url, selector, render_mode, content_source, attribute_name, match_pattern, title_selector, title_content_source, title_attribute_name, title_match_pattern, result_mode, interval_minutes, schedule_type, schedule_interval_hours, schedule_time, schedule_weekday, is_active, pagination_selector, pagination_parameter, pagination_match_pattern, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [values.name, values.url, values.selector, values.renderMode, values.contentSource, values.attributeName, values.matchPattern, values.titleSelector, values.titleContentSource, values.titleAttributeName, values.titleMatchPattern, values.resultMode, values.interval, values.scheduleType, values.scheduleIntervalHours, values.scheduleTime, values.scheduleWeekday, values.isActive, values.paginationSelector, values.paginationParameter, values.paginationMatchPattern, now, now]);
+      (name, url, selector, render_mode, content_source, attribute_name, match_pattern, title_selector, title_content_source, title_attribute_name, title_match_pattern, result_mode, interval_minutes, schedule_type, schedule_interval_hours, schedule_time, schedule_weekday, is_active, pagination_selector, pagination_parameter, pagination_match_pattern, rule_family, preset_id, render_mode_override, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [values.name, values.url, values.selector, values.renderMode, values.contentSource, values.attributeName, values.matchPattern, values.titleSelector, values.titleContentSource, values.titleAttributeName, values.titleMatchPattern, values.resultMode, values.interval, values.scheduleType, values.scheduleIntervalHours, values.scheduleTime, values.scheduleWeekday, values.isActive, values.paginationSelector, values.paginationParameter, values.paginationMatchPattern, family, presetId, override, now, now]);
     await rebuildSubscriptionProgress(result.lastInsertRowid);
     return reply.code(201).send(await getSubscription(result.lastInsertRowid));
   } catch (error) {
@@ -1756,11 +1866,12 @@ app.put('/api/subscriptions/:id', async (request, reply) => {
   const current = await getSubscription(id);
   if (!current) return reply.code(404).send({ error: '订阅不存在。' });
   try {
-    const values = await normalizePayload(request.body as SubscriptionPayload);
+    const payload = request.body as SubscriptionPayload;
+    const { values, family, presetId, override } = await resolveMissavPayload({ ...payload, ruleFamily: payload.ruleFamily ?? current.rule_family, presetId: payload.presetId ?? current.preset_id, renderModeOverride: payload.renderModeOverride === undefined ? current.render_mode_override : payload.renderModeOverride });
     const scheduleChanged = current.schedule_type !== values.scheduleType || current.schedule_interval_hours !== values.scheduleIntervalHours
       || current.schedule_time !== values.scheduleTime || current.schedule_weekday !== values.scheduleWeekday || current.is_active !== values.isActive;
-    await db.run(`UPDATE subscriptions SET name=?, url=?, selector=?, render_mode=?, content_source=?, attribute_name=?, match_pattern=?, title_selector=?, title_content_source=?, title_attribute_name=?, title_match_pattern=?, result_mode=?, interval_minutes=?, schedule_type=?, schedule_interval_hours=?, schedule_time=?, schedule_weekday=?, is_active=?, pagination_selector=?, pagination_parameter=?, pagination_match_pattern=?, initial_scan_completed=CASE WHEN ? IS NULL THEN 1 WHEN pagination_selector IS NULL THEN 0 ELSE initial_scan_completed END, initial_scan_total=CASE WHEN ? IS NOT NULL AND pagination_selector IS NULL THEN NULL ELSE initial_scan_total END, initial_scan_pages_completed=CASE WHEN ? IS NOT NULL AND pagination_selector IS NULL THEN 0 ELSE initial_scan_pages_completed END, next_scheduled_at=CASE WHEN ? THEN NULL ELSE next_scheduled_at END, updated_at=? WHERE id=?`,
-      [values.name, values.url, values.selector, values.renderMode, values.contentSource, values.attributeName, values.matchPattern, values.titleSelector, values.titleContentSource, values.titleAttributeName, values.titleMatchPattern, values.resultMode, values.interval, values.scheduleType, values.scheduleIntervalHours, values.scheduleTime, values.scheduleWeekday, values.isActive, values.paginationSelector, values.paginationParameter, values.paginationMatchPattern, values.paginationSelector, values.paginationSelector, values.paginationSelector, scheduleChanged ? 1 : 0, new Date().toISOString(), id]);
+    await db.run(`UPDATE subscriptions SET name=?, url=?, selector=?, render_mode=?, content_source=?, attribute_name=?, match_pattern=?, title_selector=?, title_content_source=?, title_attribute_name=?, title_match_pattern=?, result_mode=?, interval_minutes=?, schedule_type=?, schedule_interval_hours=?, schedule_time=?, schedule_weekday=?, is_active=?, pagination_selector=?, pagination_parameter=?, pagination_match_pattern=?, rule_family=?, preset_id=?, render_mode_override=?, initial_scan_completed=CASE WHEN ? IS NULL THEN 1 WHEN pagination_selector IS NULL THEN 0 ELSE initial_scan_completed END, initial_scan_total=CASE WHEN ? IS NOT NULL AND pagination_selector IS NULL THEN NULL ELSE initial_scan_total END, initial_scan_pages_completed=CASE WHEN ? IS NOT NULL AND pagination_selector IS NULL THEN 0 ELSE initial_scan_pages_completed END, next_scheduled_at=CASE WHEN ? THEN NULL ELSE next_scheduled_at END, updated_at=? WHERE id=?`,
+      [values.name, values.url, values.selector, values.renderMode, values.contentSource, values.attributeName, values.matchPattern, values.titleSelector, values.titleContentSource, values.titleAttributeName, values.titleMatchPattern, values.resultMode, values.interval, values.scheduleType, values.scheduleIntervalHours, values.scheduleTime, values.scheduleWeekday, values.isActive, values.paginationSelector, values.paginationParameter, values.paginationMatchPattern, family, presetId, override, values.paginationSelector, values.paginationSelector, values.paginationSelector, scheduleChanged ? 1 : 0, new Date().toISOString(), id]);
     return await getSubscription(id);
   } catch (error) {
     return reply.code(400).send({ error: error instanceof Error ? error.message : '无法更新订阅。' });
@@ -1813,7 +1924,7 @@ app.delete('/api/subscriptions/:id/archive', async (request, reply) => {
 
 app.post('/api/subscriptions/preview', async (request, reply) => {
   try {
-    const values = await normalizePayload(request.body as SubscriptionPayload);
+    const { values, family } = await resolveMissavPayload(request.body as SubscriptionPayload);
     const token = process.env.WORKER_EVENT_TOKEN || (process.env.NODE_ENV === 'production' ? '' : 'page-watch-dev-runner');
     if (!token) throw new Error('统一执行引擎尚未就绪，请稍后重试。');
     await engineWakeScheduler.wake('规则预览');
@@ -1823,7 +1934,7 @@ app.post('/api/subscriptions/preview', async (request, reply) => {
       const response = await fetch(`http://127.0.0.1:${process.env.RUNNER_INTERNAL_PORT || '3031'}/preview`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-page-watch-worker-token': token },
-        body: JSON.stringify({ url: values.url, selector: values.selector, render_mode: values.renderMode as Subscription['render_mode'], content_source: values.contentSource as Subscription['content_source'], attribute_name: values.attributeName, match_pattern: values.matchPattern, title_selector: values.titleSelector, title_content_source: values.titleContentSource as Subscription['title_content_source'], title_attribute_name: values.titleAttributeName, title_match_pattern: values.titleMatchPattern, result_mode: values.resultMode as Subscription['result_mode'] }),
+        body: JSON.stringify({ url: values.url, selector: values.selector, render_mode: values.renderMode as Subscription['render_mode'], content_source: values.contentSource as Subscription['content_source'], attribute_name: values.attributeName, match_pattern: values.matchPattern, title_selector: values.titleSelector, title_content_source: values.titleContentSource as Subscription['title_content_source'], title_attribute_name: values.titleAttributeName, title_match_pattern: values.titleMatchPattern, result_mode: values.resultMode as Subscription['result_mode'], rule_family: family }),
         signal: controller.signal
       });
       const result = await response.json().catch(() => ({}));

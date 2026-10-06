@@ -34,8 +34,8 @@ async function queueLegacyReleaseLookups() {
   if (!rule.enabled) return;
   const entries = await db.all<LegacyEntry>(`SELECT a.id, a.subscription_id, a.content, a.detail_url, s.url AS subscription_url
     FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
-    WHERE a.release_status = 'unsearched'
-      OR (a.release_status = 'unavailable' AND a.release_error = ?)
+    WHERE s.rule_family = 'missav' AND (a.release_status = 'unsearched'
+      OR (a.release_status = 'unavailable' AND a.release_error = ?))
     ORDER BY a.id ASC LIMIT ?`, [PREVIOUS_DATE_PATTERN_RESULT, BACKFILL_BATCH_SIZE]);
   for (const entry of entries) {
     const detailUrl = expandReleaseUrl(rule.urlTemplate, { detailUrl: entry.detail_url, subscriptionUrl: entry.subscription_url, content: entry.content });
@@ -67,7 +67,7 @@ async function logProgress(subscriptionId: number) {
 
 async function runNextReleaseJob(): Promise<boolean> {
   if (isExecutionEngineDraining()) return false;
-  const job = await db.get<ReleaseJob>(`SELECT j.id, j.archive_entry_id, j.attempt_count, j.priority, a.subscription_id, a.content, a.detail_url, s.url AS subscription_url, s.name AS subscription_name, b.status AS full_scan_batch_status
+  const job = await db.get<ReleaseJob & { rule_family: string }>(`SELECT j.id, j.archive_entry_id, j.attempt_count, j.priority, a.subscription_id, a.content, a.detail_url, s.url AS subscription_url, s.name AS subscription_name, s.rule_family, b.status AS full_scan_batch_status
     FROM release_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id
     LEFT JOIN full_scan_batches b ON b.id = a.full_scan_batch_id
     WHERE j.status = 'queued' AND (j.retry_after IS NULL OR j.retry_after <= ?) ORDER BY j.priority DESC, j.requested_at ASC, j.id ASC LIMIT 1`, [new Date().toISOString()]);
@@ -81,7 +81,7 @@ async function runNextReleaseJob(): Promise<boolean> {
 
   try {
     const rule = getInspectionRules().releaseDate;
-    if (!rule.enabled) {
+    if (!rule.enabled || job.rule_family !== 'missav') {
       const finishedAt = new Date().toISOString();
       await db.transaction(async (tx) => {
         await tx.run("UPDATE archive_entries SET release_status = 'unsearched', release_error = NULL, updated_at = ? WHERE id = ?", [finishedAt, job.archive_entry_id]);

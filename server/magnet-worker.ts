@@ -37,7 +37,7 @@ async function logProgress(subscriptionId: number) {
 
 async function runNextMagnetJob() {
   if (isExecutionEngineDraining()) return;
-  const job = await db.get<MagnetJob>(`SELECT j.id, j.archive_entry_id, j.attempt_count, a.subscription_id, a.content, a.auto_download_suppressed, s.name AS subscription_name, b.status AS full_scan_batch_status
+  const job = await db.get<MagnetJob & { rule_family: string }>(`SELECT j.id, j.archive_entry_id, j.attempt_count, a.subscription_id, a.content, a.auto_download_suppressed, s.name AS subscription_name, s.rule_family, b.status AS full_scan_batch_status
     FROM magnet_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id
     LEFT JOIN full_scan_batches b ON b.id = a.full_scan_batch_id
     WHERE j.status = 'queued' AND (j.retry_after IS NULL OR j.retry_after <= ?) ORDER BY j.priority DESC, j.requested_at ASC, j.id ASC LIMIT 1`, [new Date().toISOString()]);
@@ -52,7 +52,7 @@ async function runNextMagnetJob() {
 
   try {
     const rule = getInspectionRules().magnet;
-    if (!rule.enabled) {
+    if (!rule.enabled || job.rule_family !== 'missav') {
       const finishedAt = new Date().toISOString();
       await db.transaction(async (tx) => {
         await tx.run("UPDATE archive_entries SET magnet_status = 'unsearched', magnet_error = NULL, updated_at = ? WHERE id = ?", [finishedAt, job.archive_entry_id]);

@@ -261,7 +261,7 @@ body { background: #f8fafc; }
 .rules-library-head { align-items: flex-end; margin-bottom: 0; }.rules-library-head .eyebrow { margin-bottom: 5px; }.rules-library-head > div { max-width: 640px; }.rules-library-head .secondary { flex: 0 0 auto; min-height: 40px; padding: 0 14px; border-radius: 9px; }
 .rules-library-content { margin-top: 22px; }.rules-library-workbench { padding: 21px; border: 1px solid #e2e8f0; border-radius: 12px; background: #ffffff; box-shadow: 0 8px 24px rgba(15, 23, 42, .04); }.rules-library-workbench > .rule-flow { margin: 0 0 24px; }.inspection-rules-page.embedded { max-width: none; margin-top: 28px; padding-top: 28px; border-top: 1px solid #e2e8f0; }.embedded-rule-toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; margin-bottom: 15px; }.embedded-rule-toolbar h3 { margin: 3px 0 4px; font-size: 1.05rem; }.embedded-rule-toolbar p { max-width: 590px; margin: 0; color: #64748b; font-size: .82rem; line-height: 1.55; }
 .subscription-preset-library { padding: 0; background: transparent; }.preset-library-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }.preset-library-head h3 { margin: 3px 0 4px; font-size: 1.04rem; }.preset-library-head p { max-width: 620px; margin: 0; color: #64748b; font-size: .82rem; line-height: 1.55; }.preset-library-head .secondary { flex: 0 0 auto; min-height: 38px; padding: 0 12px; border-radius: 8px; font-size: .78rem; font-weight: 700; }
-.preset-library-list { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 16px; }.preset-library-list > span { padding: 5px 9px; color: #1d4ed8; border: 1px solid #bfdbfe; border-radius: 999px; background: #eff6ff; font-size: .73rem; font-weight: 650; }.preset-library-list > .preset-library-empty { color: #64748b; border-color: #e2e8f0; background: #f8fafc; font-weight: 500; }.preset-library-loading { margin: 16px 0 0; color: #64748b; font-size: .78rem; }.rules-editor-content { margin-top: 18px; }.rules-editor-content .preset-manager { margin: 0; padding: 0 0 24px; border: 0; border-bottom: 1px solid #e2e8f0; border-radius: 0; background: transparent; }.rules-editor-content .preset-manager-actions, .rules-library-workbench .inspection-rule-actions { display: none; }.rules-editor-content .inspection-rules-page.embedded { margin-top: 24px; padding-top: 0; border-top: 0; }.rule-save-actions { display: flex; justify-content: flex-end; margin-top: 26px; padding-top: 20px; border-top: 1px solid #e2e8f0; }.rule-save-actions .primary { min-height: 42px; padding: 0 16px; border-radius: 9px; }
+.preset-library-list { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 16px; }.preset-library-list > span { padding: 5px 9px; color: #1d4ed8; border: 1px solid #bfdbfe; border-radius: 999px; background: #eff6ff; font-size: .73rem; font-weight: 650; }.preset-library-list > .preset-library-empty { color: #64748b; border-color: #e2e8f0; background: #f8fafc; font-weight: 500; }.preset-library-loading { margin: 16px 0 0; color: #64748b; font-size: .78rem; }.rules-editor-content { margin-top: 18px; }.rules-editor-content .preset-manager { margin: 0; padding: 0 0 24px; border: 0; border-bottom: 1px solid #e2e8f0; border-radius: 0; background: transparent; }.rules-editor-content .preset-manager-actions, .rules-library-workbench .inspection-rule-actions { display: none; }.rules-editor-content .inspection-rules-page.embedded { margin-top: 24px; padding-top: 0; border-top: 0; }
 @media (max-width: 680px) { .rules-library { margin-top: 32px; padding-top: 24px; }.rules-library-workbench { padding: 17px; }.rules-library-head, .embedded-rule-toolbar, .preset-library-head { display: block; }.rules-library-head .secondary, .embedded-rule-toolbar .inspection-rule-actions, .preset-library-head .secondary { margin-top: 14px; }.embedded-rule-toolbar .inspection-rule-actions { width: auto; justify-content: flex-start; } }
 @media (max-width: 480px) { .topbar { gap: 12px; }.topbar-actions { align-self: flex-end; gap: 6px; }.topbar-actions .secondary, .topbar-actions .primary { min-height: 39px; padding: 0 10px; }.rules-library-head .secondary, .preset-library-head .secondary { width: 100%; }.embedded-rule-toolbar .inspection-rule-actions { width: 100%; }.rules-library-workbench { padding: 15px; } }
 
@@ -363,6 +363,80 @@ body { background: #f8fafc; }
 .subscription-page-tabs button:hover:not(.active) { color: #1d4ed8; }
 .subscription-page-tabs + .summary { margin-top: 24px; }
 .rules-library.is-open { margin-top: 24px; padding-top: 0; border-top: 0; }
+
+/* 竖排流程：每一步一句人话，替代原先满屏花括号的横向流程。 */
+.rule-flow-vertical { display: grid; gap: 12px; margin: 0 0 22px; padding: 0; list-style: none; }
+.rule-flow-vertical li { position: relative; padding-left: 30px; }
+.rule-flow-vertical li::before { position: absolute; top: 5px; left: 5px; width: 10px; height: 10px; border: 2px solid #bfdbfe; border-radius: 50%; background: #ffffff; content: ''; }
+.rule-flow-vertical li::after { position: absolute; top: 19px; bottom: -13px; left: 9px; width: 2px; background: #e2e8f0; content: ''; }
+.rule-flow-vertical li:last-child::after { display: none; }
+.rule-flow-vertical li strong { display: block; color: #172033; font-size: .84rem; }
+.rule-flow-vertical li span { color: #64748b; font-size: .76rem; line-height: 1.5; }
+.rule-flow-vertical li.current::before { border-color: #2563eb; background: #2563eb; }
+
+/* 列表读取整块可折叠：收起时只显示一行标题与摘要。 */
+.rule-card-toggle { display: flex; align-items: center; justify-content: space-between; gap: 14px; width: 100%; padding: 0; text-align: left; border: 0; background: transparent; }
+.rule-card-copy strong { display: block; color: #172033; font-size: 1.04rem; }
+.rule-card-copy small { display: block; margin-top: 3px; color: #64748b; font-size: .82rem; }
+.rule-card-summary { flex: 0 0 auto; color: #64748b; font-size: .75rem; }
+.rule-card-caret { flex: 0 0 auto; min-width: 54px; color: #1d4ed8; text-align: right; font-size: .76rem; font-weight: 650; }
+.rule-card-body { margin-top: 18px; padding-top: 18px; border-top: 1px solid #e2e8f0; }
+
+/* 读取规则：一行一条，点“编辑”才在下面展开表单。 */
+.preset-rule-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border: 1px solid #e2e8f0; border-radius: 10px; background: #f8fafc; }
+.preset-rule-row + .preset-rule-row { margin-top: 9px; }
+.preset-rule-row.editing { border-color: #bfdbfe; background: #f8fbff; }
+.preset-rule-copy { min-width: 0; }
+.preset-rule-copy strong { display: block; color: #172033; font-size: .86rem; }
+.preset-rule-copy small { display: block; margin-top: 3px; color: #64748b; font-size: .73rem; line-height: 1.5; }
+.preset-rule-actions { display: flex; flex: 0 0 auto; gap: 7px; }
+.preset-rule-actions button { padding: 6px 11px; color: #1d4ed8; border: 1px solid #bfdbfe; border-radius: 8px; background: #eff6ff; font-size: .74rem; font-weight: 650; }
+.preset-rule-actions button:hover { background: #dbeafe; }
+.preset-rule-actions button.danger { color: #b91c1c; border-color: #fecaca; background: #fef2f2; }
+.preset-rule-actions button.danger:hover { background: #fee2e2; }
+.preset-rule-add { margin-top: 12px; padding: 9px 13px; color: #1d4ed8; border: 1px dashed #bfdbfe; border-radius: 9px; background: #f8fbff; font-size: .78rem; font-weight: 650; }
+.preset-rule-add:hover { background: #eff6ff; }
+
+/* 编辑表单与读取站点：一列到底，不再套小框。 */
+.preset-rule-editor, .site-rule-block { margin-top: 20px; padding-top: 20px; border-top: 1px solid #e2e8f0; }
+.preset-rule-editor h4, .site-rule-block h4 { margin: 0; color: #172033; font-size: .92rem; }
+.preset-rule-editor .rule-grid { margin-top: 16px; }
+.site-rule-note { margin: 5px 0 0; color: #64748b; font-size: .76rem; }
+
+@media (max-width: 680px) {
+  .preset-rule-row { display: block; }
+  .preset-rule-actions { margin-top: 10px; }
+  .rule-card-toggle { align-items: flex-start; }
+  .rule-card-summary { display: none; }
+}
+
+/* 高级设置默认收起：普通使用只需要看开关和流程。 */
+.rule-details-toggle { margin-top: 16px; padding: 9px 13px; color: #1d4ed8; border: 1px solid #bfdbfe; border-radius: 9px; background: #eff6ff; font-size: .78rem; font-weight: 650; }
+.rule-details-toggle:hover { background: #dbeafe; }
+.rule-details { margin-top: 16px; padding-top: 18px; border-top: 1px solid #e2e8f0; }
+.rule-details .rule-grid { margin-top: 0; }
+.rule-details .rule-grid .field-note { color: #64748b; font-size: .72rem; font-weight: 400; line-height: 1.5; }
+.rule-restore { margin-top: 18px; padding: 8px 12px; color: #64748b; border: 1px solid #e2e8f0; border-radius: 8px; background: #f8fafc; font-size: .76rem; font-weight: 600; }
+.rule-restore:hover { color: #b91c1c; border-color: #fecaca; background: #fef2f2; }
+
+/* 统一的保存条：改过东西才会亮起，并说明是哪些内容会一起保存。 */
+.rule-save-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin-top: 26px; padding-top: 20px; border-top: 1px solid #e2e8f0; }
+.rule-unsaved { margin-right: auto; color: #b45309; font-size: .76rem; font-weight: 650; }
+.rule-save-actions .primary { min-height: 42px; padding: 0 16px; border-radius: 9px; }
+.rule-save-actions .secondary { min-height: 42px; padding: 0 14px; border-radius: 9px; }
+
+/* 站点列表放在检查规则最上面：番号、标题、发行日期和女优页都按这里的顺序读取。 */
+.site-rule-list { display: grid; gap: 10px; margin-top: 18px; }
+.site-rule-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 9px; }
+.site-rule-order { display: grid; place-items: center; width: 26px; height: 26px; color: #1d4ed8; border-radius: 8px; background: #eff6ff; font: .74rem 'DM Mono', ui-monospace, monospace; font-weight: 700; }
+.site-rule-row input { box-sizing: border-box; width: 100%; min-height: 42px; padding: 0 12px; color: #172033; border: 1px solid #cbd5e1; border-radius: 9px; background: #ffffff; font: inherit; }
+.site-rule-row input:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59, 130, 246, .14); }
+.site-rule-remove { width: 28px; height: 28px; padding: 0; color: #b91c1c; border: 0; border-radius: 8px; background: #fef2f2; font-size: .95rem; line-height: 1; }
+.site-rule-remove:hover { background: #fee2e2; }
+.site-rule-error { grid-column: 2 / -1; color: #b91c1c; font-size: .72rem; }
+.site-rule-add { margin-top: 12px; padding: 9px 13px; color: #1d4ed8; border: 1px solid #bfdbfe; border-radius: 9px; background: #eff6ff; font-size: .78rem; font-weight: 650; }
+.site-rule-add:hover { background: #dbeafe; }
+@media (max-width: 560px) { .site-rule-row { grid-template-columns: auto minmax(0, 1fr) auto; }.site-rule-error { grid-column: 2 / -1; } }
 .rules-library-head > div > p:not(.eyebrow), .preset-library-head > div > p, .embedded-rule-toolbar > div > p { display: block; }
 .rules-library-head > div > p:not(.eyebrow) { color: #64748b; font-size: .83rem; line-height: 1.5; }
 .preset-library-list > button { padding: 5px 9px; color: #1d4ed8; border: 1px solid #bfdbfe; border-radius: 999px; background: #eff6ff; font-size: .73rem; font-weight: 650; }
@@ -382,6 +456,79 @@ body { background: #f8fafc; }
 .subscription-reading-fields > .rule-flow { margin: 18px 0; }
 .subscription-editor .rule-grid label { margin: 0; }
 .subscription-editor .rule-grid input, .subscription-editor .rule-grid select { margin-top: 7px; }
+
+/* 简化后的三块规则使用相同的留白、字段宽度和说明文字。 */
+.rules-library-head > div > p:not(.eyebrow),
+.simplified-rules .inspection-rule-card header > div > p,
+.simple-subscription-reading .subscription-reading-intro > p,
+.simplified-rules .field-note,
+.simple-subscription-reading .field-note { display: block; }
+.simplified-rules { margin-top: 16px; }
+.simplified-rules .rule-details { display: grid; }
+.simple-subscription-reading .rule-hint { display: block; margin-top: 16px; }
+.archive-subscription-card { position: relative; }
+.archive-subscription-card.has-new-count { padding-top: 23px; }
+.archive-new-count { position: absolute; top: 6px; right: 10px; z-index: 1; padding: 2px 7px; color: #ffffff; border-radius: 999px; background: #2563eb; font: 700 .68rem 'DM Mono', ui-monospace, monospace; line-height: 1.35; }
+.archive-rule-groups { display: grid; gap: 24px; }
+.archive-rule-group > h3 { margin: 0 0 12px; color: #172033; font-size: 1.02rem; }
+.archive-rule-group .archive-subscription-card { min-height: 72px; }
+.archive-rule-group .archive-card-copy { flex: 1; }
+.archive-rule-group .archive-card-copy strong { white-space: normal; }
+.archive-rule-group .archive-count { flex: 0 0 auto; margin-left: auto; }
+.archive-rule-group .archive-card-rich { display: grid; align-content: center; gap: 10px; min-height: 112px; padding: 15px 16px; }
+.archive-rule-group .archive-card-rich.has-new-count { padding-top: 29px; }
+.archive-card-top { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.archive-card-check { display: flex; align-items: center; gap: 7px; color: #64748b; font-size: .72rem; }
+.archive-card-check i { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #22c55e; }
+.archive-card-check.has-error { color: #b45309; }
+.archive-card-check.has-error i { background: #f59e0b; }
+.archive-scan-progress { display: grid; gap: 5px; }
+.archive-scan-progress > span { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.archive-scan-progress b { color: #1d4ed8; font-size: .7rem; font-weight: 650; }
+.archive-scan-progress small { color: #64748b; font-size: .68rem; }
+.archive-scan-progress > i { display: block; height: 4px; overflow: hidden; border-radius: 99px; background: #dbeafe; }
+.archive-scan-progress > i > em { display: block; height: 100%; border-radius: inherit; background: #3b82f6; transition: width .2s ease; }
+.subscription-rule-groups { display: grid; gap: 26px; }
+.subscription-rule-group > header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.subscription-rule-group > header h3 { margin: 0; color: #172033; font-size: 1rem; }
+.subscription-rule-group > header span { color: #64748b; font-size: .72rem; }
+.subscription-card { cursor: pointer; }
+.subscription-card .card-title h3 .card-archive-link { color: #172033; font: inherit; text-decoration: none; }
+.subscription-card .card-title h3 .card-archive-link:hover { color: #1d4ed8; text-decoration: underline; }
+.subscription-archive-count { display: flex; align-items: baseline; gap: 5px; margin-top: 11px; color: #475569; font-size: .74rem; }
+.subscription-archive-count b { color: #1d4ed8; font: 700 .84rem 'DM Mono', ui-monospace, monospace; }
+.subscription-archive-count small { margin-left: auto; color: #64748b; font-size: .68rem; }
+.subscription-new-count { flex: 0 0 auto; padding: 3px 7px; color: #ffffff; border-radius: 999px; background: #2563eb; font: 700 .68rem 'DM Mono', ui-monospace, monospace; line-height: 1.25; }
+.subscription-grid.compact .subscription-archive-count { margin-top: 8px; }
+.subscription-grid.compact .subscription-archive-count small { display: none; }
+.subscription-grid.compact .subscription-card .card-title h3 .card-archive-link { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subscription-rule-group .subscription-grid { margin-top: 0; }
+.subscription-detail-topbar { align-items: flex-start; }
+.subscription-detail-topbar .topbar-actions { flex-wrap: wrap; justify-content: flex-end; }
+.archive-detail-actions { align-items: flex-start; }
+.archive-detail-actions > div:first-child { min-width: 0; }
+.archive-detail-actions .archive-library-summary { margin-top: 4px; }
+.archive-detail .form-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.archive-route-state { margin-top: 26px; }
+.archive-route-state > div { display: flex; justify-content: center; gap: 10px; margin-top: 16px; }
+@media (max-width: 680px) {
+  .subscription-detail-topbar { display: grid; }
+  .subscription-detail-topbar .topbar-actions { justify-content: flex-start; }
+  .archive-detail-actions { display: grid; }
+  .archive-detail-actions .archive-actions { flex-wrap: wrap; }
+  .archive-detail .form-error { align-items: flex-start; flex-direction: column; }
+}
+@media (max-width: 480px) {
+  .subscription-rule-group > header { align-items: flex-start; }
+  .subscription-rule-group > header span { white-space: nowrap; }
+  .subscription-grid.compact .subscription-new-count { padding: 2px 5px; font-size: .62rem; }
+  .archive-route-state > div { flex-wrap: wrap; }
+}
+.subscription-reading-intro > p { display: block; }
+.subscription-switch em { white-space: nowrap; }
+@media (max-width: 680px) {
+  .simplified-rules .rule-details { grid-template-columns: 1fr; }
+}
 .subscription-editor .subscription-rule-section > header { margin: 0; }
 .subscription-editor .subscription-rule-section > header h4 { margin: 0 0 3px; }
 .subscription-editor .subscription-rule-section .toggle { margin: 0; }
@@ -415,6 +562,10 @@ body { background: #f8fafc; }
 .card-footer { margin-top: 9px; }
 .card-time-info { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .card-time-info > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-time-info .card-check-result { margin-left: auto; text-align: right; }
+.card-check-result.success { color: #15803d; }
+.card-check-result.failed { color: #b45309; }
+.card-check-result.pending { color: #64748b; }
 .card-footer-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 .card-footer-actions .card-actions { margin-left: 0; }
 .subscription-list-actions { display: flex; align-items: center; gap: 8px; }
@@ -433,7 +584,7 @@ body { background: #f8fafc; }
 .subscription-grid.compact .card-time-info { display: grid; grid-template-columns: minmax(0, 1fr) max-content; grid-row: 1; align-items: center; gap: 7px; white-space: nowrap; }
 .subscription-grid.compact .card-time-info > span { font-size: .65rem; }
 .subscription-grid.compact .card-schedule { text-align: left; }
-.subscription-grid.compact .card-last-checked { justify-self: end; text-align: right; }
+.subscription-grid.compact .card-time-info .card-check-result { justify-self: end; margin-left: 0; text-align: right; }
 .subscription-grid.compact .card-footer-actions { grid-column: 1; justify-content: space-between; gap: 6px; margin-left: 0; }
 .subscription-grid.compact .subscription-switch { margin-left: auto; }
 .subscription-grid.compact .scan-progress { grid-column: 1 / -1; min-width: 0; margin: 0; padding: 6px 8px; }

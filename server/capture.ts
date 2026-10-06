@@ -4,10 +4,11 @@ import { ProxyAgent } from 'undici';
 import { db, getJellyfinSettings, getOutboundProxyUrl, queueLibraryJob, queueMagnetJob, queueReleaseJob, recordPerformanceMetric, scheduleSubscriptionProgressRebuild, type DatabaseClient, type Subscription } from './db.js';
 import { browserPool } from './browser-pool.js';
 import { describeError } from './error-details.js';
-import { expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
+import { allowedSiteHosts, expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
 import { archiveKey } from './jellyfin-match.js';
 import { findArchiveCodeMatches, replaceArchiveCodes, type ArchiveCodeRow } from './archive-code-index.js';
-import { missavBackupUrl, missavFallbackFailure, shouldTryMissavBackup } from './site-fallback.js';
+import { missavFallbackFailure, shouldTryMissavBackup } from './site-fallback.js';
+import { orderedSiteUrls } from './site-list.js';
 import { assertSafeUrl as validateSafeUrl } from './url-safety.js';
 import { readResponseText } from './bounded-body.js';
 import { createContentDiscoveredNotification, enqueueNotification } from './notifications.js';
@@ -120,8 +121,9 @@ async function getStatic(url: URL, selector: string, contentSource: Subscription
       return getStatic(await assertSafeUrl(new URL(location, url).toString()), selector, contentSource, attributeName, matchPattern, resultMode, pageCountSelector, pageCountPattern, titleSelector, titleContentSource, titleAttributeName, titleMatchPattern);
     }
     if (!response.ok) {
-      if (response.status === 403 && /^(?:www\.)?missav123\.com$|^missav\.live$/i.test(url.hostname)) {
-        throw new Error('网页返回 HTTP 403：MissAV 拒绝直接 HTML 抓取。请在“编辑订阅”中改用“浏览器渲染”，或配置能访问该站点的代理。');
+      // 只有 HTML 抓取需要这段针对站点的提示；浏览器渲染不会拿到 403。
+      if (response.status === 403 && allowedSiteHosts(getInspectionRules().sites).has(url.hostname.toLowerCase())) {
+        throw new Error('网页返回 HTTP 403：该站点拒绝直接 HTML 抓取。请在“编辑订阅”中改用“浏览器渲染”，或配置能访问该站点的代理。');
       }
       throw new Error(`网页返回 HTTP ${response.status}`);
     }
@@ -176,6 +178,7 @@ function archiveItems(content: string) {
 
 async function archiveNewItems(subscription: Subscription, items: CapturedItem[], capturedAt: string, client: DatabaseClient, suppressAutoDownload = false, fullScanBatchId: string | null = null, existingState?: { archiveWasEmpty: boolean; previousItems: Set<string> }) {
   const rules = getInspectionRules();
+  const useMissavRules = subscription.rule_family === 'missav';
   const jellyfin = getJellyfinSettings();
   const currentItems = uniqueItems(items);
   const archivedCount = existingState ? undefined : await client.get<{ count: number }>('SELECT COUNT(*) AS count FROM archive_entries WHERE subscription_id = ?', [subscription.id]);
@@ -194,15 +197,15 @@ async function archiveNewItems(subscription: Subscription, items: CapturedItem[]
     const code = archiveKey(item.content);
     if (code && existingCodes.has(code)) continue;
     const detailUrl = item.detailUrl;
-    const releaseUrl = rules.releaseDate.enabled ? expandReleaseUrl(rules.releaseDate.urlTemplate, { detailUrl, subscriptionUrl: subscription.url, content: item.content }) : null;
-    const shouldCheckLibraryFirst = rules.magnet.enabled && jellyfin.enabled && jellyfin.libraryIds.length > 0 && jellyfin.skipMagnetWhenAvailable;
+    const releaseUrl = useMissavRules && rules.releaseDate.enabled ? expandReleaseUrl(rules.releaseDate.urlTemplate, { detailUrl, subscriptionUrl: subscription.url, content: item.content }) : null;
+    const shouldCheckLibraryFirst = useMissavRules && rules.magnet.enabled && jellyfin.enabled && jellyfin.libraryIds.length > 0 && jellyfin.skipMagnetWhenAvailable;
     const result = await client.run(`INSERT IGNORE INTO archive_entries
       (subscription_id, content, title, archive_code, content_hash, first_seen_at, detail_url, release_status, magnet_status, auto_download_suppressed, full_scan_batch_id, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [subscription.id, item.content, item.title, archiveKey(item.content), hash(item.content), capturedAt, detailUrl, releaseUrl ? 'pending' : 'unsearched', rules.magnet.enabled && !shouldCheckLibraryFirst ? 'pending' : 'unsearched', suppressAutoDownload ? 1 : 0, fullScanBatchId, capturedAt]);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [subscription.id, item.content, item.title, archiveKey(item.content), hash(item.content), capturedAt, detailUrl, releaseUrl ? 'pending' : 'unsearched', useMissavRules && rules.magnet.enabled && !shouldCheckLibraryFirst ? 'pending' : 'unsearched', suppressAutoDownload ? 1 : 0, fullScanBatchId, capturedAt]);
     if (result.changes) {
       insertedItems.push(item);
       insertedRows.push({ id: result.lastInsertRowid, subscription_id: subscription.id, content: item.content, title: item.title });
-      if (rules.magnet.enabled) {
+      if (useMissavRules && rules.magnet.enabled) {
         if (shouldCheckLibraryFirst) {
           await client.run(`UPDATE archive_entries SET jellyfin_status = 'pending', jellyfin_error = NULL, updated_at = ? WHERE id = ?`, [capturedAt, result.lastInsertRowid]);
           await queueLibraryJob(result.lastInsertRowid, client);
@@ -235,28 +238,41 @@ async function archiveNewItems(subscription: Subscription, items: CapturedItem[]
   return insertedItems;
 }
 
-async function captureWithFallback<T>(url: URL, read: (target: URL) => Promise<T>) {
-  try { return await read(url); }
-  catch (error) {
-    const backup = missavBackupUrl(url);
-    if (!backup || !shouldTryMissavBackup(error)) throw error;
-    try { return await read(await assertSafeUrl(backup.toString())); }
-    catch (backupError) { throw missavFallbackFailure(url, backup, error, backupError); }
+async function captureWithFallback<T>(sites: string[], url: URL, read: (target: URL) => Promise<T>) {
+  if (!sites.length) return read(url);
+  let firstError: unknown;
+  let lastError: unknown;
+  let firstTarget: URL | null = null;
+  let lastTarget: URL | null = null;
+  for (const candidate of orderedSiteUrls(url, sites)) {
+    const target = await assertSafeUrl(candidate.toString());
+    firstTarget ??= target;
+    try { return await read(target); }
+    catch (error) {
+      if (!firstError) firstError = error;
+      if (!shouldTryMissavBackup(error)) throw error;
+      lastError = error;
+      lastTarget = target;
+    }
   }
+  if (firstTarget && lastTarget && firstTarget !== lastTarget) throw missavFallbackFailure(firstTarget, lastTarget, firstError, lastError);
+  throw lastError;
 }
 
-export async function previewCapture(input: Pick<Subscription, 'url' | 'selector' | 'render_mode' | 'content_source' | 'attribute_name' | 'match_pattern' | 'title_selector' | 'title_content_source' | 'title_attribute_name' | 'title_match_pattern' | 'result_mode'>) {
+export async function previewCapture(input: Pick<Subscription, 'url' | 'selector' | 'render_mode' | 'content_source' | 'attribute_name' | 'match_pattern' | 'title_selector' | 'title_content_source' | 'title_attribute_name' | 'title_match_pattern' | 'result_mode'> & { rule_family?: Subscription['rule_family'] }) {
   const url = await assertSafeUrl(input.url);
   if (!input.selector.trim()) throw new Error('请填写 CSS 选择器。');
   if (input.content_source === 'attribute' && !input.attribute_name?.trim()) throw new Error('请填写要提取的属性名。');
-  return captureWithFallback(url, (target) => input.render_mode === 'dynamic'
+  const { sites } = getInspectionRules();
+  return captureWithFallback(input.rule_family === 'missav' ? sites : [], url, (target) => input.render_mode === 'dynamic'
     ? getDynamic(target, input.selector, input.content_source, input.attribute_name, input.match_pattern, input.result_mode, undefined, undefined, input.title_selector, input.title_content_source, input.title_attribute_name, input.title_match_pattern, 100)
     : getStatic(target, input.selector, input.content_source, input.attribute_name, input.match_pattern, input.result_mode, undefined, undefined, input.title_selector, input.title_content_source, input.title_attribute_name, input.title_match_pattern));
 }
 
 async function capturePage(subscription: Subscription, rawUrl: string, includePageCount = false, browserPriority = 0) {
   const url = await assertSafeUrl(rawUrl);
-  return captureWithFallback(url, (target) => subscription.render_mode === 'dynamic'
+  const { sites } = getInspectionRules();
+  return captureWithFallback(subscription.rule_family === 'missav' ? sites : [], url, (target) => subscription.render_mode === 'dynamic'
     ? getDynamic(target, subscription.selector, subscription.content_source, subscription.attribute_name, subscription.match_pattern, subscription.result_mode, includePageCount ? subscription.pagination_selector : null, subscription.pagination_match_pattern, subscription.title_selector, subscription.title_content_source, subscription.title_attribute_name, subscription.title_match_pattern, browserPriority)
     : getStatic(target, subscription.selector, subscription.content_source, subscription.attribute_name, subscription.match_pattern, subscription.result_mode, includePageCount ? subscription.pagination_selector : null, subscription.pagination_match_pattern, subscription.title_selector, subscription.title_content_source, subscription.title_attribute_name, subscription.title_match_pattern));
 }
@@ -276,9 +292,10 @@ export async function captureSubscription(subscription: Subscription, browserPri
   const now = new Date().toISOString();
   const stored = await db.transaction(async (tx) => {
     const write = await tx.run(`UPDATE subscriptions
-      SET last_checked_at = ?, last_hash = ?, last_content = ?, last_error = NULL, updated_at = ?
+      SET last_checked_at = ?, last_hash = ?, last_content = ?, last_error = NULL, last_scan_added_count = 0, updated_at = ?
       WHERE id = ? AND updated_at = ?`, [now, result.hash, result.content, now, subscription.id, subscription.updated_at]);
     const addedItems = write.changes ? await archiveNewItems(subscription, result.items, now, tx, !hadBaseline) : [];
+    if (write.changes) await tx.run('UPDATE subscriptions SET last_scan_added_count = ? WHERE id = ?', [addedItems.length, subscription.id]);
     if (write.changes && hadBaseline && addedItems.length) {
       await enqueueNotification(createContentDiscoveredNotification({ subscription, count: addedItems.length, items: addedItems, occurredAt: now }), tx);
     }
@@ -382,6 +399,7 @@ async function captureInitialFullScan(subscription: Subscription, browserPriorit
       const inserted = await archiveNewItems(subscription, batch.map((item) => ({ content: item.content, title: item.title, detailUrl: item.detail_url })), now, tx, !subscription.last_hash, scanId, existingState);
       addedCount += inserted.length;
     }
+    await tx.run('UPDATE subscriptions SET last_scan_added_count = ? WHERE id = ? AND initial_scan_run_id = ?', [addedCount, subscription.id, scanId]);
     if (!subscription.last_hash) {
       // A one-click subscription may have inserted and started enriching its
       // searched film before the first paginated scan began. Include it in
