@@ -879,6 +879,26 @@ app.get('/api/tasks', async (request, reply) => {
   return privateJson(request, reply, { ...overview, history: history.items });
 });
 app.get('/api/subscriptions', async (request, reply) => privateJson(request, reply, await listSubscriptions()));
+app.post('/api/subscriptions/:id/archive-seen', async (request, reply) => {
+  const id = Number((request.params as { id?: string }).id);
+  const body = request.body as { scanAt?: unknown; addedCount?: unknown };
+  const scanAt = typeof body?.scanAt === 'string' ? body.scanAt : '';
+  const addedCount = Number(body?.addedCount);
+  if (!Number.isSafeInteger(id) || id <= 0 || !scanAt || !Number.isSafeInteger(addedCount) || addedCount <= 0) {
+    return reply.code(400).send({ error: '档案查看记录无效。' });
+  }
+  const current = await db.get<{ last_checked_at: string | null; last_scan_added_count: number; last_scan_seen_at: string | null }>(
+    'SELECT last_checked_at, last_scan_added_count, last_scan_seen_at FROM subscriptions WHERE id = ?', [id]
+  );
+  if (!current) return reply.code(404).send({ error: '订阅不存在。' });
+  if (current.last_checked_at !== scanAt || Number(current.last_scan_added_count) !== addedCount) return privateJson(request, reply, { seen: false });
+  if (current.last_scan_seen_at === scanAt) return privateJson(request, reply, { seen: true });
+  const updated = await db.run(`UPDATE subscriptions SET last_scan_seen_at = ?
+    WHERE id = ? AND last_checked_at = ? AND last_scan_added_count = ?
+      AND (last_scan_seen_at IS NULL OR last_scan_seen_at <> ?)`, [scanAt, id, scanAt, addedCount, scanAt]);
+  if (updated.changes) emitLive('subscriptions');
+  return privateJson(request, reply, { seen: Boolean(updated.changes) });
+});
 
 type PerformanceSummaryRow = { scope: string; metric: string; dimension: string; sample_count: number; duration_ms: number };
 type ThroughputRow = { bucket_start: string; scope: string; sample_count: number };

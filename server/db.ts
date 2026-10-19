@@ -186,6 +186,7 @@ export type Subscription = {
   last_content: string | null;
   last_error: string | null;
   last_scan_added_count: number;
+  last_scan_seen_at: string | null;
   pagination_selector: string | null;
   pagination_parameter: string;
   pagination_match_pattern: string | null;

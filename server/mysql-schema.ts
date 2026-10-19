@@ -30,6 +30,7 @@ export async function ensureMySqlSchema(pool: Pool) {
     last_content MEDIUMTEXT NULL,
     last_error TEXT NULL,
     last_scan_added_count INT NOT NULL DEFAULT 0,
+    last_scan_seen_at VARCHAR(40) NULL,
     pagination_selector TEXT NULL,
     pagination_parameter VARCHAR(64) NOT NULL DEFAULT 'page',
     pagination_match_pattern VARCHAR(1024) NULL,
@@ -478,6 +479,7 @@ export async function ensureMySqlSchema(pool: Pool) {
   await addColumnIfMissing(pool, 'subscriptions', 'pagination_parameter', "VARCHAR(64) NOT NULL DEFAULT 'page'");
   await addColumnIfMissing(pool, 'subscriptions', 'pagination_match_pattern', 'VARCHAR(1024) NULL');
   await addColumnIfMissing(pool, 'subscriptions', 'last_scan_added_count', 'INT NOT NULL DEFAULT 0');
+  await addColumnIfMissing(pool, 'subscriptions', 'last_scan_seen_at', 'VARCHAR(40) NULL');
   await addColumnIfMissing(pool, 'subscriptions', 'rule_family', "VARCHAR(32) NOT NULL DEFAULT 'legacy_custom'");
   await addColumnIfMissing(pool, 'subscriptions', 'preset_id', 'INT NULL');
   await addColumnIfMissing(pool, 'subscriptions', 'render_mode_override', 'VARCHAR(16) NULL');

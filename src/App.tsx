@@ -29,6 +29,7 @@ type Subscription = {
   last_content: string | null;
   last_error: string | null;
   last_scan_added_count: number;
+  last_scan_seen_at: string | null;
   pagination_selector: string | null;
   pagination_parameter: string;
   pagination_match_pattern: string | null;
@@ -355,6 +356,15 @@ function isLegacyArchiveHash(hash: string) {
 
 type View = 'subscriptions' | 'search' | 'settings' | 'operations';
 
+function MainNavigation({ view, subscriptionCount, taskCount, onSubscriptionsClick, mobile = false }: { view: View; subscriptionCount: number; taskCount: number; onSubscriptionsClick: () => void; mobile?: boolean }) {
+  return <nav className={mobile ? 'mobile-nav' : 'sidebar-nav'} aria-label="主导航">
+    <a className={`nav-item ${view === 'subscriptions' ? 'active' : ''}`} href="#subscriptions" onClick={onSubscriptionsClick}><span aria-hidden="true">◉</span><span>订阅中心</span>{subscriptionCount > 0 && <b>{subscriptionCount}</b>}</a>
+    <a className={`nav-item ${view === 'search' ? 'active' : ''}`} href="#search"><span aria-hidden="true">⌕</span><span>番号检索</span></a>
+    <a className={`nav-item ${view === 'operations' ? 'active' : ''}`} href="#operations"><span aria-hidden="true">◫</span><span>运行中心</span>{taskCount > 0 && <b>{taskCount}</b>}</a>
+    <a className={`nav-item ${view === 'settings' ? 'active' : ''}`} href="#settings"><span aria-hidden="true">⚙</span><span>设置</span></a>
+  </nav>;
+}
+
 function viewFromHash(hash = window.location.hash): View {
   if (hash === '#logs' || hash === '#tasks' || hash === '#operations') return 'operations';
   if (hash === '#search') return 'search';
@@ -412,6 +422,7 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const [archiveInspectionRules, setArchiveInspectionRules] = useState<InspectionRules | null>(null);
   const [archiveJellyfinBaseUrl, setArchiveJellyfinBaseUrl] = useState('');
   const [archiveSettingsLoaded, setArchiveSettingsLoaded] = useState(false);
+  const archiveSeenRequestRef = useRef<string | null>(null);
   const [subscriptionLayout, setSubscriptionLayout] = useState<'list' | 'compact'>(() => {
     try { return window.localStorage.getItem('page-watch.subscription-layout') === 'compact' ? 'compact' : 'list'; }
     catch { return 'list'; }
@@ -516,6 +527,29 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
   const detailSubscription = detailSubscriptionId === null ? null : subscriptions.find((item) => item.id === detailSubscriptionId) ?? null;
   const showingSubscriptionDetail = view === 'subscriptions' && detailSubscriptionId !== null;
   const subscriptionGroups = subscriptionPage === 'list' && !showingSubscriptionDetail ? groupSubscriptions(subscriptions) : [];
+  function markArchiveSeen(item: Subscription) {
+    const scanAt = item.last_checked_at;
+    const addedCount = Number(item.last_scan_added_count);
+    if (!isActressSubscription(item) || !scanAt || addedCount <= 0 || item.last_scan_seen_at === scanAt) return;
+    const requestKey = `${item.id}:${scanAt}:${addedCount}`;
+    if (archiveSeenRequestRef.current === requestKey) return;
+    archiveSeenRequestRef.current = requestKey;
+    void request<{ seen: boolean }>(`/api/subscriptions/${item.id}/archive-seen`, {
+      method: 'POST',
+      body: JSON.stringify({ scanAt, addedCount })
+    }).then((result) => {
+      if (archiveSeenRequestRef.current === requestKey) archiveSeenRequestRef.current = null;
+      if (result.seen) {
+        setSubscriptions((current) => current.map((subscription) => subscription.id === item.id && subscription.last_checked_at === scanAt
+          ? { ...subscription, last_scan_seen_at: scanAt }
+          : subscription));
+      } else {
+        void load();
+      }
+    }).catch(() => {
+      if (archiveSeenRequestRef.current === requestKey) archiveSeenRequestRef.current = null;
+    });
+  }
   useEffect(() => {
     if (!showingSubscriptionDetail || archiveSettingsLoaded) return;
     let active = true;
@@ -623,18 +657,14 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
   return <main className="shell">
     <aside className="sidebar">
       <div className="brand"><span className="brand-mark">⌁</span><span>PAGE WATCH</span></div>
-      <nav aria-label="主导航">
-        <a className={`nav-item ${view === 'subscriptions' ? 'active' : ''}`} href="#subscriptions" onClick={() => setSubscriptionPage('list')}><span>◉</span> 订阅中心 <b>{stats.total}</b></a>
-        <a className={`nav-item ${view === 'search' ? 'active' : ''}`} href="#search"><span>⌕</span> 番号检索</a>
-        <a className={`nav-item ${view === 'operations' ? 'active' : ''}`} href="#operations"><span>◫</span> 运行中心 {taskCount ? <b>{taskCount}</b> : null}</a>
-        <a className={`nav-item ${view === 'settings' ? 'active' : ''}`} href="#settings"><span>⚙</span> 设置</a>
-      </nav>
+      <MainNavigation view={view} subscriptionCount={stats.total} taskCount={taskCount} onSubscriptionsClick={() => setSubscriptionPage('list')} />
       <div className={`sidebar-note ${servicesHealthy ? '' : 'needs-attention'}`} title={serviceAttention}>
         <span className="pulse" /> {servicesHealthy ? '后台服务运行正常' : systemStatus ? `服务需要注意（${attentionServices.length}）` : '正在确认服务状态…'}
         {servicesHealthy && systemStatus ? <a className="sidebar-task-link" href="#operations"><span>{systemStatus.services.length} 项服务在线</span><span>{taskCount} 项任务执行中</span></a> : <small>{serviceAttention || '正在读取服务状态…'}</small>}
         <button type="button" className="sign-out" onClick={() => void onLogout()}>退出登录</button>
       </div>
     </aside>
+    <MainNavigation mobile view={view} subscriptionCount={stats.total} taskCount={taskCount} onSubscriptionsClick={() => setSubscriptionPage('list')} />
 
     <section className="workspace">
       {showingSubscriptionDetail ? <header className="topbar subscription-detail-topbar">
@@ -648,7 +678,7 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
       {view === 'subscriptions' ? showingSubscriptionDetail ? loading && !detailSubscription
         ? <div className="empty archive-route-state">正在加载订阅…</div>
         : !detailSubscription ? <div className="empty-card archive-route-state"><h2>{subscriptionLoadError ? '暂时无法打开档案' : '这条订阅已不存在'}</h2><p>{subscriptionLoadError || '订阅可能已被删除，请返回列表重新选择。'}</p><div><button className="secondary" onClick={() => { setLoading(true); void load(); }}>重试</button><button className="primary" onClick={returnToSubscriptionList}>返回订阅列表</button></div></div>
-        : <ArchiveDetail key={detailSubscription.id} subscription={detailSubscription} inspectionRules={archiveInspectionRules} jellyfinBaseUrl={archiveJellyfinBaseUrl} onNotice={setNotice} />
+        : <ArchiveDetail key={detailSubscription.id} subscription={detailSubscription} inspectionRules={archiveInspectionRules} jellyfinBaseUrl={archiveJellyfinBaseUrl} onNotice={setNotice} onArchiveViewed={markArchiveSeen} />
         : <><nav className="subscription-page-tabs" aria-label="订阅中心页面"><button type="button" className={subscriptionPage === 'list' ? 'active' : ''} aria-current={subscriptionPage === 'list' ? 'page' : undefined} onClick={() => showSubscriptionPage('list')}>订阅列表</button><button type="button" className={subscriptionPage === 'rules' ? 'active' : ''} aria-current={subscriptionPage === 'rules' ? 'page' : undefined} onClick={() => showSubscriptionPage('rules')}>检查规则</button></nav>{subscriptionPage === 'list' ? <><section className="summary" aria-label="订阅概览">
         <div><span>全部订阅</span><strong>{stats.total}</strong></div>
         <div><span>正在监测</span><strong>{stats.active}</strong></div>
@@ -821,7 +851,7 @@ function Empty({ onCreate }: { onCreate: () => void }) {
 }
 
 function SubscriptionCard({ item, onOpenArchive, onRun, onEdit, onToggle }: { item: Subscription; onOpenArchive: (item: Subscription) => void; onRun: (item: Subscription) => void; onEdit: (item: Subscription) => void; onToggle: (item: Subscription) => void }) {
-  const showNewCount = isActressSubscription(item) && item.last_scan_added_count > 0;
+  const showNewCount = isActressSubscription(item) && item.last_scan_added_count > 0 && item.last_checked_at !== item.last_scan_seen_at;
   return <article className={`subscription-card ${item.last_error ? 'has-error' : ''}`} onClick={(event) => {
     const target = event.target;
     if (target instanceof Element && target.closest('a, button, input, select, textarea, [role="switch"]')) return;
@@ -1099,7 +1129,7 @@ function CodeSearchPage({ onNotice, onSubscriptionsChanged }: { onNotice: (messa
   </section>;
 }
 
-function ArchiveDetail({ subscription, inspectionRules, jellyfinBaseUrl, onNotice }: { subscription: Subscription; inspectionRules: InspectionRules | null; jellyfinBaseUrl: string; onNotice: (message: string) => void }) {
+function ArchiveDetail({ subscription, inspectionRules, jellyfinBaseUrl, onNotice, onArchiveViewed }: { subscription: Subscription; inspectionRules: InspectionRules | null; jellyfinBaseUrl: string; onNotice: (message: string) => void; onArchiveViewed: (subscription: Subscription) => void }) {
   const selected = subscription;
   const [entries, setEntries] = useState<ArchiveEntry[]>([]);
   const [archivePage, setArchivePage] = useState(1);
@@ -1143,6 +1173,7 @@ function ArchiveDetail({ subscription, inspectionRules, jellyfinBaseUrl, onNotic
       setArchiveTotal(result.total);
       setArchivePage(result.page);
       setError('');
+      onArchiveViewed(selected);
     }
     catch (reason) { if (requestVersion === archiveRequestVersion.current) setError(reason instanceof Error ? reason.message : '无法读取内容档案。'); }
     finally {
