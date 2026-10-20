@@ -6,3 +6,5 @@ data
 deploy/.env
 .npm-cache
 work
+# 本地 AI 协作记忆与工作产物，不进版本库
+.workbuddy
