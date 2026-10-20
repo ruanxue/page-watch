@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { db, getIntegrationStatuses, getJellyfinSettings, getQbittorrentSettings, getRuntimeMetrics, isDatabaseConfigured, type IntegrationService } from '../db.js';
 import { privateJson } from '../http-guards.js';
+import { emitLive } from '../sse-hub.js';
 import { listSubscriptions } from '../subscriptions-query.js';
 
 /**
@@ -9,10 +10,7 @@ import { listSubscriptions } from '../subscriptions-query.js';
  * 这一领域只读取队列、心跳与日志表，不触发抓取或下载，因此不依赖执行引擎，
  * 可以独立注册与测试。
  */
-export function registerOperationsRoutes(app: FastifyInstance, deps: {
-  /** 由 index 注入，避免这个模块反向依赖 SSE 路由文件。 */
-  emitLive: (channel: 'logs' | 'archive' | 'subscriptions' | 'tasks' | 'task-summary' | 'task-active' | 'services' | 'metrics', subscriptionId?: number) => void;
-}) {
+export function registerOperationsRoutes(app: FastifyInstance) {
 type HeartbeatRow = {
   worker_name: string;
   status: 'ready' | 'busy' | 'sleeping' | 'error';
@@ -264,7 +262,7 @@ app.post('/api/subscriptions/:id/archive-seen', async (request, reply) => {
   const updated = await db.run(`UPDATE subscriptions SET last_scan_seen_at = ?
     WHERE id = ? AND last_checked_at = ? AND last_scan_added_count = ?
       AND (last_scan_seen_at IS NULL OR last_scan_seen_at <> ?)`, [scanAt, id, scanAt, addedCount, scanAt]);
-  if (updated.changes) deps.emitLive('subscriptions');
+  if (updated.changes) emitLive('subscriptions');
   return privateJson(request, reply, { seen: Boolean(updated.changes) });
 });
 
