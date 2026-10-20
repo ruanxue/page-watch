@@ -352,8 +352,11 @@ body { background: #f8fafc; }
 .notification-settings .runtime-settings-card { display: block; margin-top: 16px; padding: 0; border: 0; background: transparent; }.network-header-actions { display: flex; align-items: center; gap: 12px; }.network-header-actions .toggle { margin: 0; }
 
 /* The primary UI intentionally stays compact: labels and live state remain,
-   while repeated instructional copy is omitted across every workspace. */
-.field-note, .network-copy, .editor-note, .preset-note, .attribute-hint, .rule-hint, .qbit-card-head p, .runtime-settings-card small, .list-section > .section-head > div > p, .task-center-page > .section-head > div > p:not(.eyebrow), .operations-center-page > .section-head > div > p, .runtime-log-section > .section-head > div > p:not(.eyebrow), .operation-section-heading > div > p, .rules-library-head > div > p:not(.eyebrow), .subscription-rule-head > div > p, .subscription-rule-section header > div > p, .preset-library-head > div > p, .embedded-rule-toolbar > div > p, .inspection-rules-page > .section-head > div > p, .inspection-rule-card header > div > p, .preset-manager-head > div > small, .subscription-rule-picker > p, .integration-onboarding .onboarding-card > p:not(.eyebrow), .integration-onboarding .onboarding-integrations small { display: none; }
+   while repeated instructional copy is omitted across every workspace.
+   .field-note / .rule-hint / .rules-library-head > div > p 曾经也被隐藏：规则页
+   需要这些说明来解释「留空表示不限站点」「自定义步骤只保存配置」，因此它们已从
+   白名单移除，说明文字重新可见。 */
+.network-copy, .editor-note, .preset-note, .attribute-hint, .qbit-card-head p, .runtime-settings-card small, .list-section > .section-head > div > p, .task-center-page > .section-head > div > p:not(.eyebrow), .operations-center-page > .section-head > div > p, .runtime-log-section > .section-head > div > p:not(.eyebrow), .operation-section-heading > div > p, .subscription-rule-head > div > p, .subscription-rule-section header > div > p, .preset-library-head > div > p, .embedded-rule-toolbar > div > p, .inspection-rules-page > .section-head > div > p, .inspection-rule-card header > div > p, .preset-manager-head > div > small, .subscription-rule-picker > p, .integration-onboarding .onboarding-card > p:not(.eyebrow), .integration-onboarding .onboarding-integrations small { display: none; }
 .subscription-editor label > .field-note { display: block; margin-top: 5px; font-size: .72rem; font-weight: 400; line-height: 1.45; }
 
 /* Subscription navigation keeps rules at the top of the workflow. */
@@ -614,7 +617,7 @@ body { background: #f8fafc; }
 .mobile-nav { display: none; }
 @media (max-width: 820px) {
   .sidebar-nav { display: none; }
-  .mobile-nav { position: fixed; z-index: 20; inset: auto 0 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 2px; margin: 0; padding: 7px 7px calc(7px + env(safe-area-inset-bottom)); border-top: 1px solid #e2e8f0; background: rgba(255, 255, 255, .97); box-shadow: 0 -8px 24px rgba(15, 23, 42, .08); }
+  .mobile-nav { position: fixed; z-index: 8; inset: auto 0 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 2px; margin: 0; padding: 7px 7px calc(7px + env(safe-area-inset-bottom)); border-top: 1px solid #e2e8f0; background: rgba(255, 255, 255, .97); box-shadow: 0 -8px 24px rgba(15, 23, 42, .08); }
   .mobile-nav .nav-item { position: relative; display: flex; min-width: 0; min-height: 51px; flex-direction: column; justify-content: center; gap: 3px; padding: 5px 2px; border-radius: 8px; color: #64748b; font-size: .67rem; line-height: 1.2; white-space: nowrap; }
   .mobile-nav .nav-item > span:first-child { font-size: 1.05rem; line-height: 1.15; }
   .mobile-nav .nav-item.active { color: #1d4ed8; background: #eff6ff; }
@@ -622,3 +625,286 @@ body { background: #f8fafc; }
   .workspace { padding-bottom: calc(88px + env(safe-area-inset-bottom)); }
   .toast { bottom: calc(78px + env(safe-area-inset-bottom)); }
 }
+
+/* 设置页统一交互层：所有面板共用同一套区块、字段、开关与动作栏。
+   新增样式只作用于 .settings-* 前缀，不影响订阅、档案与运行中心。 */
+.settings-page .settings-intro { max-width: 760px; margin: 0 0 4px; color: #64748b; font-size: .82rem; line-height: 1.6; }
+.settings-section { margin-top: 20px; padding: 22px; border: 1px solid #e2e8f0; border-radius: 12px; background: #ffffff; box-shadow: 0 8px 24px rgba(15, 23, 42, .04); scroll-margin-top: 24px; }
+.settings-form { margin: 0; }
+.settings-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding-bottom: 16px; border-bottom: 1px solid #e2e8f0; }
+.settings-head-copy { min-width: 0; }
+.settings-head h2 { margin: 0; color: #172033; font-size: 1.12rem; letter-spacing: -.02em; }
+.settings-head .eyebrow { margin: 0 0 5px; }
+.settings-desc { max-width: 620px; margin: 6px 0 0; color: #64748b; font-size: .78rem; line-height: 1.55; }
+.settings-dirty { flex: 0 0 auto; padding: 4px 9px; color: #a16207; border: 1px solid #fde68a; border-radius: 999px; background: #fffbeb; font-size: .7rem; font-weight: 650; white-space: nowrap; }
+.settings-body { display: grid; gap: 16px; padding-top: 18px; }
+.settings-loading { margin: 0; padding: 12px 0; color: #64748b; font-size: .8rem; }
+.settings-group { display: grid; gap: 12px; }
+.settings-group-title { margin-top: 2px; padding-top: 15px; border-top: 1px solid #e2e8f0; color: #334155; font-size: .78rem; font-weight: 650; }
+.settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 16px; }
+.settings-field { display: grid; gap: 6px; min-width: 0; }
+.settings-field.wide { grid-column: 1 / -1; }
+.settings-field-label { color: #334155; font-size: .8rem; font-weight: 650; }
+.settings-field input, .settings-field select { box-sizing: border-box; width: 100%; height: 42px; margin: 0; padding: 0 12px; color: #172033; background: #ffffff; border: 1px solid #cbd5e1; border-radius: 9px; font: inherit; }
+.settings-field select { padding-right: 38px; appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'%3E%3Cpath d='m4 6 4 4 4-4' fill='none' stroke='%2364748b' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.7'/%3E%3C/svg%3E"); background-position: right 12px center; background-repeat: no-repeat; }
+.settings-field input:focus, .settings-field select:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59, 130, 246, .14); }
+.settings-field input:disabled, .settings-field select:disabled { cursor: not-allowed; color: #94a3b8; background-color: #f8fafc; }
+.settings-field-hint { color: #64748b; font-size: .72rem; font-weight: 400; line-height: 1.45; }
+.settings-switch { display: inline-flex; align-items: flex-start; gap: 10px; cursor: pointer; }
+.settings-switch input { width: 0; height: 0; margin: 0; opacity: 0; }
+.settings-switch-track { position: relative; width: 36px; height: 21px; flex: 0 0 auto; margin-top: 1px; border-radius: 999px; background: #cbd5e1; transition: background .16s; }
+.settings-switch-track::after { position: absolute; top: 3px; left: 3px; width: 15px; height: 15px; border-radius: 50%; background: #ffffff; box-shadow: 0 1px 2px rgba(15, 23, 42, .2); content: ''; transition: transform .16s; }
+.settings-switch input:checked + .settings-switch-track { background: #2563eb; }
+.settings-switch input:checked + .settings-switch-track::after { transform: translateX(15px); }
+.settings-switch input:focus-visible + .settings-switch-track { box-shadow: 0 0 0 3px rgba(59, 130, 246, .2); }
+.settings-switch input:disabled + .settings-switch-track { opacity: .5; }
+.settings-switch.disabled { cursor: not-allowed; }
+.settings-switch-copy { display: grid; gap: 2px; color: #334155; font-size: .82rem; font-weight: 650; }
+.settings-switch-copy small { color: #64748b; font-size: .72rem; font-weight: 400; line-height: 1.45; }
+.settings-fieldset { min-width: 0; margin: 0; padding: 14px; border: 1px solid #dbeafe; border-radius: 10px; background: #f8fbff; }
+.settings-fieldset legend { padding: 0 6px; color: #334155; font-size: .78rem; font-weight: 650; }
+.settings-fieldset-empty { margin: 0; color: #64748b; font-size: .76rem; line-height: 1.5; }
+.settings-fieldset-note { display: block; margin-top: 10px; color: #64748b; font-size: .72rem; line-height: 1.45; }
+.settings-library-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; }
+.settings-library-choice { display: flex; align-items: center; gap: 9px; margin: 0; padding: 9px 10px; border: 1px solid #dbeafe; border-radius: 8px; background: #ffffff; cursor: pointer; }
+.settings-library-choice input { width: auto; height: auto; margin: 0; accent-color: #2563eb; }
+.settings-library-choice span { display: grid; gap: 2px; }
+.settings-library-choice b { color: #1e3a8a; font-size: .78rem; }
+.settings-library-choice small { color: #64748b; font-size: .67rem; }
+.settings-notice { margin: 0; padding: 12px; color: #475569; border: 1px solid #dbeafe; border-radius: 9px; background: #f8fbff; font-size: .78rem; line-height: 1.55; }
+.settings-notice code { color: #1d4ed8; }
+.settings-hint { margin: 0; color: #a16207; font-size: .74rem; line-height: 1.5; }
+.settings-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 9px; margin-top: 20px; padding-top: 16px; border-top: 1px solid #e2e8f0; }
+.settings-actions button { min-height: 42px; padding: 0 15px; border-radius: 9px; font-size: .82rem; font-weight: 650; }
+.settings-actions .primary:disabled { box-shadow: none; }
+.settings-actions button:disabled { cursor: not-allowed; opacity: .55; }
+.settings-actions button[aria-busy="true"] { cursor: progress; opacity: .85; }
+.settings-status { margin: 16px 0 0; padding: 10px 12px; border-radius: 8px; font-size: .78rem; line-height: 1.5; }
+.settings-status.error { color: #b91c1c; border: 1px solid #fecaca; background: #fff7f7; }
+.settings-status.success { color: #15803d; border: 1px solid #bbf7d0; background: #f0fdf4; }
+@media (max-width: 680px) {
+  .settings-section { padding: 17px; }
+  .settings-grid { grid-template-columns: 1fr; }
+  .settings-actions { justify-content: stretch; }
+  .settings-actions button { flex: 1 1 auto; }
+}
+@media (max-width: 480px) {
+  .settings-head { flex-direction: column; gap: 10px; }
+  .settings-actions { flex-direction: column-reverse; }
+  .settings-actions button { width: 100%; }
+}
+
+/* ==================== 移动端与触屏适配层 ====================
+   以下规则全部位于 max-width / 横屏 / 触屏查询内，桌面端（≥821px）表现保持不变。 */
+
+/* A. 横竖屏切换时不要被 iOS 自动放大字号 */
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+
+/* B. 窄屏工作区：左右避开刘海与圆角安全区，标题缩小一档 */
+@media (max-width: 820px) {
+  .workspace { padding-left: max(18px, env(safe-area-inset-left)); padding-right: max(18px, env(safe-area-inset-right)); }
+  .topbar { gap: 12px; }
+  .topbar h1 { font-size: 1.62rem; }
+  .section-head { align-items: flex-start; gap: 10px; }
+  .section-head .quiet { min-height: 40px; }
+  /* 媒体资源（当前页面无位图，为将来插入的图片/视频预留）不超出容器 */
+  img, video, canvas, iframe { max-width: 100%; height: auto; }
+}
+
+/* C. 档案表格：窄屏改为横向滑动，首列固定，避免被 overflow:hidden 直接截断 */
+@media (max-width: 820px) {
+  .archive-table-wrap { overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; }
+  .archive-table { min-width: 680px; }
+  .archive-table th, .archive-table td { padding: 11px 12px; overflow-wrap: anywhere; }
+  .archive-table th:first-child, .archive-table td:first-child { position: sticky; left: 0; z-index: 1; background: #ffffff; }
+  .archive-table th:first-child { background: #f8fafc; }
+}
+
+/* D. 弹窗：小屏铺满视口；dvh 让地址栏收起/展开时也不再溢出 */
+@media (max-width: 640px) {
+  .overlay { padding: 0; }
+  .overlay > .editor { width: 100%; max-width: none; height: 100dvh; max-height: 100dvh; border: 0; border-radius: 0; padding: 18px 16px calc(18px + env(safe-area-inset-bottom)); }
+  .overlay > .editor.subscription-editor { padding: 0; }
+  .overlay > .editor.subscription-editor > header { padding: 18px 16px 14px; }
+  .overlay > .editor.subscription-editor > footer { padding: 14px 16px calc(14px + env(safe-area-inset-bottom)); }
+  .overlay > .editor.confirmation-card { width: auto; height: auto; max-height: calc(100dvh - 24px); margin: 12px; padding: 21px 18px; border: 1px solid #e2e8f0; border-radius: 12px; }
+  .overlay > .settings-section { width: 100%; height: 100dvh; max-height: 100dvh; margin: 0; overflow: auto; border: 0; border-radius: 0; padding: 18px 16px calc(18px + env(safe-area-inset-bottom)); }
+}
+
+/* E. 输入框字号不足 16px 时 iOS 会在聚焦瞬间放大整页；触屏下统一到 16px 并加高控件 */
+@media (max-width: 820px) {
+  input, select, textarea { font-size: 16px !important; }
+  .settings-field input, .settings-field select { height: 46px; }
+  .rule-grid input, .rule-grid select { min-height: 46px; }
+  /* 支持 dvh 的浏览器用动态视口高度，地址栏收起/展开时弹窗不再溢出 */
+  @supports (height: 100dvh) {
+    .editor { max-height: calc(100dvh - 44px); }
+  }
+}
+
+/* F. 触屏上把可点击区域补到 44px 以上，避免误触相邻控件 */
+@media (hover: none) and (pointer: coarse) {
+  .primary, .secondary, .quiet, .danger-button, .sign-out, .back-button { min-height: 44px; }
+  .toggle, .settings-switch { min-height: 44px; }
+  .mobile-nav .nav-item { min-height: 56px; }
+  .card-actions button, .archive-actions button, .subscription-list-actions button { min-height: 44px; }
+  .archive-table td { padding-top: 14px; padding-bottom: 14px; }
+}
+
+/* G. 窄屏提示条拉满宽度，避免右侧被裁 */
+@media (max-width: 560px) {
+  .toast { right: 12px; left: 12px; max-width: none; bottom: calc(84px + env(safe-area-inset-bottom)); }
+  /* H. 小字统一抬到 12px，保证触屏可读性 */
+  .eyebrow, .label-help, .rule-kind, .preview span, .runtime-log-time, .field-note,
+  .rule-grid .field-note, .settings-field-hint, .settings-desc, .settings-fieldset-note,
+  .task-entry-head time, .archive-card-copy small, .archive-count small,
+  .mobile-nav .nav-item b { font-size: .75rem; }
+  .settings-field-label, .settings-switch-copy { font-size: .84rem; }
+}
+
+/* I. 长 URL 与错误文本在窄屏换行，不再横向撑破卡片 */
+@media (max-width: 820px) {
+  .preview p, .runtime-log-entry > p, .settings-status, .confirmation-question strong, .archive-entry pre { overflow-wrap: anywhere; }
+}
+
+/* J. 横屏矮屏（手机横放）：桌面布局会把侧边栏挤成一列，这里改成单列 + 底部导航 */
+@media (max-height: 500px) and (orientation: landscape) and (max-width: 1024px) {
+  .shell { display: block; }
+  .sidebar { display: none; }
+  .workspace { padding: 18px max(18px, env(safe-area-inset-left)) calc(66px + env(safe-area-inset-bottom)); }
+  .topbar h1 { font-size: 1.45rem; }
+  .mobile-nav { position: fixed; z-index: 8; inset: auto 0 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 2px; margin: 0; padding: 4px 7px calc(4px + env(safe-area-inset-bottom)); border-top: 1px solid #e2e8f0; background: rgba(255, 255, 255, .97); box-shadow: 0 -8px 24px rgba(15, 23, 42, .08); }
+  .mobile-nav .nav-item { position: relative; display: flex; min-width: 0; min-height: 44px; flex-direction: column; justify-content: center; gap: 2px; padding: 4px 2px; border-radius: 8px; color: #64748b; font-size: .7rem; line-height: 1.15; white-space: nowrap; }
+  .mobile-nav .nav-item > span:first-child { font-size: 1rem; line-height: 1.1; }
+  .mobile-nav .nav-item.active { color: #1d4ed8; background: #eff6ff; }
+  .mobile-nav .nav-item b { position: absolute; top: 1px; right: max(3px, calc(50% - 26px)); min-width: 15px; padding: 0 3px; color: #1d4ed8; background: #dbeafe; border-radius: 9px; font: .56rem 'DM Mono', monospace; text-align: center; }
+  .overlay { padding: 8px; }
+  .overlay > .editor { max-height: calc(100dvh - 16px); }
+  /* 横屏宽度通常 >820px，仍要压住 iOS 的输入框自动放大 */
+  input, select, textarea { font-size: 16px !important; }
+  .primary, .secondary, .quiet, .danger-button { min-height: 44px; }
+}
+
+/* K. 极窄屏（≤360px）：压缩留白，动作按钮独占一行 */
+@media (max-width: 360px) {
+  .workspace { padding-left: 14px; padding-right: 14px; }
+  .summary { grid-template-columns: 1fr 1fr; }
+  .settings-actions button, .qbit-form-actions button { width: 100%; }
+}
+
+/* 渲染兜底页：只在 React 组件抛错时出现，不参与正常布局 */
+.app-crash { max-width: 520px; margin: 12vh auto; padding: 28px; border: 1px solid #fecaca; border-radius: 14px; background: #ffffff; box-shadow: 0 16px 40px rgba(15, 23, 42, .08); }
+.app-crash h1 { margin: 0 0 10px; color: #b91c1c; font-size: 1.24rem; }
+.app-crash p { margin: 0 0 14px; color: #475569; font-size: .86rem; line-height: 1.6; }
+.app-crash pre { max-height: 180px; margin: 0 0 18px; padding: 12px; overflow: auto; color: #7f1d1d; background: #fff7f7; border: 1px solid #fee2e2; border-radius: 8px; font-size: .76rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.app-crash button { min-height: 42px; padding: 0 16px; border-radius: 9px; }
+
+/* ==================== 检查规则组页面 ====================
+   三段配置（读取方式 / 适用站点 / 补充步骤）各自独立保存；这里的样式只服务
+   RulesPage，命名统一加 rule-group- 前缀，避免影响其它页面。 */
+.rules-page { margin-top: 8px; }
+.rules-page-head { align-items: flex-start; }
+.rules-page-loading { margin: 22px 0 0; color: #64748b; font-size: .84rem; }
+.rules-page-body { display: grid; grid-template-columns: 268px minmax(0, 1fr); gap: 18px; align-items: start; }
+
+/* 左侧规则组列表 */
+.rule-group-list { padding: 15px; border: 1px solid #e2e8f0; border-radius: 12px; background: #ffffff; box-shadow: 0 8px 24px rgba(15, 23, 42, .04); }
+.rule-group-list-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 11px; }
+.rule-group-list-head strong { color: #172033; font-size: .92rem; }
+.rule-group-list-head span { color: #64748b; font-size: .74rem; }
+.rule-group-list ul { display: grid; gap: 7px; margin: 0 0 11px; padding: 0; list-style: none; }
+.rule-group-list li { position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 9px 10px; border: 1px solid #e2e8f0; border-radius: 9px; background: #f8fafc; }
+.rule-group-list li.active { border-color: #bfdbfe; background: #eff6ff; }
+.rule-group-pick { display: block; width: 100%; min-width: 0; padding: 0; text-align: left; border: 0; background: transparent; }
+.rule-group-pick strong { display: block; color: #172033; font-size: .85rem; overflow-wrap: anywhere; }
+.rule-group-pick small { display: block; margin-top: 3px; color: #64748b; font-size: .73rem; line-height: 1.4; overflow-wrap: anywhere; }
+.rule-group-badge { padding: 1px 7px; color: #1d4ed8; border: 1px solid #bfdbfe; border-radius: 999px; background: #eff6ff; font-size: .68rem; font-weight: 650; }
+.rule-group-delete { padding: 3px 8px; color: #b91c1c; border: 1px solid #fecaca; border-radius: 7px; background: #fff7f7; font-size: .72rem; font-weight: 650; }
+.rule-group-delete:hover { background: #fee2e2; }
+.rule-group-add { width: 100%; min-height: 38px; color: #1d4ed8; border: 1px dashed #bfdbfe; border-radius: 9px; background: #f8fbff; font-size: .82rem; font-weight: 650; }
+.rule-group-add:hover { background: #eff6ff; }
+
+/* 右侧编辑区 */
+.rule-group-detail { display: grid; gap: 16px; min-width: 0; }
+.rule-group-card { min-width: 0; padding: 19px 21px; border: 1px solid #e2e8f0; border-radius: 12px; background: #ffffff; box-shadow: 0 8px 24px rgba(15, 23, 42, .04); }
+.rule-group-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 4px; }
+.rule-group-card-head h3 { margin: 3px 0 0; color: #172033; font-size: 1.04rem; }
+.rule-group-id { padding: 2px 8px; color: #64748b; border: 1px solid #e2e8f0; border-radius: 999px; background: #f8fafc; font: .7rem 'DM Mono', ui-monospace, monospace; white-space: nowrap; }
+.rule-group-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 16px; margin-top: 15px; }
+.rule-group-field { display: block; min-width: 0; color: #334155; font-size: .8rem; font-weight: 650; }
+.rule-group-field > span { display: block; }
+.rule-group-field input, .rule-group-field select { display: block; box-sizing: border-box; width: 100%; min-height: 42px; margin-top: 7px; padding: 0 12px; color: #172033; border: 1px solid #cbd5e1; border-radius: 9px; background: #ffffff; font: inherit; font-weight: 400; }
+.rule-group-field select { padding-right: 38px; appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'%3E%3Cpath d='m4 6 4 4 4-4' fill='none' stroke='%2364748b' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.7'/%3E%3C/svg%3E"); background-position: right 12px center; background-repeat: no-repeat; }
+.rule-group-field input:focus, .rule-group-field select:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59, 130, 246, .14); }
+.rule-group-field-wide { grid-column: 1 / -1; }
+.rule-group-hint { display: block; margin: 5px 0 0; color: #64748b; font-size: .71rem; font-weight: 400; line-height: 1.45; }
+.rule-group-hint-block { align-self: end; margin: 0; padding: 10px 12px; border: 1px solid #e2e8f0; border-radius: 9px; background: #f8fafc; }
+.rule-group-error { display: block; margin: 5px 0 0; color: #b91c1c; font-size: .72rem; font-weight: 500; line-height: 1.45; }
+.rule-group-note { margin: 12px 0 0; color: #475569; font-size: .78rem; line-height: 1.55; }
+
+/* 读取方式里的标题、分页子块 */
+.rule-group-subcard { margin-top: 16px; padding: 15px 16px; border: 1px solid #dbeafe; border-radius: 10px; background: #f8fbff; }
+.rule-group-subcard > header { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.rule-group-subcard h4 { margin: 0; color: #334155; font-size: .9rem; }
+.rule-group-subcard .toggle { margin: 0; color: #334155; font-size: .78rem; font-weight: 700; }
+.rule-group-subcard .rule-group-hint-block { background: #ffffff; }
+
+/* 每段的保存区：原因常显，不静默禁用 */
+.rule-group-save { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 10px; margin-top: 18px; padding-top: 14px; border-top: 1px solid #e2e8f0; }
+.rule-group-block { flex: 1 1 260px; margin: 0; padding: 9px 11px; color: #b45309; border: 1px solid #fde68a; border-radius: 8px; background: #fffbeb; font-size: .76rem; line-height: 1.5; }
+.rule-group-unsaved { flex: 1 1 auto; margin: 0; color: #b45309; font-size: .76rem; }
+.rule-group-saved { flex: 1 1 auto; margin: 0; color: #64748b; font-size: .76rem; }
+.rule-group-save-error { flex: 1 1 100%; margin: 0; padding: 9px 11px; color: #b91c1c; border: 1px solid #fecaca; border-radius: 8px; background: #fff7f7; font-size: .76rem; line-height: 1.5; }
+.rule-group-save .primary { min-height: 40px; padding: 0 16px; border-radius: 9px; font-size: .82rem; }
+.rule-group-save .primary:disabled { cursor: not-allowed; box-shadow: none; opacity: .55; }
+
+/* 适用站点 */
+.rule-site-list { display: grid; gap: 8px; margin-top: 12px; }
+.rule-site-row { display: grid; grid-template-columns: 26px minmax(0, 1fr) 34px; gap: 8px; align-items: center; }
+.rule-site-order { display: grid; place-items: center; width: 26px; height: 26px; color: #1d4ed8; border: 1px solid #dbeafe; border-radius: 50%; background: #eff6ff; font: .72rem 'DM Mono', ui-monospace, monospace; }
+.rule-site-row input { box-sizing: border-box; width: 100%; min-height: 42px; padding: 0 12px; color: #172033; border: 1px solid #cbd5e1; border-radius: 9px; background: #ffffff; font: inherit; }
+.rule-site-row input:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59, 130, 246, .14); }
+.rule-site-remove { width: 34px; min-height: 34px; color: #64748b; border: 1px solid #e2e8f0; border-radius: 8px; background: #f8fafc; font-size: 1rem; line-height: 1; }
+.rule-site-remove:hover { color: #b91c1c; border-color: #fecaca; background: #fff7f7; }
+.rule-site-row .rule-group-error { grid-column: 2 / -1; }
+.rule-site-add { margin-top: 10px; min-height: 38px; padding: 0 13px; color: #1d4ed8; border: 1px dashed #bfdbfe; border-radius: 9px; background: #f8fbff; font-size: .8rem; font-weight: 650; }
+.rule-site-add:hover { background: #eff6ff; }
+.rule-site-empty { margin: 10px 0 0; padding: 11px 12px; color: #64748b; border: 1px dashed #e2e8f0; border-radius: 9px; background: #f8fafc; font-size: .78rem; }
+
+/* 补充步骤 */
+.rule-step-card { margin-top: 14px; padding: 15px 16px; border: 1px solid #e2e8f0; border-radius: 10px; background: #f8fafc; }
+.rule-step-card > header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+.rule-step-copy { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.rule-step-copy strong { color: #172033; font-size: .88rem; overflow-wrap: anywhere; }
+.rule-step-badge { padding: 1px 7px; color: #15803d; border: 1px solid #bbf7d0; border-radius: 999px; background: #f0fdf4; font-size: .68rem; font-weight: 650; }
+.rule-step-actions { display: flex; align-items: center; gap: 10px; }
+.rule-step-actions .toggle { margin: 0; color: #334155; font-size: .76rem; font-weight: 700; }
+.rule-step-delete { min-height: 32px; padding: 0 10px; color: #b91c1c; border: 1px solid #fecaca; border-radius: 8px; background: #fff7f7; font-size: .74rem; font-weight: 650; }
+.rule-step-delete:hover:not(:disabled) { background: #fee2e2; }
+.rule-step-delete:disabled { cursor: not-allowed; color: #94a3b8; border-color: #e2e8f0; background: #f1f5f9; }
+.rule-step-card .rule-group-grid { margin-top: 13px; }
+.rule-step-card .rule-group-note { margin-top: 9px; color: #64748b; font-size: .74rem; }
+.rule-step-add { margin-top: 14px; min-height: 38px; padding: 0 13px; color: #1d4ed8; border: 1px dashed #bfdbfe; border-radius: 9px; background: #f8fbff; font-size: .8rem; font-weight: 650; }
+.rule-step-add:hover { background: #eff6ff; }
+.rule-group-empty { padding: 38px 20px; }
+
+/* 窄屏：单列、无横向溢出。输入框字号由上方适配层的 16px 规则统一处理。 */
+@media (max-width: 820px) {
+  .rules-page-body { grid-template-columns: minmax(0, 1fr); }
+  .rule-group-card { padding: 17px; }
+  .rule-group-grid { grid-template-columns: minmax(0, 1fr); gap: 13px; }
+  .rule-group-field-wide { grid-column: auto; }
+  .rule-group-card-head { flex-wrap: wrap; }
+  .rule-site-row { grid-template-columns: 24px minmax(0, 1fr) 44px; }
+  .rule-site-remove { width: 44px; min-height: 44px; }
+  .rule-group-save { justify-content: stretch; }
+  .rule-group-save .primary { width: 100%; }
+  .rule-group-block, .rule-group-unsaved, .rule-group-saved { flex: 1 1 100%; }
+  .rule-step-actions { width: 100%; justify-content: space-between; }
+  .rule-step-delete { min-height: 44px; }
+  .rule-group-delete { min-height: 34px; }
+}
+
+/* 左侧列表里「有未保存修改」的角标：复用 .rule-unsaved 的琥珀色文字色，
+   只补一个胶囊外框，不引入新的视觉体系。 */
+.rule-group-list li > .rule-unsaved { margin-right: 0; padding: 1px 7px; color: #b45309; border: 1px solid #fde68a; border-radius: 999px; background: #fffbeb; font-size: .68rem; font-weight: 650; }

@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction, type ReactNode } from 'react';
 import { resetLiveUpdates, subscribeLive, type LiveEvent } from './live-updates.js';
+import RulesPage from './RulesPage.js';
 
 type Subscription = {
   id: number;
@@ -660,7 +661,7 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
       <MainNavigation view={view} subscriptionCount={stats.total} taskCount={taskCount} onSubscriptionsClick={() => setSubscriptionPage('list')} />
       <div className={`sidebar-note ${servicesHealthy ? '' : 'needs-attention'}`} title={serviceAttention}>
         <span className="pulse" /> {servicesHealthy ? '后台服务运行正常' : systemStatus ? `服务需要注意（${attentionServices.length}）` : '正在确认服务状态…'}
-        {servicesHealthy && systemStatus ? <a className="sidebar-task-link" href="#operations"><span>{systemStatus.services.length} 项服务在线</span><span>{taskCount} 项任务执行中</span></a> : <small>{serviceAttention || '正在读取服务状态…'}</small>}
+        {servicesHealthy && systemStatus ? <a className="sidebar-task-link" href="#operations"><span>{systemStatus.services.filter((service) => service.healthy).length} 项服务正常</span><span>{taskCount} 个任务执行中</span></a> : <small>{serviceAttention || '正在读取服务状态…'}</small>}
         <button type="button" className="sign-out" onClick={() => void onLogout()}>退出登录</button>
       </div>
     </aside>
@@ -694,7 +695,7 @@ function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
             </div></section>)}
           </div>}
       </section>
-      </> : <RulesLibrary onNotice={setNotice} />}</>
+      </> : <RulesPage onNotice={setNotice} />}</>
       : view === 'search' ? <CodeSearchPage onNotice={setNotice} onSubscriptionsChanged={load} /> : view === 'settings' ? <SettingsPage onNotice={setNotice} /> : <OperationsCenterPage onSummary={setTaskSummary} />}
       {notice && <div className="toast" role="status">{notice}</div>}
     </section>
@@ -1557,16 +1558,16 @@ function OperationsCenterPage({ onSummary }: { onSummary: (summary: TasksRespons
   return <section id="operations" className="operations-center-page">
     <div className="section-head"><div><h2>运行中心</h2><p>选择一项服务，查看它自己的实时队列、任务进度和运行日志。</p></div><button type="button" className="quiet" onClick={() => void load()}>↻ 刷新</button></div>
     <section className="task-summary operation-summary" aria-label="运行概览">{[
-      ['服务在线', summary?.servicesOnline ?? '—'], ['执行中', summary?.running ?? '—'], ['排队中', summary?.queued ?? '—'], ['等待重试', summary?.retrying ?? '—']
+      ['服务正常', summary?.servicesOnline ?? '—'], ['执行中任务', summary?.running ?? '—'], ['排队中', summary?.queued ?? '—'], ['等待重试', summary?.retrying ?? '—']
     ].map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong></div>)}</section>
     {!scope && <PerformanceOverview metrics={metrics} error={metricsError} integrations={data?.integrations ?? []} range={metricRange} onRange={setMetricRange} />}
-    <section className="operation-service-panel"><div className="task-list-heading"><h3>服务</h3><span>点击查看对应任务与日志</span></div><div className="operation-service-grid">{operationDefinitions.map((definition) => {
+    <section className="operation-service-panel"><div className="task-list-heading"><h3>服务</h3><span>休眠表示服务正常但当前空闲，点击查看详情</span></div><div className="operation-service-grid">{operationDefinitions.map((definition) => {
       const service = data?.services.find((item) => item.name === definition.service);
       const tasks = (data?.active ?? []).filter((task) => taskMatchesScope(task, definition.scope));
       const running = tasks.filter((task) => task.status === 'running').length;
       const waiting = tasks.filter((task) => task.status === 'queued' || task.status === 'retrying').length;
       return <button type="button" key={definition.scope} className={`operation-service ${scope === definition.scope ? 'selected' : ''} ${serviceVisualState(service)}`} onClick={() => setScope(definition.scope)}>
-        <span className="operation-service-top"><strong>{definition.label}</strong><em>{service?.status === 'busy' ? '执行中' : service?.status === 'sleeping' ? '休眠' : service?.healthy ? '在线' : service?.status === 'missing' ? '未启动' : '注意'}</em></span>
+        <span className="operation-service-top"><strong>{definition.label}</strong><em>{service?.status === 'busy' ? '执行中' : service?.status === 'sleeping' ? '在线休眠' : service?.healthy ? '在线待命' : service?.status === 'missing' ? '未启动' : '注意'}</em></span>
         <small title={service?.detail}>{service?.detail ?? '正在读取服务状态。'}</small>
         <footer>{definition.kinds.length ? <>{running} 执行中 · {waiting} 排队</> : '系统事件与网页接口状态'}<span>→</span></footer>
       </button>;
@@ -1683,6 +1684,11 @@ function presetFormPayload(row: PresetForm) {
   return payload;
 }
 
+/**
+ * 旧版「检查规则」页：一次性保存全部规则，且只能改名称、说明与读取方式。
+ * 页面已由 RulesPage 取代（三段独立保存），这里保留组件与默认值，供订阅编辑等
+ * 位置继续复用其数据结构；不要再新增功能到这里。
+ */
 function RulesLibrary({ onNotice }: { onNotice: (message: string) => void }) {
   const savedRef = useRef<string>('');
   const nextTemporaryId = useRef(-1);
@@ -1814,59 +1820,220 @@ const blankQbittorrentForm: QbittorrentForm = {
   enabled: false, url: '', authMode: 'api_key', apiKey: '', username: '', password: '', category: '', savePath: '', tags: 'page-watch', autoDownload: false, autoDownloadMinSizeMb: 0, stopAfterDownload: false
 };
 
+type SettingsAction = 'save' | 'verify' | 'sync' | 'test';
+type SettingsStatus = { tone: 'error' | 'success'; message: string } | null;
+
+/**
+ * 设置页统一的状态机：任意时刻只有一个动作在进行，按钮只反映自己那一个动作，
+ * 成功与失败都落在页面内状态条里，不再出现「成功用浮动提示、失败用页面红字」的分裂。
+ */
+function useSettingsActions() {
+  const [pending, setPending] = useState<SettingsAction | ''>('');
+  const [status, setStatus] = useState<SettingsStatus>(null);
+  const run = async (action: SettingsAction, work: () => Promise<string | void>, fallback: string) => {
+    setPending(action);
+    setStatus(null);
+    try {
+      const message = await work();
+      if (message) setStatus({ tone: 'success', message });
+      return true;
+    } catch (reason) {
+      const message = reason instanceof Error && reason.message.trim() ? reason.message.trim() : fallback;
+      setStatus({ tone: 'error', message });
+      return false;
+    } finally {
+      setPending('');
+    }
+  };
+  return { pending, status, setStatus, run };
+}
+
+function SettingsSection({ id, eyebrow, title, description, children, actions, status, loading, dirty, onSubmit }: {
+  id?: string;
+  eyebrow: string;
+  title: string;
+  description?: string;
+  children: ReactNode;
+  actions: ReactNode;
+  status: SettingsStatus;
+  loading: boolean;
+  dirty?: boolean;
+  onSubmit: (event: FormEvent) => void;
+}) {
+  return <section id={id} className="settings-section">
+    <form className="settings-form" onSubmit={onSubmit} noValidate>
+      <header className="settings-head">
+        <div className="settings-head-copy">
+          <p className="eyebrow">{eyebrow}</p>
+          <h2>{title}</h2>
+          {description && <p className="settings-desc">{description}</p>}
+        </div>
+        {dirty && <span className="settings-dirty">有未保存的修改</span>}
+      </header>
+      <div className="settings-body">
+        {loading ? <p className="settings-loading" role="status">正在读取设置…</p> : children}
+      </div>
+      {status && <p className={`settings-status ${status.tone}`} role={status.tone === 'error' ? 'alert' : 'status'}>{status.message}</p>}
+      <footer className="settings-actions">{actions}</footer>
+    </form>
+  </section>;
+}
+
+function SettingsField({ label, hint, children, wide }: { label: string; hint?: ReactNode; children: ReactNode; wide?: boolean }) {
+  return <label className={`settings-field${wide ? ' wide' : ''}`}>
+    <span className="settings-field-label">{label}</span>
+    {children}
+    {hint && <span className="settings-field-hint">{hint}</span>}
+  </label>;
+}
+
+function SettingsToggle({ label, hint, checked, disabled, onChange }: { label: string; hint?: string; checked: boolean; disabled?: boolean; onChange: (checked: boolean) => void }) {
+  return <label className={`settings-switch${disabled ? ' disabled' : ''}`}>
+    <input type="checkbox" checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
+    <span className="settings-switch-track" aria-hidden="true" />
+    <span className="settings-switch-copy">{label}{hint && <small>{hint}</small>}</span>
+  </label>;
+}
+
+/** 统一的动作按钮：主按钮永远只有一个，次要动作用次按钮，危险操作用危险按钮。 */
+function SettingsActionButton({ tone = 'secondary', busy, disabled, onClick, type = 'button', children }: {
+  tone?: 'primary' | 'secondary' | 'danger';
+  busy?: boolean;
+  disabled?: boolean;
+  onClick?: () => void;
+  type?: 'button' | 'submit';
+  children: ReactNode;
+}) {
+  const className = tone === 'primary' ? 'primary' : tone === 'danger' ? 'secondary danger-button' : 'secondary';
+  return <button className={className} type={type} disabled={disabled || busy} aria-busy={busy || undefined} onClick={onClick}>{children}</button>;
+}
+
 function QbittorrentSettingsPage({ onNotice }: { onNotice: (message: string) => void }) {
   const [form, setForm] = useState<QbittorrentForm>(blankQbittorrentForm);
   const [apiKeyConfigured, setApiKeyConfigured] = useState(false);
   const [passwordConfigured, setPasswordConfigured] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
+  const [baseline, setBaseline] = useState<QbittorrentForm | null>(null);
+  const { pending, status, setStatus, run } = useSettingsActions();
+  void onNotice;
+  const busy = pending !== '';
+  const dirty = baseline !== null && JSON.stringify(form) !== JSON.stringify(baseline);
   const update = <K extends keyof QbittorrentForm>(key: K, value: QbittorrentForm[K]) => setForm((old) => ({ ...old, [key]: value }));
   useEffect(() => {
     void request<QbittorrentSettings>('/api/settings/qbittorrent').then((settings) => {
-      setForm({ enabled: settings.enabled, url: settings.url, authMode: settings.authMode, apiKey: '', username: settings.username, password: '', category: settings.category, savePath: settings.savePath, tags: settings.tags, autoDownload: settings.autoDownload, autoDownloadMinSizeMb: settings.autoDownloadMinSizeMb, stopAfterDownload: settings.stopAfterDownload });
+      const next: QbittorrentForm = {
+        enabled: settings.enabled, url: settings.url, authMode: settings.authMode, apiKey: '',
+        username: settings.username, password: '', category: settings.category, savePath: settings.savePath,
+        tags: settings.tags, autoDownload: settings.autoDownload,
+        autoDownloadMinSizeMb: settings.autoDownloadMinSizeMb, stopAfterDownload: settings.stopAfterDownload
+      };
+      setForm(next);
+      setBaseline(next);
       setApiKeyConfigured(settings.apiKeyConfigured);
       setPasswordConfigured(settings.passwordConfigured);
-    }).catch((reason) => setError(reason instanceof Error ? reason.message : '无法读取下载设置。')).finally(() => setLoading(false));
-  }, []);
+    }).catch((reason) => setStatus({ tone: 'error', message: reason instanceof Error ? reason.message : '无法读取下载设置。' })).finally(() => setLoading(false));
+  }, [setStatus]);
   const payload = () => {
     const { apiKey, password, ...settings } = form;
     return { ...settings, ...(apiKey ? { apiKey } : {}), ...(password ? { password } : {}) };
   };
-  async function save(showNotice = true) {
+  async function putSettings() {
     const settings = await request<QbittorrentSettings>('/api/settings/qbittorrent', { method: 'PUT', body: JSON.stringify(payload()) });
-    setForm((old) => ({ ...old, apiKey: '', password: '' }));
+    const next = { ...form, apiKey: '', password: '' };
+    setForm(next);
+    setBaseline(next);
     setApiKeyConfigured(settings.apiKeyConfigured);
     setPasswordConfigured(settings.passwordConfigured);
-    if (showNotice) onNotice(settings.enabled ? 'qBittorrent 下载设置已保存。' : 'qBittorrent 下载已关闭。');
+    return settings;
   }
-  async function submit(event: FormEvent) {
-    event.preventDefault(); setBusy(true); setError('');
-    try { await save(); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存下载设置。'); }
-    finally { setBusy(false); }
-  }
-  async function testConnection() {
-    setBusy(true); setError('');
-    try { await save(false); await request('/api/settings/qbittorrent/test', { method: 'POST' }); onNotice('qBittorrent 连接测试成功。'); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : 'qBittorrent 连接测试失败。'); }
-    finally { setBusy(false); }
-  }
-  return <><section id="downloads" className="qbit-settings-page">
-    <form className="qbit-settings" onSubmit={submit}>
-      <section className="qbit-card"><h2 className="settings-card-title">qBittorrent 下载</h2><div className="qbit-card-head"><div><h3>连接设置</h3></div><label className="toggle"><input type="checkbox" checked={form.enabled} disabled={loading || busy} onChange={(event) => update('enabled', event.target.checked)} /><span />启用下载</label></div>
-      <label>Web UI 地址<input disabled={loading || busy} value={form.url} onChange={(event) => update('url', event.target.value)} placeholder="例如 http://192.168.1.20:8080" /></label>
-      <label>认证方式<select disabled={loading || busy} value={form.authMode} onChange={(event) => update('authMode', event.target.value as QbittorrentForm['authMode'])}><option value="api_key">API 密钥（推荐，qBittorrent 5.2+）</option><option value="password">用户名与密码（旧版兼容）</option></select></label>
-      {form.authMode === 'api_key' ? <label>API 密钥<input type="password" autoComplete="off" disabled={loading || busy} value={form.apiKey} onChange={(event) => update('apiKey', event.target.value)} placeholder={apiKeyConfigured ? '********' : 'API 密钥'} /></label> : <div className="two-col"><label>用户名<input autoComplete="username" disabled={loading || busy} value={form.username} onChange={(event) => update('username', event.target.value)} placeholder="qBittorrent 用户名" /></label><label>密码<input type="password" autoComplete="current-password" disabled={loading || busy} value={form.password} onChange={(event) => update('password', event.target.value)} placeholder={passwordConfigured ? '********' : '密码'} /></label></div>}<div className="qbit-card-divider" />
-      <div className="qbit-card-section"><div className="qbit-card-head"><div><h3>下载规则</h3></div></div><div className="two-col"><label>分类<input disabled={loading || busy} value={form.category} onChange={(event) => update('category', event.target.value)} placeholder="可选，例如 movies" /></label><label>标签<input disabled={loading || busy} value={form.tags} onChange={(event) => update('tags', event.target.value)} placeholder="可选，多个标签用逗号分隔" /></label></div><label>保存路径<input disabled={loading || busy} value={form.savePath} onChange={(event) => update('savePath', event.target.value)} placeholder="可选，使用 qBittorrent 容器内可见的路径" /></label><label className="toggle qbit-auto-toggle"><input type="checkbox" checked={form.autoDownload} disabled={loading || busy || !form.enabled} onChange={(event) => update('autoDownload', event.target.checked)} /><span />新找到磁力链接后自动提交下载</label><p className="qbit-auto-note">订阅的初次检查（包括初次全量检查）发现的内容只检索磁力，不自动提交下载；后续检查新增的内容仍按此开关处理。</p><label>最小单文件大小（MB）<input type="number" min="0" max="1048576" step="1" disabled={loading || busy || !form.enabled} value={form.autoDownloadMinSizeMb} onChange={(event) => update('autoDownloadMinSizeMb', Number(event.target.value))} /></label><label className="toggle qbit-auto-toggle"><input type="checkbox" checked={form.stopAfterDownload} disabled={loading || busy || !form.enabled} onChange={(event) => update('stopAfterDownload', event.target.checked)} /><span />下载完成后停止做种</label></div></section>
-      {error && <p className="form-error">{error}</p>}
-      <div className="qbit-form-actions"><button type="button" className="secondary" disabled={loading || busy} onClick={() => void testConnection()}>{busy ? '处理中…' : '保存并测试连接'}</button><button className="primary" disabled={loading || busy} type="submit">{busy ? '保存中…' : '保存下载设置'}</button></div>
-    </form>
-  </section><JellyfinSettingsPanel onNotice={onNotice} /></>;
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (!dirty || busy) return;
+    void run('save', async () => {
+      const settings = await putSettings();
+      return settings.enabled ? '下载设置已保存。' : '下载设置已保存，qBittorrent 下载当前关闭。';
+    }, '无法保存下载设置。');
+  };
+  const testConnection = () => {
+    if (busy) return;
+    void run('verify', async () => {
+      await putSettings();
+      await request('/api/settings/qbittorrent/test', { method: 'POST' });
+      return '连接测试成功，设置已保存。';
+    }, 'qBittorrent 连接测试失败。');
+  };
+  const discard = () => {
+    if (!baseline) return;
+    setForm(baseline);
+    setStatus(null);
+  };
+  return <>
+    <SettingsSection
+      id="downloads"
+      eyebrow="下载与做种"
+      title="qBittorrent 下载"
+      description="把已归档内容提交到 qBittorrent。保存后立即生效，已提交的任务不受影响。"
+      loading={loading}
+      dirty={dirty}
+      status={status}
+      onSubmit={submit}
+      actions={<>
+        {dirty && <SettingsActionButton disabled={busy} onClick={discard}>撤销更改</SettingsActionButton>}
+        <SettingsActionButton busy={pending === 'verify'} disabled={busy && pending !== 'verify'} onClick={testConnection}>{pending === 'verify' ? '正在连接…' : '保存并测试连接'}</SettingsActionButton>
+        <SettingsActionButton tone="primary" type="submit" busy={pending === 'save'} disabled={busy || !dirty}>{pending === 'save' ? '保存中…' : '保存下载设置'}</SettingsActionButton>
+      </>}
+    >
+      <div className="settings-group">
+        <SettingsToggle label="启用 qBittorrent 下载" hint="关闭后不再提交新的下载任务。" checked={form.enabled} disabled={busy} onChange={(value) => update('enabled', value)} />
+      </div>
+      <div className="settings-grid">
+        <SettingsField wide label="Web UI 地址" hint="包含协议与端口，例如 http://192.168.1.20:8080。">
+          <input disabled={busy} value={form.url} onChange={(event) => update('url', event.target.value)} placeholder="http://192.168.1.20:8080" />
+        </SettingsField>
+        <SettingsField label="认证方式" hint="qBittorrent 5.2 及以上推荐 API 密钥。">
+          <select disabled={busy} value={form.authMode} onChange={(event) => update('authMode', event.target.value as QbittorrentForm['authMode'])}>
+            <option value="api_key">API 密钥（推荐）</option>
+            <option value="password">用户名与密码（旧版兼容）</option>
+          </select>
+        </SettingsField>
+        {form.authMode === 'api_key'
+          ? <SettingsField wide label="API 密钥" hint={apiKeyConfigured ? '已保存密钥；留空表示不修改。' : '在 qBittorrent 的 Web UI 选项中生成。'}>
+            <input type="password" autoComplete="off" disabled={busy} value={form.apiKey} onChange={(event) => update('apiKey', event.target.value)} placeholder={apiKeyConfigured ? '已保存，留空则不修改' : 'API 密钥'} />
+          </SettingsField>
+          : <>
+            <SettingsField label="用户名">
+              <input autoComplete="username" disabled={busy} value={form.username} onChange={(event) => update('username', event.target.value)} placeholder="qBittorrent 用户名" />
+            </SettingsField>
+            <SettingsField label="密码" hint={passwordConfigured ? '已保存密码；留空表示不修改。' : undefined}>
+              <input type="password" autoComplete="current-password" disabled={busy} value={form.password} onChange={(event) => update('password', event.target.value)} placeholder={passwordConfigured ? '已保存，留空则不修改' : '密码'} />
+            </SettingsField>
+          </>}
+        <SettingsField label="分类" hint="可选，例如 movies。">
+          <input disabled={busy} value={form.category} onChange={(event) => update('category', event.target.value)} placeholder="可选" />
+        </SettingsField>
+        <SettingsField label="标签" hint="可选，多个标签用逗号分隔。">
+          <input disabled={busy} value={form.tags} onChange={(event) => update('tags', event.target.value)} placeholder="可选" />
+        </SettingsField>
+        <SettingsField wide label="保存路径" hint="必须是 qBittorrent 容器内可见的路径，例如 /downloads。">
+          <input disabled={busy} value={form.savePath} onChange={(event) => update('savePath', event.target.value)} placeholder="使用 qBittorrent 默认路径" />
+        </SettingsField>
+      </div>
+      <div className="settings-group-title">下载规则</div>
+      <div className="settings-group">
+        <SettingsToggle label="新找到磁力链接后自动提交下载" hint="订阅首次检查（含首次全量检查）发现的内容只检索磁力，不自动提交。" checked={form.autoDownload} disabled={busy || !form.enabled} onChange={(value) => update('autoDownload', value)} />
+        <SettingsField label="最小单文件大小（MB）" hint="小于该值的文件不会下载；0 表示不限制。">
+          <input type="number" min="0" max="1048576" step="1" disabled={busy || !form.enabled} value={form.autoDownloadMinSizeMb} onChange={(event) => update('autoDownloadMinSizeMb', Number(event.target.value))} />
+        </SettingsField>
+        <SettingsToggle label="下载完成后停止做种" hint="仅停止本网站提交的任务，不影响 qBittorrent 其他任务。" checked={form.stopAfterDownload} disabled={busy || !form.enabled} onChange={(value) => update('stopAfterDownload', value)} />
+      </div>
+    </SettingsSection>
+    <JellyfinSettingsPanel onNotice={onNotice} />
+  </>;
 }
 
 function SettingsPage({ onNotice }: { onNotice: (message: string) => void }) {
   return <section id="settings" className="settings-page">
+    <p className="settings-intro">所有设置都以「保存」为唯一提交入口：保存前显示未保存标记，保存失败会在对应区块内说明原因，不会静默丢弃修改。</p>
     <QbittorrentSettingsPage onNotice={onNotice} />
     <NetworkSettings embedded onSaved={onNotice} />
     <RuntimeSettingsPanel onNotice={onNotice} />
@@ -1894,58 +2061,115 @@ function JellyfinSettingsPanel({ onNotice }: { onNotice: (message: string) => vo
   const [apiKeyConfigured, setApiKeyConfigured] = useState(false);
   const [libraries, setLibraries] = useState<JellyfinLibrary[]>([]);
   const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
+  const [baseline, setBaseline] = useState<JellyfinForm | null>(null);
+  const { pending, status, setStatus, run } = useSettingsActions();
+  void onNotice;
+  const busy = pending !== '';
+  const dirty = baseline !== null && JSON.stringify(form) !== JSON.stringify(baseline);
   const update = <K extends keyof JellyfinForm>(key: K, value: JellyfinForm[K]) => setForm((old) => ({ ...old, [key]: value }));
   useEffect(() => {
     void request<JellyfinSettings>('/api/settings/jellyfin').then((settings) => {
-      setForm({ enabled: settings.enabled, url: settings.url, apiKey: '', libraryIds: settings.libraryIds, syncIntervalMinutes: settings.syncIntervalMinutes, skipMagnetWhenAvailable: settings.skipMagnetWhenAvailable });
+      const next: JellyfinForm = {
+        enabled: settings.enabled, url: settings.url, apiKey: '', libraryIds: settings.libraryIds,
+        syncIntervalMinutes: settings.syncIntervalMinutes, skipMagnetWhenAvailable: settings.skipMagnetWhenAvailable
+      };
+      setForm(next);
+      setBaseline(next);
       setApiKeyConfigured(settings.apiKeyConfigured);
-    }).catch((reason) => setError(reason instanceof Error ? reason.message : '无法读取 Jellyfin 设置。')).finally(() => setLoading(false));
-  }, []);
+    }).catch((reason) => setStatus({ tone: 'error', message: reason instanceof Error ? reason.message : '无法读取 Jellyfin 设置。' })).finally(() => setLoading(false));
+  }, [setStatus]);
   const payload = () => {
     const { apiKey, ...settings } = form;
     return { ...settings, ...(apiKey ? { apiKey } : {}) };
   };
-  const save = async (showNotice = true) => {
+  const putSettings = async () => {
     const settings = await request<JellyfinSettings>('/api/settings/jellyfin', { method: 'PUT', body: JSON.stringify(payload()) });
-    setForm((old) => ({ ...old, enabled: settings.enabled, url: settings.url, apiKey: '', libraryIds: settings.libraryIds, syncIntervalMinutes: settings.syncIntervalMinutes, skipMagnetWhenAvailable: settings.skipMagnetWhenAvailable }));
+    const next: JellyfinForm = {
+      enabled: settings.enabled, url: settings.url, apiKey: '', libraryIds: settings.libraryIds,
+      syncIntervalMinutes: settings.syncIntervalMinutes, skipMagnetWhenAvailable: settings.skipMagnetWhenAvailable
+    };
+    setForm(next);
+    setBaseline(next);
     setApiKeyConfigured(settings.apiKeyConfigured);
-    if (showNotice) onNotice(settings.enabled ? 'Jellyfin 影视库设置已保存，等待同步。' : 'Jellyfin 影视库同步已关闭。');
+    return settings;
   };
   const toggleLibrary = (id: string) => setForm((old) => ({ ...old, libraryIds: old.libraryIds.includes(id) ? old.libraryIds.filter((item) => item !== id) : [...old.libraryIds, id] }));
-  async function testConnection() {
-    setBusy(true); setError('');
-    try {
-      await save(false);
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (!dirty || busy) return;
+    void run('save', async () => {
+      const settings = await putSettings();
+      return settings.enabled ? '影视库设置已保存，等待同步。' : '影视库设置已保存，同步当前关闭。';
+    }, '无法保存 Jellyfin 设置。');
+  };
+  const testConnection = () => {
+    if (busy) return;
+    void run('verify', async () => {
+      await putSettings();
       const result = await request<{ server: { serverName: string; version: string | null }; libraries: JellyfinLibrary[] }>('/api/settings/jellyfin/test', { method: 'POST' });
       setLibraries(result.libraries);
       setForm((old) => old.libraryIds.length ? old : { ...old, libraryIds: result.libraries.map((library) => library.id) });
-      onNotice(`Jellyfin 连接成功：${result.server.serverName}${result.server.version ? ` ${result.server.version}` : ''}。请选择媒体库后保存。`);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Jellyfin 连接测试失败。'); }
-    finally { setBusy(false); }
-  }
-  async function syncNow() {
-    setBusy(true); setError('');
-    try {
-      await save(false);
+      return `连接成功：${result.server.serverName}${result.server.version ? ` ${result.server.version}` : ''}。请选择媒体库后保存。`;
+    }, 'Jellyfin 连接测试失败。');
+  };
+  const syncNow = () => {
+    if (busy) return;
+    void run('sync', async () => {
+      await putSettings();
       const result = await request<{ queued: boolean; jobId: number }>('/api/settings/jellyfin/sync', { method: 'POST' });
-      onNotice(result.queued ? `Jellyfin 全量同步已加入队列（任务 #${result.jobId}），可在运行中心查看进度。` : `Jellyfin 全量同步已在执行或排队中（任务 #${result.jobId}）。`);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Jellyfin 影视库同步失败。'); }
-    finally { setBusy(false); }
-  }
-  return <section className="qbit-settings-page jellyfin-settings-page"><form className="qbit-settings" onSubmit={(event) => { event.preventDefault(); setBusy(true); setError(''); void save().catch((reason) => setError(reason instanceof Error ? reason.message : '无法保存 Jellyfin 设置。')).finally(() => setBusy(false)); }}>
-    <section className="qbit-card"><h2 className="settings-card-title">Jellyfin 影视库</h2><div className="qbit-card-head"><div><h3>连接与同步</h3><p>仅以只读方式查询 Jellyfin 媒体库，不会修改影片或元数据。</p></div><label className="toggle"><input type="checkbox" checked={form.enabled} disabled={loading || busy} onChange={(event) => update('enabled', event.target.checked)} /><span />启用影视库同步</label></div>
-      <label>Jellyfin Web 地址<input disabled={loading || busy} value={form.url} onChange={(event) => update('url', event.target.value)} placeholder="例如 http://192.168.1.20:8096" /><span className="field-note">填写 Jellyfin Web UI 的局域网地址和端口。</span></label>
-      <label>API 密钥<input type="password" autoComplete="off" disabled={loading || busy} value={form.apiKey} onChange={(event) => update('apiKey', event.target.value)} placeholder={apiKeyConfigured ? '********' : 'API 密钥'} /></label>
-      <label>同步间隔（分钟）<input type="number" min="5" max="1440" disabled={loading || busy || !form.enabled} value={form.syncIntervalMinutes} onChange={(event) => update('syncIntervalMinutes', Number(event.target.value))} /></label>
-      <label className="toggle jellyfin-skip-toggle"><input type="checkbox" checked={form.skipMagnetWhenAvailable} disabled={loading || busy || !form.enabled} onChange={(event) => update('skipMagnetWhenAvailable', event.target.checked)} /><span />已入库时自动跳过磁力检索</label>
-      {libraries.length > 0 && <fieldset className="jellyfin-libraries" disabled={loading || busy || !form.enabled}><legend>同步的媒体库</legend><div>{libraries.map((library) => <label key={library.id} className="library-choice"><input type="checkbox" checked={form.libraryIds.includes(library.id)} onChange={() => toggleLibrary(library.id)} /><span><b>{library.name}</b>{library.collectionType ? <small>{library.collectionType}</small> : null}</span></label>)}</div><span className="field-note">可多选；同步只读取所选媒体库中的影片项目。</span></fieldset>}
-      {libraries.length === 0 && <p className="field-note jellyfin-library-hint">先保存并测试连接，即可读取并选择 Jellyfin 媒体库。</p>}
-    </section>
-    {error && <p className="form-error">{error}</p>}
-    <div className="qbit-form-actions"><button type="button" className="secondary" disabled={loading || busy} onClick={() => void testConnection()}>{busy ? '处理中…' : '保存并检测媒体库'}</button><button type="button" className="secondary" disabled={loading || busy || !form.enabled || !form.libraryIds.length} onClick={() => void syncNow()}>{busy ? '正在同步…' : '立即同步影视库'}</button><button className="primary" disabled={loading || busy} type="submit">{busy ? '保存中…' : '保存影视库设置'}</button></div>
-  </form></section>;
+      return result.queued ? `全量同步已加入队列（任务 #${result.jobId}），可在运行中心查看进度。` : `全量同步已在执行或排队中（任务 #${result.jobId}）。`;
+    }, 'Jellyfin 影视库同步失败。');
+  };
+  const discard = () => {
+    if (!baseline) return;
+    setForm(baseline);
+    setStatus(null);
+  };
+  const syncBlocked = !form.enabled || !form.libraryIds.length;
+  return <SettingsSection
+    eyebrow="影视库"
+    title="Jellyfin 影视库"
+    description="以只读方式查询媒体库，用于判断内容是否已入库；不会修改影片或元数据。"
+    loading={loading}
+    dirty={dirty}
+    status={status}
+    onSubmit={submit}
+    actions={<>
+      {dirty && <SettingsActionButton disabled={busy} onClick={discard}>撤销更改</SettingsActionButton>}
+      <SettingsActionButton busy={pending === 'verify'} disabled={busy && pending !== 'verify'} onClick={testConnection}>{pending === 'verify' ? '正在连接…' : '保存并检测媒体库'}</SettingsActionButton>
+      <SettingsActionButton busy={pending === 'sync'} disabled={(busy && pending !== 'sync') || syncBlocked} onClick={syncNow}>{pending === 'sync' ? '正在同步…' : '立即同步影视库'}</SettingsActionButton>
+      <SettingsActionButton tone="primary" type="submit" busy={pending === 'save'} disabled={busy || !dirty}>{pending === 'save' ? '保存中…' : '保存影视库设置'}</SettingsActionButton>
+    </>}
+  >
+    <div className="settings-group">
+      <SettingsToggle label="启用影视库同步" hint="关闭后不再读取媒体库，档案中的入库状态保持最后一次结果。" checked={form.enabled} disabled={busy} onChange={(value) => update('enabled', value)} />
+    </div>
+    <div className="settings-grid">
+      <SettingsField wide label="Jellyfin Web 地址" hint="填写 Web UI 的局域网地址和端口，例如 http://192.168.1.20:8096。">
+        <input disabled={busy} value={form.url} onChange={(event) => update('url', event.target.value)} placeholder="http://192.168.1.20:8096" />
+      </SettingsField>
+      <SettingsField wide label="API 密钥" hint={apiKeyConfigured ? '已保存密钥；留空表示不修改。' : '在 Jellyfin 控制台的「API 密钥」页面生成。'}>
+        <input type="password" autoComplete="off" disabled={busy} value={form.apiKey} onChange={(event) => update('apiKey', event.target.value)} placeholder={apiKeyConfigured ? '已保存，留空则不修改' : 'API 密钥'} />
+      </SettingsField>
+      <SettingsField label="同步间隔（分钟）" hint="范围 5–1440；默认 60 分钟。">
+        <input type="number" min="5" max="1440" disabled={busy || !form.enabled} value={form.syncIntervalMinutes} onChange={(event) => update('syncIntervalMinutes', Number(event.target.value))} />
+      </SettingsField>
+    </div>
+    <div className="settings-group">
+      <SettingsToggle label="已入库时自动跳过磁力检索" hint="仅在确认影片已入库时跳过，避免重复检索。" checked={form.skipMagnetWhenAvailable} disabled={busy || !form.enabled} onChange={(value) => update('skipMagnetWhenAvailable', value)} />
+    </div>
+    <fieldset className="settings-fieldset" disabled={busy || !form.enabled}>
+      <legend>同步的媒体库</legend>
+      {libraries.length === 0
+        ? <p className="settings-fieldset-empty">先点击「保存并检测媒体库」，即可读取并选择要同步的媒体库。</p>
+        : <div className="settings-library-grid">{libraries.map((library) => <label key={library.id} className="settings-library-choice">
+          <input type="checkbox" checked={form.libraryIds.includes(library.id)} onChange={() => toggleLibrary(library.id)} />
+          <span><b>{library.name}</b>{library.collectionType ? <small>{library.collectionType}</small> : null}</span>
+        </label>)}</div>}
+      <span className="settings-fieldset-note">可多选；同步只读取所选媒体库中的影片项目。</span>
+    </fieldset>
+    {syncBlocked && <p className="settings-hint">启用同步并至少选择一个媒体库后，「立即同步影视库」才可用。</p>}
+  </SettingsSection>;
 }
 
 function SimpleSubscriptionReading({ form, setForm, busy, presets, selectedPreset, presetId, applyPreset }: { form: FormData; setForm: Dispatch<SetStateAction<FormData>>; busy: boolean; presets: SubscriptionPreset[]; selectedPreset: SubscriptionPreset | undefined; presetId: string; applyPreset: (id: string) => void }) {
@@ -2081,74 +2305,152 @@ function NetworkSettings({ onClose, onSaved, embedded = false }: { onClose?: () 
   const [proxyUrl, setProxyUrl] = useState('');
   const [enabled, setEnabled] = useState(false);
   const [fromEnvironment, setFromEnvironment] = useState(false);
-  const [busy, setBusy] = useState(true);
-  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [baseline, setBaseline] = useState<{ proxyUrl: string; enabled: boolean } | null>(null);
+  const { pending, status, setStatus, run } = useSettingsActions();
+  void onSaved;
+  const busy = pending !== '';
+  const dirty = baseline !== null && (proxyUrl !== baseline.proxyUrl || enabled !== baseline.enabled);
   useEffect(() => {
     void request<{ proxyUrl: string; enabled: boolean; fromEnvironment: boolean }>('/api/settings/network')
-      .then((network) => { setProxyUrl(network.proxyUrl); setEnabled(network.enabled); setFromEnvironment(network.fromEnvironment); })
-      .catch((reason) => setError(reason.message))
-      .finally(() => setBusy(false));
-  }, []);
-  async function save(event: FormEvent) {
-    event.preventDefault(); setBusy(true); setError('');
-    try {
-      const network = fromEnvironment ? null : await request<{ active: boolean; enabled: boolean }>('/api/settings/network', { method: 'PUT', body: JSON.stringify({ proxyUrl, enabled }) });
-      if (network) setEnabled(network.enabled);
-      onSaved(network ? (network.active ? '网络代理已保存。' : '网络代理已关闭。') : '网络代理由环境变量管理。');
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存设置。'); }
-    finally { setBusy(false); }
-  }
-  const form = <form className={`editor network-settings ${embedded ? 'embedded-settings-form' : ''}`} onSubmit={save}>
-    <header><div><p className="eyebrow">网络连接</p><h2 id="network-title">网络代理</h2></div><div className="network-header-actions"><label className="toggle"><input type="checkbox" checked={enabled} disabled={busy || fromEnvironment} onChange={(event) => setEnabled(event.target.checked)} /><span />启用代理</label>{onClose && <button type="button" className="close" onClick={onClose}>×</button>}</div></header>
-    {fromEnvironment ? <div className="environment-note">当前代理由 Docker 的 <code>OUTBOUND_PROXY</code> 环境变量提供。请在部署配置中修改。</div> : <label>HTTP / HTTPS 代理地址<input disabled={busy} value={proxyUrl} onChange={(event) => setProxyUrl(event.target.value)} /></label>}
-    {error && <p className="form-error">{error}</p>}
-    <footer>{onClose && <button type="button" className="secondary" onClick={onClose}>取消</button>}<button className="primary" disabled={busy} type="submit">{busy ? '读取中…' : '保存设置'}</button></footer>
-  </form>;
-  return embedded ? <section id="network" className="settings-section">{form}</section> : <div className="overlay" role="dialog" aria-modal="true" aria-labelledby="network-title">{form}</div>;
+      .then((network) => {
+        setProxyUrl(network.proxyUrl);
+        setEnabled(network.enabled);
+        setFromEnvironment(network.fromEnvironment);
+        setBaseline({ proxyUrl: network.proxyUrl, enabled: network.enabled });
+      })
+      .catch((reason) => setStatus({ tone: 'error', message: reason instanceof Error ? reason.message : '无法读取网络设置。' }))
+      .finally(() => setLoading(false));
+  }, [setStatus]);
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (busy || fromEnvironment || !dirty) return;
+    void run('save', async () => {
+      const network = await request<{ active: boolean; enabled: boolean }>('/api/settings/network', { method: 'PUT', body: JSON.stringify({ proxyUrl, enabled }) });
+      setEnabled(network.enabled);
+      setBaseline({ proxyUrl, enabled: network.enabled });
+      return network.active ? '网络代理已保存。' : '网络代理已保存，代理当前关闭。';
+    }, '无法保存网络设置。');
+  };
+  const discard = () => {
+    if (!baseline) return;
+    setProxyUrl(baseline.proxyUrl);
+    setEnabled(baseline.enabled);
+    setStatus(null);
+  };
+  const section = <SettingsSection
+    id={embedded ? 'network' : undefined}
+    eyebrow="网络连接"
+    title="网络代理"
+    description="普通抓取、浏览器渲染与磁力检索都会使用这里的代理；仅支持 HTTP / HTTPS 代理。"
+    loading={loading}
+    dirty={dirty}
+    status={status}
+    onSubmit={submit}
+    actions={<>
+      {onClose && !embedded && <SettingsActionButton disabled={busy} onClick={onClose}>取消</SettingsActionButton>}
+      {dirty && !fromEnvironment && <SettingsActionButton disabled={busy} onClick={discard}>撤销更改</SettingsActionButton>}
+      <SettingsActionButton tone="primary" type="submit" busy={pending === 'save'} disabled={busy || fromEnvironment || !dirty}>{pending === 'save' ? '保存中…' : '保存设置'}</SettingsActionButton>
+    </>}
+  >
+    {fromEnvironment
+      ? <p className="settings-notice">当前代理由部署环境的 <code>OUTBOUND_PROXY</code> 环境变量提供，网页内无法修改。</p>
+      : <>
+        <div className="settings-group">
+          <SettingsToggle label="启用代理" hint="关闭后所有抓取都会直连目标站点。" checked={enabled} disabled={busy} onChange={setEnabled} />
+        </div>
+        <div className="settings-grid">
+          <SettingsField wide label="HTTP / HTTPS 代理地址" hint="例如 http://192.168.1.10:7890；代理在其他设备时请填写其局域网地址。">
+            <input disabled={busy || !enabled} value={proxyUrl} onChange={(event) => setProxyUrl(event.target.value)} placeholder="http://192.168.1.10:7890" />
+          </SettingsField>
+        </div>
+      </>}
+  </SettingsSection>;
+  return embedded ? section : <div className="overlay" role="dialog" aria-modal="true" aria-labelledby="network-title">{section}</div>;
 }
 
 function RuntimeSettingsPanel({ onNotice }: { onNotice: (message: string) => void }) {
   const [runtime, setRuntime] = useState<RuntimeSettings>({ profile: 'safe', browserIdleMinutes: 10 });
-  const [busy, setBusy] = useState(true);
-  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [baseline, setBaseline] = useState<RuntimeSettings | null>(null);
+  const { pending, status, setStatus, run } = useSettingsActions();
+  void onNotice;
+  const busy = pending !== '';
+  const dirty = baseline !== null && JSON.stringify(runtime) !== JSON.stringify(baseline);
   useEffect(() => {
     void request<RuntimeSettings>('/api/settings/runtime')
-      .then(setRuntime)
-      .catch((reason) => setError(reason instanceof Error ? reason.message : '无法读取运行性能设置。'))
-      .finally(() => setBusy(false));
-  }, []);
-  async function save(event: FormEvent) {
-    event.preventDefault(); setBusy(true); setError('');
-    try {
-      setRuntime(await request<RuntimeSettings>('/api/settings/runtime', { method: 'PUT', body: JSON.stringify(runtime) }));
-      onNotice('运行性能已保存。');
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存运行性能设置。'); }
-    finally { setBusy(false); }
-  }
-  return <section id="runtime" className="settings-section"><form className="editor embedded-settings-form runtime-settings" onSubmit={save}>
-    <header><div><p className="eyebrow">执行引擎</p><h2>运行性能</h2></div></header>
-    <p className="network-copy">MissAV 始终优先浏览器渲染；不会自动切换为高并发 HTTP 抓取。</p>
-    <section className="runtime-settings-card"><div><strong>浏览器资源</strong><small>仅在有网页任务时启动 Chromium；空闲后会自动退出以回收内存。</small></div><div className="two-col"><label>浏览器模式<select disabled={busy} value={runtime.profile} onChange={(event) => setRuntime((current) => ({ ...current, profile: event.target.value as RuntimeSettings['profile'] }))}><option value="safe">稳妥：单页并发</option><option value="performance">性能：最多两页并发</option></select><span className="field-note">性能模式会提高内存占用和站点访问风险。</span></label><label>空闲回收<select disabled={busy} value={runtime.browserIdleMinutes} onChange={(event) => setRuntime((current) => ({ ...current, browserIdleMinutes: Number(event.target.value) as RuntimeSettings['browserIdleMinutes'] }))}><option value={5}>5 分钟</option><option value={10}>10 分钟（默认）</option><option value={20}>20 分钟</option></select><span className="field-note">没有浏览器任务时，Chromium 会自动退出。</span></label></div></section>
-    {error && <p className="form-error">{error}</p>}
-    <footer><button className="primary" disabled={busy} type="submit">{busy ? '读取中…' : '保存运行性能'}</button></footer>
-  </form></section>;
+      .then((settings) => { setRuntime(settings); setBaseline(settings); })
+      .catch((reason) => setStatus({ tone: 'error', message: reason instanceof Error ? reason.message : '无法读取运行性能设置。' }))
+      .finally(() => setLoading(false));
+  }, [setStatus]);
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (busy || !dirty) return;
+    void run('save', async () => {
+      const settings = await request<RuntimeSettings>('/api/settings/runtime', { method: 'PUT', body: JSON.stringify(runtime) });
+      setRuntime(settings);
+      setBaseline(settings);
+      return '运行性能已保存，下一个任务开始生效。';
+    }, '无法保存运行性能设置。');
+  };
+  const discard = () => {
+    if (!baseline) return;
+    setRuntime(baseline);
+    setStatus(null);
+  };
+  return <SettingsSection
+    id="runtime"
+    eyebrow="执行引擎"
+    title="运行性能"
+    description="控制浏览器渲染的并发与回收节奏；任务始终优先使用浏览器渲染，不会退回高并发抓取。"
+    loading={loading}
+    dirty={dirty}
+    status={status}
+    onSubmit={submit}
+    actions={<>
+      {dirty && <SettingsActionButton disabled={busy} onClick={discard}>撤销更改</SettingsActionButton>}
+      <SettingsActionButton tone="primary" type="submit" busy={pending === 'save'} disabled={busy || !dirty}>{pending === 'save' ? '保存中…' : '保存运行性能'}</SettingsActionButton>
+    </>}
+  >
+    <div className="settings-grid">
+      <SettingsField label="浏览器模式" hint="性能模式最多两页并发，会增加内存占用和站点访问风险。">
+        <select disabled={busy} value={runtime.profile} onChange={(event) => setRuntime((current) => ({ ...current, profile: event.target.value as RuntimeSettings['profile'] }))}>
+          <option value="safe">稳妥：单页并发</option>
+          <option value="performance">性能：最多两页并发</option>
+        </select>
+      </SettingsField>
+      <SettingsField label="空闲回收" hint="没有浏览器任务时，Chromium 会在该时长后退出并释放内存。">
+        <select disabled={busy} value={runtime.browserIdleMinutes} onChange={(event) => setRuntime((current) => ({ ...current, browserIdleMinutes: Number(event.target.value) as RuntimeSettings['browserIdleMinutes'] }))}>
+          <option value={5}>5 分钟</option>
+          <option value={10}>10 分钟（默认）</option>
+          <option value={20}>20 分钟</option>
+        </select>
+      </SettingsField>
+    </div>
+  </SettingsSection>;
 }
 
 function NotificationSettingsModal({ onClose, onNotice, embedded = false }: { onClose?: () => void; onNotice: (message: string) => void; embedded?: boolean }) {
   const [form, setForm] = useState<NotificationForm>(blankNotificationForm);
   const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
+  const [baseline, setBaseline] = useState<NotificationForm | null>(null);
+  const { pending, status, setStatus, run } = useSettingsActions();
+  void onNotice;
+  const busy = pending !== '';
+  const dirty = baseline !== null && JSON.stringify(form) !== JSON.stringify(baseline);
   useEffect(() => {
     void request<NotificationSettings>('/api/settings/notifications')
-      .then((settings) => setForm({ ...settings, wecomWebhook: '', dingtalkWebhook: '', dingtalkSecret: '', webhookUrl: '', webhookHmacSecret: '' }))
-      .catch((reason) => setError(reason instanceof Error ? reason.message : '无法读取通知设置。'))
+      .then((settings) => {
+        const next: NotificationForm = { ...settings, wecomWebhook: '', dingtalkWebhook: '', dingtalkSecret: '', webhookUrl: '', webhookHmacSecret: '' };
+        setForm(next);
+        setBaseline(next);
+      })
+      .catch((reason) => setStatus({ tone: 'error', message: reason instanceof Error ? reason.message : '无法读取通知设置。' }))
       .finally(() => setLoading(false));
-  }, []);
-
+  }, [setStatus]);
   const update = <K extends keyof NotificationForm>(key: K, value: NotificationForm[K]) => setForm((current) => ({ ...current, [key]: value }));
   const updateEvent = <K extends keyof NotificationEvents>(key: K, value: boolean) => setForm((current) => ({ ...current, events: { ...current.events, [key]: value } }));
-  const configuredLabel = (configured: boolean) => configured ? '********' : '';
+  const configuredLabel = (configured: boolean) => configured ? '已保存，留空则不修改' : '';
   function payload() {
     const { wecomWebhook, dingtalkWebhook, dingtalkSecret, webhookUrl, webhookHmacSecret, ...settings } = form;
     return {
@@ -2160,47 +2462,96 @@ function NotificationSettingsModal({ onClose, onNotice, embedded = false }: { on
       ...(webhookHmacSecret.trim() ? { webhookHmacSecret: webhookHmacSecret.trim() } : {})
     };
   }
-  async function save(showNotice = true) {
+  async function putSettings() {
     const settings = await request<NotificationSettings>('/api/settings/notifications', { method: 'PUT', body: JSON.stringify(payload()) });
-    setForm({ ...settings, wecomWebhook: '', dingtalkWebhook: '', dingtalkSecret: '', webhookUrl: '', webhookHmacSecret: '' });
-    if (showNotice) onNotice(settings.enabled ? '通知设置已保存并启用。' : '通知设置已保存，通知当前关闭。');
+    const next: NotificationForm = { ...settings, wecomWebhook: '', dingtalkWebhook: '', dingtalkSecret: '', webhookUrl: '', webhookHmacSecret: '' };
+    setForm(next);
+    setBaseline(next);
+    return settings;
   }
-  async function submit(event: FormEvent) {
+  const submit = (event: FormEvent) => {
     event.preventDefault();
-    setBusy(true); setError('');
-    try { await save(); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : '无法保存通知设置。'); }
-    finally { setBusy(false); }
-  }
-  async function test() {
-    setBusy(true); setError('');
-    try {
-      await save(false);
+    if (busy || !dirty) return;
+    void run('save', async () => {
+      const settings = await putSettings();
+      return settings.enabled ? '通知设置已保存并启用。' : '通知设置已保存，通知当前关闭。';
+    }, '无法保存通知设置。');
+  };
+  const test = () => {
+    if (busy) return;
+    void run('test', async () => {
+      await putSettings();
       await request('/api/settings/notifications/test', { method: 'POST' });
-      onNotice('测试通知已发送。');
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '测试通知发送失败。'); }
-    finally { setBusy(false); }
-  }
+      return '测试通知已发送，请到对应渠道确认。';
+    }, '测试通知发送失败。');
+  };
+  const discard = () => {
+    if (!baseline) return;
+    setForm(baseline);
+    setStatus(null);
+  };
   const channelConfigured = form.channel === 'wecom' ? form.wecomWebhookConfigured : form.channel === 'dingtalk' ? form.dingtalkWebhookConfigured : form.webhookUrlConfigured;
   const channelInputPresent = form.channel === 'wecom' ? Boolean(form.wecomWebhook.trim()) : form.channel === 'dingtalk' ? Boolean(form.dingtalkWebhook.trim()) : Boolean(form.webhookUrl.trim());
-  const formContent = <form className={`editor notification-settings ${embedded ? 'embedded-settings-form' : ''}`} onSubmit={(event) => void submit(event)}>
-    <header><div><p className="eyebrow">通知与告警</p><h2 id="notification-title">通知设置</h2></div>{onClose && <button type="button" className="close" onClick={onClose}>×</button>}</header>
-    <p className="network-copy">全量检索完成后发送一条汇总；普通检查和下载进展可分别设置。中间重试不会发送，相同失败会在 30 分钟内合并。</p>
-    <label className="toggle"><input type="checkbox" checked={form.enabled} disabled={loading || busy} onChange={(event) => update('enabled', event.target.checked)} /><span />启用通知</label>
-    <label>主通知渠道<select disabled={loading || busy} value={form.channel} onChange={(event) => update('channel', event.target.value as NotificationChannel)}><option value="wecom">企业微信机器人</option><option value="dingtalk">钉钉机器人</option><option value="webhook">通用 Webhook</option></select><span className="field-note">一次只向一个主渠道发送；切换不会删除其他渠道的已保存地址。</span></label>
-    <section className="runtime-settings-card"><div><strong>通知事件</strong><small>全量检索汇总默认开启，其他成功类进展可单独设置。</small></div>
-      <label className="toggle"><input type="checkbox" checked={form.events.content_discovered} disabled={loading || busy} onChange={(event) => updateEvent('content_discovered', event.target.checked)} /><span />发现新内容</label>
-      <label className="toggle"><input type="checkbox" checked={form.events.full_scan_completed} disabled={loading || busy} onChange={(event) => updateEvent('full_scan_completed', event.target.checked)} /><span />全量检索完成汇总</label>
-      <label className="toggle"><input type="checkbox" checked={form.events.operation_failed} disabled={loading || busy} onChange={(event) => updateEvent('operation_failed', event.target.checked)} /><span />任务最终失败</label>
-      <label className="toggle"><input type="checkbox" checked={form.events.magnet_found} disabled={loading || busy} onChange={(event) => updateEvent('magnet_found', event.target.checked)} /><span />已找到磁力链接</label>
-      <label className="toggle"><input type="checkbox" checked={form.events.download_completed} disabled={loading || busy} onChange={(event) => updateEvent('download_completed', event.target.checked)} /><span />qBittorrent 下载完成</label>
-    </section>
-    {form.channel === 'wecom' && <section className="runtime-settings-card"><div><strong>企业微信机器人</strong><small>在群聊中添加机器人后，粘贴其 Webhook 地址。</small></div><label>Webhook 地址<input type="password" autoComplete="off" disabled={loading || busy} value={form.wecomWebhook} onChange={(event) => update('wecomWebhook', event.target.value)} placeholder={configuredLabel(form.wecomWebhookConfigured)} /><span className="field-note">地址保存在服务端数据库中且不会回显；数据库和备份中为明文，请限制访问。</span></label></section>}
-    {form.channel === 'dingtalk' && <section className="runtime-settings-card"><div><strong>钉钉机器人</strong><small>可选填写“加签”安全设置中的签名密钥。</small></div><label>Webhook 地址<input type="password" autoComplete="off" disabled={loading || busy} value={form.dingtalkWebhook} onChange={(event) => update('dingtalkWebhook', event.target.value)} placeholder={configuredLabel(form.dingtalkWebhookConfigured)} /></label><label>签名密钥（可选）<input type="password" autoComplete="off" disabled={loading || busy} value={form.dingtalkSecret} onChange={(event) => update('dingtalkSecret', event.target.value)} placeholder={configuredLabel(form.dingtalkSecretConfigured)} /><span className="field-note">若机器人未启用“加签”，请留空。</span></label></section>}
-    {form.channel === 'webhook' && <section className="runtime-settings-card"><div><strong>通用 Webhook</strong><small>以 JSON POST 发送；可选 HMAC-SHA256 签名。</small></div><label>Webhook 地址<input type="password" autoComplete="off" disabled={loading || busy} value={form.webhookUrl} onChange={(event) => update('webhookUrl', event.target.value)} placeholder={configuredLabel(form.webhookUrlConfigured)} /></label><label>HMAC 密钥（可选）<input type="password" autoComplete="off" disabled={loading || busy} value={form.webhookHmacSecret} onChange={(event) => update('webhookHmacSecret', event.target.value)} placeholder={configuredLabel(form.webhookHmacSecretConfigured)} /><span className="field-note">签名在 <code>X-Page-Watch-Signature</code>，时间戳在 <code>X-Page-Watch-Timestamp</code>。</span></label></section>}
-    {!channelConfigured && <p className="field-note">保存并填写当前渠道地址后，才能发送测试通知或启用通知。</p>}
-    {error && <p className="form-error">{error}</p>}
-    <footer>{onClose && <button type="button" className="secondary" onClick={onClose}>关闭</button>}<button type="button" className="secondary" disabled={loading || busy || (!channelConfigured && !channelInputPresent)} onClick={() => void test()}>{busy ? '处理中…' : '保存并发送测试'}</button><button className="primary" disabled={loading || busy} type="submit">{busy ? '保存中…' : '保存通知设置'}</button></footer>
-  </form>;
-  return embedded ? <section id="notifications" className="settings-section">{formContent}</section> : <div className="overlay" role="dialog" aria-modal="true" aria-labelledby="notification-title">{formContent}</div>;
+  const testBlocked = !channelConfigured && !channelInputPresent;
+  const section = <SettingsSection
+    id={embedded ? 'notifications' : undefined}
+    eyebrow="通知与告警"
+    title="通知设置"
+    description="一次只向一个主渠道发送。全量检索完成后发送汇总；中间重试不发送，相同失败 30 分钟内合并。"
+    loading={loading}
+    dirty={dirty}
+    status={status}
+    onSubmit={submit}
+    actions={<>
+      {onClose && !embedded && <SettingsActionButton disabled={busy} onClick={onClose}>关闭</SettingsActionButton>}
+      {dirty && <SettingsActionButton disabled={busy} onClick={discard}>撤销更改</SettingsActionButton>}
+      <SettingsActionButton busy={pending === 'test'} disabled={(busy && pending !== 'test') || testBlocked} onClick={test}>{pending === 'test' ? '正在发送…' : '保存并发送测试'}</SettingsActionButton>
+      <SettingsActionButton tone="primary" type="submit" busy={pending === 'save'} disabled={busy || !dirty}>{pending === 'save' ? '保存中…' : '保存通知设置'}</SettingsActionButton>
+    </>}
+  >
+    <div className="settings-group">
+      <SettingsToggle label="启用通知" hint="关闭后不再发送任何通知，事件仍会记录在运行日志中。" checked={form.enabled} disabled={busy} onChange={(value) => update('enabled', value)} />
+    </div>
+    <div className="settings-grid">
+      <SettingsField label="主通知渠道" hint="切换渠道不会删除其他渠道已保存的地址。">
+        <select disabled={busy} value={form.channel} onChange={(event) => update('channel', event.target.value as NotificationChannel)}>
+          <option value="wecom">企业微信机器人</option>
+          <option value="dingtalk">钉钉机器人</option>
+          <option value="webhook">通用 Webhook</option>
+        </select>
+      </SettingsField>
+    </div>
+    <div className="settings-group-title">通知事件</div>
+    <div className="settings-group">
+      <SettingsToggle label="发现新内容" checked={form.events.content_discovered} disabled={busy} onChange={(value) => updateEvent('content_discovered', value)} />
+      <SettingsToggle label="全量检索完成汇总" checked={form.events.full_scan_completed} disabled={busy} onChange={(value) => updateEvent('full_scan_completed', value)} />
+      <SettingsToggle label="任务最终失败" checked={form.events.operation_failed} disabled={busy} onChange={(value) => updateEvent('operation_failed', value)} />
+      <SettingsToggle label="已找到磁力链接" checked={form.events.magnet_found} disabled={busy} onChange={(value) => updateEvent('magnet_found', value)} />
+      <SettingsToggle label="qBittorrent 下载完成" checked={form.events.download_completed} disabled={busy} onChange={(value) => updateEvent('download_completed', value)} />
+    </div>
+    <div className="settings-group-title">渠道地址</div>
+    <div className="settings-grid">
+      {form.channel === 'wecom' && <SettingsField wide label="Webhook 地址" hint="地址保存在服务端数据库中且不回显；数据库与备份中为明文，请限制访问。">
+        <input type="password" autoComplete="off" disabled={busy} value={form.wecomWebhook} onChange={(event) => update('wecomWebhook', event.target.value)} placeholder={configuredLabel(form.wecomWebhookConfigured)} />
+      </SettingsField>}
+      {form.channel === 'dingtalk' && <>
+        <SettingsField wide label="Webhook 地址">
+          <input type="password" autoComplete="off" disabled={busy} value={form.dingtalkWebhook} onChange={(event) => update('dingtalkWebhook', event.target.value)} placeholder={configuredLabel(form.dingtalkWebhookConfigured)} />
+        </SettingsField>
+        <SettingsField wide label="签名密钥（可选）" hint="机器人启用「加签」时填写，否则留空。">
+          <input type="password" autoComplete="off" disabled={busy} value={form.dingtalkSecret} onChange={(event) => update('dingtalkSecret', event.target.value)} placeholder={configuredLabel(form.dingtalkSecretConfigured)} />
+        </SettingsField>
+      </>}
+      {form.channel === 'webhook' && <>
+        <SettingsField wide label="Webhook 地址" hint="以 JSON POST 发送。">
+          <input type="password" autoComplete="off" disabled={busy} value={form.webhookUrl} onChange={(event) => update('webhookUrl', event.target.value)} placeholder={configuredLabel(form.webhookUrlConfigured)} />
+        </SettingsField>
+        <SettingsField wide label="HMAC 密钥（可选）" hint="签名在 X-Page-Watch-Signature，时间戳在 X-Page-Watch-Timestamp。">
+          <input type="password" autoComplete="off" disabled={busy} value={form.webhookHmacSecret} onChange={(event) => update('webhookHmacSecret', event.target.value)} placeholder={configuredLabel(form.webhookHmacSecretConfigured)} />
+        </SettingsField>
+      </>}
+    </div>
+    {testBlocked && <p className="settings-hint">填写当前渠道的地址后，才能发送测试通知。</p>}
+  </SettingsSection>;
+  return embedded ? section : <div className="overlay" role="dialog" aria-modal="true" aria-labelledby="notification-title">{section}</div>;
 }
