@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { ServerResponse } from 'node:http';
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
@@ -34,6 +34,7 @@ import {
   type RuleGroupReading,
   type SupplementStep
 } from './rule-groups.js';
+import { authPath, clearLoginFailures, loginAllowed, privateJson, pruneLoginFailures, recordFailedLogin, tokensMatch, trustProxyOption } from './http-guards.js';
 import { ExecutionEngineController } from './engine-controller.js';
 import { EngineWakeScheduler } from './engine-wake-scheduler.js';
 import { createTestNotification, deliverNotification, getNotificationSettings, normalizeNotificationSettings, publicNotificationSettings, saveNotificationSettings, type NotificationSettingsPayload } from './notifications.js';
@@ -49,19 +50,6 @@ if (!process.env.WORKER_EVENT_TOKEN && process.env.NODE_ENV !== 'production') pr
 // 网页服务只负责接口与调度，所有 Worker 都由统一执行引擎按需拉起；在模块加载
 // 阶段就关闭自启动，避免动态 import 下载观察器时在本进程里意外注册定时器。
 process.env.PAGE_WATCH_WORKER_AUTOSTART = '0';
-
-/**
- * trustProxy 决定 request.ip 是否采信 X-Forwarded-For。
- * - 未配置 / false：直连部署，不信任任何代理头，避免伪造 IP 绕过登录限流。
- * - true：信任所有上游（反代与容器在同一台机器时最省事）。
- * - 字符串：只信任指定地址或网段，例如 `172.16.0.0/12` 或 `127.0.0.1,172.17.0.1`。
- */
-function trustProxyOption(): boolean | string {
-  const raw = process.env.APP_TRUST_PROXY?.trim();
-  if (!raw || raw === 'false') return false;
-  if (raw === 'true') return true;
-  return raw;
-}
 
 const app = Fastify({
   logger: { level: 'warn' },
@@ -120,12 +108,6 @@ engineController.onChange((snapshot) => {
   emitLive('services');
   emitLive('metrics');
 });
-const loginFailures = new Map<string, { count: number; firstAt: number; lockedUntil: number }>();
-const loginWindowMs = 10 * 60_000;
-const loginLimit = 7;
-// 陌生 IP 的失败记录原本只在同一 IP 再次尝试时才清理，长期运行会只增不减。
-// 定期裁剪 + 条数上限让这张表始终停留在“最近一个窗口”的量级。
-const loginFailureEntryLimit = 200;
 type LiveChannel = 'archive' | 'logs' | 'subscriptions' | 'tasks' | 'task-summary' | 'task-active' | 'services' | 'metrics';
 const liveChannels = new Set<LiveChannel>(['archive', 'logs', 'subscriptions', 'tasks', 'task-summary', 'task-active', 'services', 'metrics']);
 type LiveClient = {
@@ -204,90 +186,6 @@ let lastSseKeepAliveAt = 0;
 // a hostname that is only resolvable from the proxy network.
 async function assertSafeUrl(raw: string) {
   return validateSafeUrl(raw, { allowUnresolvedViaProxy: true, hasOutboundProxy: Boolean(getOutboundProxyUrl()) });
-}
-
-/**
- * 令牌比较必须走常量时间，避免通过响应耗时逐字节猜测内部令牌。
- */
-function tokensMatch(given: unknown, expected: string) {
-  if (typeof given !== 'string' || !expected) return false;
-  const a = Buffer.from(given);
-  const b = Buffer.from(expected);
-  return a.length === b.length && timingSafeEqual(a, b);
-}
-
-/**
- * 路由匹配器会先对路径做百分号解码（例如 `/%61pi/subscriptions` 会命中
- * `/api/subscriptions`），如果这里仍拿原始字符串做前缀比对，就会出现
- * 「路由命中了、鉴权却被跳过」的越权访问。这里做两轮解码以覆盖双重编码，
- * 再把反斜杠与重复斜杠折叠，交给 URL 解析器消掉 `.` 与 `..` 段。
- */
-function authPath(url: string) {
-  const raw = url.split('?')[0];
-  try {
-    let decoded = raw;
-    for (let round = 0; round < 2; round += 1) {
-      const next = decodeURIComponent(decoded);
-      if (next === decoded) break;
-      decoded = next;
-    }
-    return new URL(decoded.replace(/\\/g, '/').replace(/\/{2,}/g, '/'), 'http://page-watch.internal').pathname;
-  } catch {
-    return raw;
-  }
-}
-
-/** Authenticated API payloads are revalidated, never shared. The lightweight
- * ETag lets an inactive view keep its in-memory snapshot without re-downloading
- * identical task or subscription documents after it regains focus. */
-function privateJson(request: { headers: Record<string, string | string[] | undefined> }, reply: { header: (name: string, value: string) => unknown; code: (status: number) => { send: (value?: unknown) => unknown }; send: (value: unknown) => unknown }, payload: unknown) {
-  // `generatedAt` is intentionally informational. Excluding it from the
-  // validator makes conditional GET useful when the underlying read model is
-  // unchanged instead of defeating caching once per request.
-  const cachePayload = payload && typeof payload === 'object' && !Array.isArray(payload)
-    ? Object.fromEntries(Object.entries(payload as Record<string, unknown>).filter(([key]) => key !== 'generatedAt'))
-    : payload;
-  const encoded = JSON.stringify(cachePayload);
-  const etag = `\"${createHash('sha1').update(encoded).digest('base64url')}\"`;
-  reply.header('Cache-Control', 'private, max-age=0, must-revalidate');
-  reply.header('Vary', 'Accept-Encoding, Cookie');
-  reply.header('ETag', etag);
-  if (request.headers['if-none-match'] === etag) return reply.code(304).send();
-  return reply.send(payload);
-}
-
-function loginAllowed(ip: string) {
-  const record = loginFailures.get(ip);
-  if (!record) return true;
-  if (record.lockedUntil > Date.now()) return false;
-  if (Date.now() - record.firstAt > loginWindowMs) { loginFailures.delete(ip); return true; }
-  return true;
-}
-
-function recordFailedLogin(ip: string) {
-  const current = loginFailures.get(ip);
-  const now = Date.now();
-  const next = !current || now - current.firstAt > loginWindowMs ? { count: 1, firstAt: now, lockedUntil: 0 } : { ...current, count: current.count + 1 };
-  if (next.count >= loginLimit) next.lockedUntil = now + loginWindowMs;
-  loginFailures.set(ip, next);
-  pruneLoginFailures(now);
-}
-
-/**
- * 只清理已经过了窗口且不在锁定期的记录；仍在锁定期的一律保留，
- * 否则超限裁剪会顺手把限流解除掉。
- */
-function pruneLoginFailures(now = Date.now()) {
-  for (const [ip, record] of loginFailures) {
-    if (record.lockedUntil > now) continue;
-    if (now - record.firstAt > loginWindowMs) loginFailures.delete(ip);
-  }
-  if (loginFailures.size <= loginFailureEntryLimit) return;
-  const removable = [...loginFailures.entries()]
-    .filter(([, record]) => record.lockedUntil <= now)
-    .sort((left, right) => left[1].firstAt - right[1].firstAt)
-    .slice(0, loginFailures.size - loginFailureEntryLimit);
-  for (const [ip] of removable) loginFailures.delete(ip);
 }
 
 function writeSse(client: LiveClient, event: string, data?: unknown) {
@@ -903,7 +801,7 @@ app.post('/api/auth/login', async (request, reply) => {
     recordFailedLogin(ip);
     return reply.code(401).send({ error: '访问密码不正确。' });
   }
-  loginFailures.delete(ip);
+  clearLoginFailures(ip);
   reply.header('Set-Cookie', sessionCookie(await createSession()));
   return { authenticated: true };
 });
