@@ -34,6 +34,7 @@ import {
   type SupplementStep
 } from './rule-groups.js';
 import { emitLive, registerLiveRoutes, startLivePolling } from './sse-hub.js';
+import { assertSafeUrl, normalizePayload, normalizePaginationPayload, normalizePresetPayload, resolveMissavPayload, updatePresetList, type MissavPresetListPayload, type MissavRulesPayload, type SubscriptionPayload, type SubscriptionPresetPayload } from './subscription-payload.js';
 import { authPath, clearLoginFailures, loginAllowed, privateJson, pruneLoginFailures, recordFailedLogin, tokensMatch, trustProxyOption } from './http-guards.js';
 import { registerAuthRoutes } from './routes/auth.js';
 import { registerOperationsRoutes } from './routes/operations.js';
@@ -166,12 +167,6 @@ async function withCodeSearchSubscriptionLock<T>(key: string, work: () => Promis
     if (codeSearchSubscriptionLocks.get(key) === current) codeSearchSubscriptionLocks.delete(key);
   }
 }
-// DNS may be intentionally delegated to the configured outbound proxy. Keep
-// API-side validation equally strict about private addresses without rejecting
-// a hostname that is only resolvable from the proxy network.
-async function assertSafeUrl(raw: string) {
-  return validateSafeUrl(raw, { allowUnresolvedViaProxy: true, hasOutboundProxy: Boolean(getOutboundProxyUrl()) });
-}
 
 startLivePolling(app);
 
@@ -201,130 +196,6 @@ app.addHook('onRequest', async (request, reply) => {
   if (!status.authenticated) return reply.code(401).send({ error: '登录已失效，请重新登录。' });
 });
 
-type SubscriptionPayload = {
-  name: string;
-  ruleFamily?: 'missav' | 'legacy_custom';
-  presetId?: number | null;
-  renderModeOverride?: 'static' | 'dynamic' | null;
-  url: string;
-  selector: string;
-  renderMode?: 'static' | 'dynamic';
-  contentSource?: 'text' | 'attribute';
-  attributeName?: string;
-  matchPattern?: string;
-  titleSelector?: string;
-  titleContentSource?: 'text' | 'attribute';
-  titleAttributeName?: string;
-  titleMatchPattern?: string;
-  resultMode?: 'first' | 'all';
-  intervalMinutes?: number;
-  scheduleType?: 'hourly' | 'daily' | 'weekly';
-  scheduleIntervalHours?: number;
-  scheduleTime?: string;
-  scheduleWeekday?: number;
-  isActive?: boolean;
-  paginationSelector?: string;
-  paginationParameter?: string;
-  paginationMatchPattern?: string;
-};
-
-type SubscriptionPresetPayload = Omit<SubscriptionPayload, 'url'> & { description?: string };
-/** 列表读取规则的一次提交：带已有 id 的更新，没有 id 的新建。 */
-type PresetListRow = SubscriptionPresetPayload & { id?: number | null };
-type MissavRulesPayload = { presetId?: number; preset?: SubscriptionPresetPayload; presets?: PresetListRow[]; sites?: unknown; inspectionRules?: unknown };
-type MissavPresetListPayload = { presets?: PresetListRow[]; sites?: unknown; inspectionRules?: unknown };
-function normalizePaginationPayload(payload: Pick<SubscriptionPayload, 'paginationSelector' | 'paginationParameter' | 'paginationMatchPattern'>) {
-  const selector = payload.paginationSelector?.trim() || null;
-  const parameter = payload.paginationParameter?.trim() || 'page';
-  const matchPattern = selector ? payload.paginationMatchPattern?.trim() || null : null;
-  if (parameter.length > 64 || !/^[A-Za-z][A-Za-z0-9_.-]*$/.test(parameter)) throw new Error('分页参数名格式无效。');
-  if (matchPattern && matchPattern.length > 480) throw new Error('分页页数匹配规则不能超过 480 个字符。');
-  if (matchPattern) {
-    try { new RegExp(matchPattern, 'i'); } catch { throw new Error('分页页数匹配规则不是有效的正则表达式。'); }
-  }
-  return { paginationSelector: selector, paginationParameter: parameter, paginationMatchPattern: matchPattern };
-}
-
-/** 一次保存整组列表读取规则：已存在的更新，没有 id 的新建，未提交的删除。 */
-async function updatePresetList(tx: Pick<DatabaseClient, 'run' | 'get'>, rows: PresetListRow[], now: string) {
-  const keptIds: number[] = [];
-  for (const row of rows) {
-    const values = normalizePresetPayload(row as unknown as SubscriptionPresetPayload);
-    const id = Number(row.id);
-    if (Number.isInteger(id) && id > 0) {
-      if (!await tx.get('SELECT id FROM subscription_presets WHERE id=?', [id])) throw new Error('读取规则已被删除，请刷新页面后重试。');
-      await tx.run(`UPDATE subscription_presets SET name=?, description=?, selector=?, render_mode=?, content_source=?, attribute_name=?, match_pattern=?, title_selector=?, title_content_source=?, title_attribute_name=?, title_match_pattern=?, result_mode=?, interval_minutes=?, pagination_selector=?, pagination_parameter=?, pagination_match_pattern=?, is_active=?, updated_at=? WHERE id=?`,
-        [values.name, values.description, values.selector, values.renderMode, values.contentSource, values.attributeName, values.matchPattern, values.titleSelector, values.titleContentSource, values.titleAttributeName, values.titleMatchPattern, values.resultMode, values.interval, values.paginationSelector, values.paginationParameter, values.paginationMatchPattern, values.isActive, now, id]);
-      keptIds.push(id); continue;
-    }
-    const inserted = await tx.run(`INSERT INTO subscription_presets (name, description, selector, render_mode, content_source, attribute_name, match_pattern, title_selector, title_content_source, title_attribute_name, title_match_pattern, result_mode, interval_minutes, pagination_selector, pagination_parameter, pagination_match_pattern, is_active, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [values.name, values.description, values.selector, values.renderMode, values.contentSource, values.attributeName, values.matchPattern, values.titleSelector, values.titleContentSource, values.titleAttributeName, values.titleMatchPattern, values.resultMode, values.interval, values.paginationSelector, values.paginationParameter, values.paginationMatchPattern, values.isActive, now, now]);
-    keptIds.push(inserted.lastInsertRowid);
-  }
-  if (keptIds.length) await tx.run(`DELETE FROM subscription_presets WHERE id NOT IN (${keptIds.map(() => '?').join(', ')})`, keptIds);
-  else await tx.run('DELETE FROM subscription_presets');
-  return keptIds;
-}
-
-async function resolveMissavPayload(payload: SubscriptionPayload): Promise<{ values: Awaited<ReturnType<typeof normalizePayload>>; family: 'missav' | 'legacy_custom'; presetId: number | null; override: 'static' | 'dynamic' | null }> {
-  if (payload.ruleFamily !== 'missav') return { values: await normalizePayload(payload), family: 'legacy_custom', presetId: null, override: null };
-  const host = new URL((await assertSafeUrl(payload.url)).toString()).hostname.toLowerCase();
-  const presetId = Number(payload.presetId);
-  const preset = await db.get<Subscription & { sites_json?: string | null }>(`SELECT * FROM subscription_presets WHERE id=?`, [presetId]);
-  if (!preset) throw new Error('请选择有效的检查规则组。');
-  // 只有规则组自己声明了站点时才限制主机名；站点为空表示任意网站都可以用这组规则。
-  const groupSites = parseSitesJson(preset.sites_json);
-  if (groupSites.length) {
-    const allowedHosts = groupSites.map((site) => { try { return new URL(site).hostname.toLowerCase(); } catch { return ''; } }).filter(Boolean);
-    if (!allowedHosts.includes(host)) throw new Error(`这组检查规则只适用于已声明的站点：${groupSites.join('、')}。`);
-  }
-  const override = payload.renderModeOverride === 'static' || payload.renderModeOverride === 'dynamic' ? payload.renderModeOverride : null;
-  const values = await normalizePayload({ ...payload, selector: preset.selector, renderMode: override ?? preset.render_mode, contentSource: preset.content_source, attributeName: preset.attribute_name ?? '', matchPattern: preset.match_pattern ?? '', titleSelector: preset.title_selector ?? '', titleContentSource: preset.title_content_source, titleAttributeName: preset.title_attribute_name ?? '', titleMatchPattern: preset.title_match_pattern ?? '', resultMode: preset.result_mode, paginationSelector: preset.pagination_selector ?? '', paginationParameter: preset.pagination_parameter, paginationMatchPattern: preset.pagination_match_pattern ?? '' });
-  return { values, family: 'missav', presetId, override };
-}
-
-function normalizePresetPayload(payload: SubscriptionPresetPayload) {
-  const name = payload.name?.trim();
-  const description = payload.description?.trim() ?? '';
-  const selector = payload.selector?.trim();
-  const interval = Number(payload.intervalMinutes ?? 60);
-  const renderMode = payload.renderMode === 'dynamic' ? 'dynamic' : 'static';
-  const contentSource = payload.contentSource === 'attribute' ? 'attribute' : 'text';
-  const attributeName = payload.attributeName?.trim() || null;
-  const matchPattern = payload.matchPattern?.trim() || null;
-  const titleSelector = payload.titleSelector?.trim() || null;
-  const titleContentSource = payload.titleContentSource === 'attribute' ? 'attribute' : 'text';
-  const titleAttributeName = titleSelector ? payload.titleAttributeName?.trim() || null : null;
-  const titleMatchPattern = titleSelector ? payload.titleMatchPattern?.trim() || null : null;
-  const resultMode = payload.resultMode === 'all' ? 'all' : 'first';
-  const pagination = normalizePaginationPayload(payload);
-  if (!name || name.length > 80) throw new Error('请填写不超过 80 个字符的规则名称。');
-  if (description.length > 200) throw new Error('规则说明不能超过 200 个字符。');
-  if (!selector) throw new Error('请填写 CSS 选择器。');
-  if (contentSource === 'attribute' && !attributeName) throw new Error('请填写要提取的属性名。');
-  if (attributeName && !/^[A-Za-z_:][-A-Za-z0-9_:.]*$/.test(attributeName)) throw new Error('属性名格式无效。');
-  if (matchPattern && matchPattern.length > 240) throw new Error('内容匹配规则不能超过 240 个字符。');
-  if (matchPattern) {
-    try { new RegExp(matchPattern, 'i'); } catch { throw new Error('内容匹配规则不是有效的正则表达式。'); }
-  }
-  if (titleSelector && titleContentSource === 'attribute' && !titleAttributeName) throw new Error('请填写标题要提取的属性名。');
-  if (titleAttributeName && !/^[A-Za-z_:][-A-Za-z0-9_:.]*$/.test(titleAttributeName)) throw new Error('标题属性名格式无效。');
-  if (titleMatchPattern && titleMatchPattern.length > 240) throw new Error('标题匹配规则不能超过 240 个字符。');
-  if (titleMatchPattern) {
-    try { new RegExp(titleMatchPattern, 'i'); } catch { throw new Error('标题匹配规则不是有效的正则表达式。'); }
-  }
-  if (!Number.isInteger(interval) || interval < 1 || interval > 10080) throw new Error('检查间隔需在 1 到 10080 分钟之间。');
-  return { name, description, selector, renderMode, contentSource, attributeName, matchPattern, titleSelector, titleContentSource, titleAttributeName, titleMatchPattern, resultMode, interval, ...pagination, isActive: payload.isActive === false ? 0 : 1 };
-}
-
-/**
- * 规则组改动后，把读取列复制到跟随它的订阅上。
- *
- * 订阅行保存的是读取配置的副本（Worker 只读订阅），所以改完规则组必须同步一次，
- * 否则页面上的修改要等订阅重新保存才生效。presetId 为空时同步全部 missav 订阅，
- * 供兼容接口沿用原有的整体保存行为。
- */
 async function syncSubscriptionsFromPresets(tx: Pick<DatabaseClient, 'run'>, now: string, presetId?: number) {
   const filter = presetId === undefined ? '' : ' AND p.id = ?';
   const params = presetId === undefined ? [] : [presetId];
@@ -472,51 +343,6 @@ async function writeInspectionSites(
   return rules;
 }
 
-async function normalizePayload(payload: SubscriptionPayload) {
-  const name = payload.name?.trim();
-  const selector = payload.selector?.trim();
-  const interval = Number(payload.intervalMinutes ?? 60);
-  const scheduleType = payload.scheduleType === 'daily' || payload.scheduleType === 'weekly' ? payload.scheduleType : 'hourly';
-  const scheduleIntervalHours = Number(payload.scheduleIntervalHours ?? Math.max(1, Math.round(interval / 60)));
-  const scheduleTime = payload.scheduleTime ?? '09:00';
-  const scheduleWeekday = Number(payload.scheduleWeekday ?? 1);
-  const renderMode = payload.renderMode === 'dynamic' ? 'dynamic' : 'static';
-  const contentSource = payload.contentSource === 'attribute' ? 'attribute' : 'text';
-  const attributeName = payload.attributeName?.trim() || null;
-  const matchPattern = payload.matchPattern?.trim() || null;
-  const titleSelector = payload.titleSelector?.trim() || null;
-  const titleContentSource = payload.titleContentSource === 'attribute' ? 'attribute' : 'text';
-  const titleAttributeName = titleSelector ? payload.titleAttributeName?.trim() || null : null;
-  const titleMatchPattern = titleSelector ? payload.titleMatchPattern?.trim() || null : null;
-  const resultMode = payload.resultMode === 'all' ? 'all' : 'first';
-  const pagination = normalizePaginationPayload(payload);
-  if (!name) throw new Error('请填写订阅名称。');
-  if (!selector) throw new Error('请先选择检查规则。');
-  if (contentSource === 'attribute' && !attributeName) throw new Error('请填写要提取的属性名。');
-  if (attributeName && !/^[A-Za-z_:][-A-Za-z0-9_:.]*$/.test(attributeName)) throw new Error('属性名格式无效。');
-  if (matchPattern && matchPattern.length > 240) throw new Error('内容匹配规则不能超过 240 个字符。');
-  if (matchPattern) {
-    try { new RegExp(matchPattern, 'i'); } catch (error) {
-      const detail = error instanceof Error ? error.message : 'unknown error';
-      throw new Error(`内容匹配规则不是有效的正则表达式：${detail}`);
-    }
-  }
-  if (titleSelector && titleContentSource === 'attribute' && !titleAttributeName) throw new Error('请填写标题要提取的属性名。');
-  if (titleAttributeName && !/^[A-Za-z_:][-A-Za-z0-9_:.]*$/.test(titleAttributeName)) throw new Error('标题属性名格式无效。');
-  if (titleMatchPattern && titleMatchPattern.length > 240) throw new Error('标题匹配规则不能超过 240 个字符。');
-  if (titleMatchPattern) {
-    try { new RegExp(titleMatchPattern, 'i'); } catch (error) {
-      const detail = error instanceof Error ? error.message : 'unknown error';
-      throw new Error(`标题匹配规则不是有效的正则表达式：${detail}`);
-    }
-  }
-  if (!Number.isInteger(interval) || interval < 1 || interval > 10080) throw new Error('检查间隔需在 1 到 10080 分钟之间。');
-  if (!Number.isInteger(scheduleIntervalHours) || scheduleIntervalHours < 1 || scheduleIntervalHours > 168) throw new Error('按小时检查需设置为 1 到 168 小时。');
-  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(scheduleTime)) throw new Error('检查时间需使用 HH:MM 格式。');
-  if (!Number.isInteger(scheduleWeekday) || scheduleWeekday < 0 || scheduleWeekday > 6) throw new Error('请选择有效的每周检查日期。');
-  const url = (await assertSafeUrl(payload.url)).toString();
-  return { name, url, selector, interval: scheduleType === 'hourly' ? scheduleIntervalHours * 60 : 1440, scheduleType, scheduleIntervalHours, scheduleTime, scheduleWeekday, renderMode, contentSource, attributeName, matchPattern, titleSelector, titleContentSource, titleAttributeName, titleMatchPattern, resultMode, ...pagination, isActive: payload.isActive === false ? 0 : 1 };
-}
 
 app.get('/api/health', async () => ({ ok: true }));
 registerLiveRoutes(app);
