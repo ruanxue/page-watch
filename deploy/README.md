@@ -78,6 +78,30 @@ qBittorrent 不在 Docker 中，不能填写容器服务名，也不能填写 `1
 
 在网页的“下载与影视库”页，分别重新测试 qBittorrent 和 Jellyfin 连接。Jellyfin 改为内部地址后，既不会走公网，也不会绕行 NAS 的局域网 IP。
 
+## 反向代理（lucky / Nginx）
+
+项目支持挂在反向代理后面通过域名访问，但有三件事必须配对，否则会出现「登录后立刻掉线」「所有人都被限流」这类问题。
+
+**1. 保持页面与接口同域。** 推荐用同一个域名、同一路径前缀反代到 `http://NAS_LAN_IP:3030`，例如 `https://pw.example.com/` 整体转发。页面与 `/api` 同源时，Cookie 与实时推送都能正常工作。如果你把页面放在 A 域名、接口反代到 B 域名，浏览器会按跨站处理，登录会失败。
+
+**2. 在 `deploy/.env` 打开两个开关：**
+
+```ini
+# 通过 HTTPS 域名访问：让会话 Cookie 只走加密连接
+APP_SESSION_SECURE=true
+# 反代后面：让登录限流取到真实客户端 IP
+APP_TRUST_PROXY=true
+```
+
+- 不设 `APP_TRUST_PROXY` 时，`request.ip` 永远是代理的地址，登录失败次数会被所有外网用户共享——7 次之后所有人一起被锁 10 分钟。若反代与容器不在同一台机器，可以只信任代理网段：`APP_TRUST_PROXY=172.16.0.0/12`。
+- 设了 `APP_TRUST_PROXY=true` 就意味着完全信任 `X-Forwarded-For`，请确保 lucky / Nginx 会**覆盖**（而不是追加）客户端自带的该请求头，并且 3030 端口没有被直接暴露到公网。
+
+**3. 实时推送需要关闭响应缓冲。** `/api/events` 是 SSE 长连接，项目已下发 `X-Accel-Buffering: no` 与 `Cache-Control: no-transform`。如果幸运面板里开了「响应缓冲 / 压缩 / 缓存」，请对 `/api/events` 关闭；同时把读超时放宽到 5 分钟以上，否则页面会频繁重连。
+
+**关于两个访问入口的取舍：** 一旦 `APP_SESSION_SECURE=true`，用 `http://` 访问（含内网 IP 直连）时浏览器不会保存 Cookie，表现为「登录成功但立刻退回登录页」。这是 Secure 标志的正常行为。如果你既想外网 HTTPS 又想内网 HTTP 都能登录，可以把内网入口也套一层 HTTPS，或者内网只用 `http://NAS_LAN_IP:3030` 并从 `deploy/.env` 里去掉 `APP_SESSION_SECURE`（此时外网入口同样会失去该保护，请只在家用网络中取舍）。
+
+**如果页面样式正常但功能全挂**，先看浏览器控制台的 CSP 报错：生产模式会下发 `Content-Security-Policy`，若反代注入了额外的脚本或统计代码，会被拦下。此时应关闭反代的脚本注入，而不是放宽 CSP。
+
 ## 日常发布与升级
 
 电脑开发完成后：

@@ -8,6 +8,10 @@ test('only retries transient failures', () => {
   assert.equal(isRetryableJobError(new Error('内容匹配规则没有匹配到结果')), false);
 });
 
+test('treats a full local render queue as a transient failure', () => {
+  assert.equal(isRetryableJobError(new Error('网页渲染排队已满（32 个等待中），请稍后重试。')), true);
+});
+
 test('retry backoff keeps a small bounded jitter', () => {
   const first = retryDelayMs(1);
   const second = retryDelayMs(2);

@@ -3,6 +3,7 @@ import mysql, { type Pool, type PoolConnection, type ResultSetHeader } from 'mys
 import { ensureMySqlSchema } from './mysql-schema.js';
 import { databaseBootstrapForStartup, databaseBootstrapNeedsMigration, environmentDatabaseSettings, migrateLegacyDatabaseSettingsToPlaintext, normalizeDatabaseSettings, savedDatabaseSettings, saveDatabaseSettings, type MySqlConnectionSettings } from './database-bootstrap.js';
 import { defaultInspectionRules, inspectionRulesJson } from './inspection-rules.js';
+import { BUILTIN_GROUP_NAME, builtinSupplementSteps, legacyMissavGroupName, parseSitesJson, serializeSitesJson } from './rule-groups.js';
 import { notifyLive } from './live-events.js';
 import { decryptSecret, isEncryptedSecret, isPageWatchEncryptedValue, readOptionalLegacyApplicationEncryptionKey } from './secret-storage.js';
 import { resolveHeartbeatWrite, type WorkerHeartbeatContext, type WorkerHeartbeatOptions, type WorkerName, type WorkerTaskContext } from './worker-heartbeat.js';
@@ -205,7 +206,7 @@ let lastSettingsRefreshAt = 0;
 const SETTINGS_REFRESH_MS = 3_000;
 const missavTitlePattern = '^[A-Za-z]+-\\d+\\s*(.+)$';
 const defaultSubscriptionPresets = [
-  ['MissAV 番号列表', '适用于列表页，读取影片番号、标题和全部分页内容。', 'a.text-secondary[alt]', 'dynamic', 'attribute', 'alt', '', 'a.text-secondary[alt]', 'text', null, missavTitlePattern, 'all', 60, '#price-currency', 'page', '/\\s*(\\d+)', 1],
+  [BUILTIN_GROUP_NAME, '适用于列表页，读取影片番号、标题和全部分页内容。', 'a.text-secondary[alt]', 'dynamic', 'attribute', 'alt', '', 'a.text-secondary[alt]', 'text', null, missavTitlePattern, 'all', 60, '#price-currency', 'page', '/\\s*(\\d+)', 1],
   ['文章标题列表', '读取文章区域的一级、二级标题。', 'article h1, article h2, main h1, main h2', 'static', 'text', '', '', null, 'text', null, null, 'all', 120, null, 'page', null, 1],
   ['商品价格', '读取常见的价格字段，适合监测商品详情页。', '[itemprop="price"], .price, [data-price]', 'static', 'text', '', '', null, 'text', null, null, 'first', 30, null, 'page', null, 1],
   ['页面标题', '读取网页标题，适合检查页面是否替换或发布新版本。', 'title', 'static', 'text', '', '', null, 'text', null, null, 'first', 240, null, 'page', null, 1]
@@ -812,7 +813,7 @@ async function backfillMissavPaginationDefaults() {
   await db.transaction(async (tx) => {
     await tx.run(`UPDATE subscription_presets
       SET description = ?, pagination_selector = ?, pagination_parameter = ?, pagination_match_pattern = ?, updated_at = ?
-      WHERE name = 'MissAV 番号列表'
+      WHERE name IN ('MissAV 默认规则组', 'MissAV 番号列表')
         AND selector = 'a.text-secondary[alt]'
         AND (pagination_selector IS NULL OR TRIM(pagination_selector) = '')`,
     ['适用于列表页，读取影片番号、标题和全部分页内容。', '#price-currency', 'page', '/\\s*(\\d+)', now]);
@@ -867,6 +868,55 @@ async function assignLegacyMissavRules() {
   settings.set(migrationKey, '1');
 }
 
+/**
+ * 「检查规则组」一次性迁移：原先整个项目只有一份全局站点列表和两条写死的补全
+ * 步骤，现在它们归属到内置规则组自己身上。
+ *
+ * - 内置组：沿用当前 inspection_rules.sites 作为「适用站点」，并写入发行日期、
+ *   磁力链接两条内置步骤；旧名称「MissAV 番号列表」同时改为「MissAV 默认规则组」。
+ * - 其余已有预设：sites_json / steps_json 补成空数组。空站点表示不限站点，
+ *   空步骤表示没有自定义步骤，两者都不是错误状态。
+ * - 订阅的 rule_family 与读取列一律不动，迁移只补两列 JSON。
+ */
+async function migrateRuleGroups() {
+  const migrationKey = 'rule_groups_v1';
+  if (getSetting(migrationKey)) return;
+  const sites = (() => {
+    try {
+      const parsed = JSON.parse(getSetting('inspection_rules'));
+      const list = parseSitesJson(JSON.stringify((parsed as { sites?: unknown } | null)?.sites ?? []));
+      return list.length ? list : [...defaultInspectionRules.sites];
+    } catch { return [...defaultInspectionRules.sites]; }
+  })();
+  const builtinStepsJson = JSON.stringify(builtinSupplementSteps());
+  const builtinSitesJson = serializeSitesJson(sites);
+  const now = new Date().toISOString();
+  await db.transaction(async (tx) => {
+    // 旧版只可能有一组 MissAV 预设；优先按新名字找，其次按旧名字找。
+    const target = await tx.get<{ id: number }>(
+      `SELECT id FROM subscription_presets WHERE name IN (?, ?)
+        ORDER BY CASE WHEN name = ? THEN 0 ELSE 1 END, id ASC LIMIT 1`,
+      [BUILTIN_GROUP_NAME, legacyMissavGroupName, legacyMissavGroupName]);
+    if (target) {
+      await tx.run(`UPDATE subscription_presets SET name = ?, sites_json = ?, steps_json = ?, updated_at = ? WHERE id = ?`,
+        [BUILTIN_GROUP_NAME, builtinSitesJson, builtinStepsJson, now, target.id]);
+    } else {
+      // 使用者可能已经删掉了 MissAV 预设，这时补一组内置规则，保证页面仍有一组
+      // 可用的基础配置。
+      await tx.run(`INSERT INTO subscription_presets
+        (name, description, selector, render_mode, content_source, attribute_name, match_pattern, title_selector, title_content_source, title_attribute_name, title_match_pattern, result_mode, interval_minutes, pagination_selector, pagination_parameter, pagination_match_pattern, is_active, sites_json, steps_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [BUILTIN_GROUP_NAME, '适用于列表页，读取影片番号、标题和全部分页内容。', 'a.text-secondary[alt]', 'dynamic', 'attribute', 'alt', '', 'a.text-secondary[alt]', 'text', null, missavTitlePattern, 'all', 60, '#price-currency', 'page', '/\\s*(\\d+)', 1, builtinSitesJson, builtinStepsJson, now, now]);
+    }
+    // 其余预设（以及上面新建时没覆盖到的行）补空数组，但不覆盖已有配置。
+    await tx.run(`UPDATE subscription_presets SET sites_json = COALESCE(sites_json, '[]'), steps_json = COALESCE(steps_json, '[]')
+      WHERE sites_json IS NULL OR steps_json IS NULL`);
+    await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, '1', ?)
+      ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`, [migrationKey, now]);
+  });
+  settings.set(migrationKey, '1');
+}
+
 let initialization: Promise<void> | null = null;
 
 /**
@@ -885,6 +935,7 @@ export function initializeDatabase() {
     await backfillMissavPaginationDefaults();
     await seedDefaultInspectionRules();
     await assignLegacyMissavRules();
+    await migrateRuleGroups();
     await rebuildSubscriptionProgress();
   })();
   return initialization;

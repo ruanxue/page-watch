@@ -5,6 +5,7 @@ import { getSetting, setSetting } from './db.js';
 const scrypt = promisify(scryptCallback);
 const passwordSettingKey = 'app_auth_password_hash';
 const sessionSecretSettingKey = 'app_auth_session_secret';
+const sessionVersionSettingKey = 'app_auth_session_version';
 const sessionMaxAgeSeconds = 7 * 24 * 60 * 60;
 const passwordMinimumLength = 12;
 
@@ -28,6 +29,18 @@ function sign(payload: string, secret: string) {
   return createHmac('sha256', secret).update(payload).digest('base64url');
 }
 
+/** 会话版本号：登出或改密时递增，即可一次性吊销此前签发的全部会话。 */
+function currentSessionVersion() {
+  const raw = Number(getSetting(sessionVersionSettingKey));
+  return Number.isInteger(raw) && raw >= 0 ? String(raw) : '0';
+}
+
+export async function revokeSessions() {
+  const raw = Number(getSetting(sessionVersionSettingKey));
+  const next = (Number.isInteger(raw) && raw >= 0 ? raw : 0) + 1;
+  await setSetting(sessionVersionSettingKey, String(next));
+}
+
 function secureCookie() {
   return process.env.APP_SESSION_SECURE === 'true' ? '; Secure' : '';
 }
@@ -42,17 +55,39 @@ export function clearSessionCookie() {
 
 export async function createSession() {
   const expiresAt = Math.floor(Date.now() / 1000) + sessionMaxAgeSeconds;
-  const payload = `v1.${expiresAt}.${randomBytes(12).toString('base64url')}`;
+  const payload = `v1.${expiresAt}.${currentSessionVersion()}.${randomBytes(12).toString('base64url')}`;
   return `${payload}.${sign(payload, await sessionSecret())}`;
 }
 
 async function verifySession(value: string) {
-  const [version, rawExpiresAt, nonce, signature, extra] = value.split('.');
-  if (version !== 'v1' || !rawExpiresAt || !nonce || !signature || extra) return false;
+  const parts = value.split('.');
+  if (parts[0] !== 'v1') return false;
+  const rawExpiresAt = parts[1];
+  if (!rawExpiresAt) return false;
   const expiresAt = Number(rawExpiresAt);
   if (!Number.isInteger(expiresAt) || expiresAt <= Math.floor(Date.now() / 1000)) return false;
-  const expected = sign(`${version}.${rawExpiresAt}.${nonce}`, await sessionSecret());
-  const givenBuffer = Buffer.from(signature);
+  const secret = await sessionSecret();
+
+  // 新格式：v1.expires.version.nonce.signature，签名输入含版本号。
+  if (parts.length === 5) {
+    const [, , sessionVersion, nonce, signature] = parts;
+    if (!sessionVersion || !nonce || !signature) return false;
+    if (sessionVersion !== currentSessionVersion()) return false;
+    return signatureMatches(signature, sign(`v1.${rawExpiresAt}.${sessionVersion}.${nonce}`, secret));
+  }
+  // 旧格式：v1.expires.nonce.signature，签名输入不含版本号。只在会话版本仍为 0
+  // （从未登出或改密）时承认，升级瞬间不会要求所有人重新登录。
+  if (parts.length === 4) {
+    const [, , nonce, signature] = parts;
+    if (!nonce || !signature) return false;
+    if (currentSessionVersion() !== '0') return false;
+    return signatureMatches(signature, sign(`v1.${rawExpiresAt}.${nonce}`, secret));
+  }
+  return false;
+}
+
+function signatureMatches(given: string, expected: string) {
+  const givenBuffer = Buffer.from(given);
   const expectedBuffer = Buffer.from(expected);
   return givenBuffer.length === expectedBuffer.length && timingSafeEqual(givenBuffer, expectedBuffer);
 }

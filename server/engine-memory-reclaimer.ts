@@ -1,6 +1,6 @@
 import { appendRuntimeLog, getExecutionEngineQueueState, recordPerformanceMetric, reportRuntimeMetrics } from './db.js';
 import { beginExecutionEngineDrain, cancelExecutionEngineDrain } from './engine-drain.js';
-import { ENGINE_MEMORY_RECLAIM_IDLE_GRACE_MS, ENGINE_MEMORY_RECLAIM_THRESHOLD_BYTES, isEligibleForExecutionEngineMemoryReclaim } from './engine-memory-policy.js';
+import { ENGINE_MEMORY_RECLAIM_IDLE_GRACE_MS, engineMemoryReclaimThresholdBytes, isEligibleForExecutionEngineMemoryReclaim } from './engine-memory-policy.js';
 
 export const ENGINE_MEMORY_RECYCLE_EXIT_CODE = 75;
 
@@ -48,6 +48,8 @@ async function runControlledGc() {
 export class ExecutionEngineMemoryReclaimer {
   private readonly startedAt = Date.now();
   private readonly recycleNotBefore = configuredNotBefore();
+  // 启动时解析一次，回收器生命周期内保持一致，避免中途改环境变量导致判定抖动。
+  private readonly thresholdBytes = engineMemoryReclaimThresholdBytes();
   private idleSince: number | null = null;
   private checking = false;
   private recycling = false;
@@ -88,7 +90,7 @@ export class ExecutionEngineMemoryReclaimer {
         && jobs.running === 0
         && jobs.busyWorkers === 0;
 
-      if (!idleNow || rssBytes <= ENGINE_MEMORY_RECLAIM_THRESHOLD_BYTES) {
+      if (!idleNow || rssBytes <= this.thresholdBytes) {
         this.resetIdleWindow();
         return;
       }
@@ -100,6 +102,7 @@ export class ExecutionEngineMemoryReclaimer {
         recycleNotBefore: this.recycleNotBefore,
         idleSince: this.idleSince,
         rssBytes,
+        thresholdBytes: this.thresholdBytes,
         browserState: browser.state,
         activePages: browser.activePages,
         queuedPages: browser.queuedPages,
@@ -129,7 +132,7 @@ export class ExecutionEngineMemoryReclaimer {
       ]);
       await recordPerformanceMetric({ scope: 'runner', metric: 'memory_reclaim', dimension: gc.ran ? 'gc' : 'gc_unavailable' });
 
-      if (gc.after <= ENGINE_MEMORY_RECLAIM_THRESHOLD_BYTES) {
+      if (gc.after <= this.thresholdBytes) {
         if (gc.before - gc.after >= 8 * 1024 * 1024) {
           await appendRuntimeLog({ level: 'info', source: 'system', message: `统一执行引擎空闲内存回收：受控 GC 后 RSS 由 ${toMiB(gc.before)}MB 降至 ${toMiB(gc.after)}MB。` });
         }

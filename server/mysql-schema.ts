@@ -448,6 +448,11 @@ export async function ensureMySqlSchema(pool: Pool) {
   await addColumnIfMissing(pool, 'archive_entries', 'download_save_path', 'TEXT NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'download_content_path', 'TEXT NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'download_removed_at', 'VARCHAR(40) NULL');
+  // 下载观察器按 download_status 过滤、发行日期补全按 release_status 过滤、
+  // 引擎唤醒调度按 next_scheduled_at 排序，这三处此前都是全表扫描。
+  await addIndexIfMissing(pool, 'archive_entries', 'idx_archive_entries_download_status', 'KEY idx_archive_entries_download_status (download_status, id)');
+  await addIndexIfMissing(pool, 'archive_entries', 'idx_archive_entries_release_status', 'KEY idx_archive_entries_release_status (release_status, id)');
+  await addIndexIfMissing(pool, 'subscriptions', 'idx_subscriptions_active_schedule', 'KEY idx_subscriptions_active_schedule (is_active, next_scheduled_at)');
   await addColumnIfMissing(pool, 'archive_entries', 'download_filter_min_size_bytes', 'BIGINT NULL');
   await addColumnIfMissing(pool, 'archive_entries', 'jellyfin_status', "VARCHAR(16) NOT NULL DEFAULT 'unconfigured'");
   await addColumnIfMissing(pool, 'archive_entries', 'jellyfin_item_id', 'VARCHAR(64) NULL');
@@ -493,6 +498,10 @@ export async function ensureMySqlSchema(pool: Pool) {
   await addColumnIfMissing(pool, 'subscription_presets', 'pagination_selector', 'TEXT NULL');
   await addColumnIfMissing(pool, 'subscription_presets', 'pagination_parameter', "VARCHAR(64) NOT NULL DEFAULT 'page'");
   await addColumnIfMissing(pool, 'subscription_presets', 'pagination_match_pattern', 'VARCHAR(1024) NULL');
+  // 「检查规则组」把自己的适用站点与补充步骤存在这两列里，正文仍是 JSON 文本，
+  // 这样旧版本回滚时只是读不到新字段，不会破坏已有的读取规则。
+  await addColumnIfMissing(pool, 'subscription_presets', 'sites_json', 'TEXT NULL');
+  await addColumnIfMissing(pool, 'subscription_presets', 'steps_json', 'TEXT NULL');
   await addColumnIfMissing(pool, 'library_sync_jobs', 'trigger_type', "VARCHAR(16) NOT NULL DEFAULT 'scheduled'");
   await addColumnIfMissing(pool, 'library_sync_jobs', 'heartbeat_at', 'VARCHAR(40) NULL');
   await addColumnIfMissing(pool, 'library_sync_jobs', 'progress_phase', 'VARCHAR(32) NULL');
@@ -526,6 +535,10 @@ async function addColumnIfMissing(pool: Pool, table: string, column: string, def
   }
 }
 
+/**
+ * 补索引：这几列被下载观察器、发行日期补全和订阅调度反复按状态过滤，
+ * 没有索引时每次都要全表扫描，数据量涨起来后会明显拖慢后台轮询。
+ */
 async function addIndexIfMissing(pool: Pool, table: string, index: string, definition: string) {
   const [rows] = await pool.query<(RowDataPacket & { present: number })[]>(`SELECT COUNT(*) AS present
     FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?`, [table, index]);

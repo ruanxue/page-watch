@@ -16,7 +16,8 @@ export function isRetryableJobError(error: unknown) {
   const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
   if (!message) return false;
   if (/选择器|正则|规则|配置|订阅已删除|未启用|密码|api 密钥|身份验证|401|403|404|无效/.test(message)) return false;
-  return /fetch failed|timeout|timed out|econnreset|econnrefused|econnaborted|enetunreach|ehostunreach|eai_again|enotfound|dns|net::err|proxy|socket|network|429|5\d\d|无法解析/.test(message);
+  // “排队已满”是本进程自己的瞬时容量问题，等一会儿就能成功，按临时故障重试。
+  return /fetch failed|timeout|timed out|econnreset|econnrefused|econnaborted|enetunreach|ehostunreach|eai_again|enotfound|dns|net::err|proxy|socket|network|429|5\d\d|无法解析|排队已满/.test(message);
 }
 
 /** A safe, low-cardinality label for long-term telemetry. Never persist raw errors. */

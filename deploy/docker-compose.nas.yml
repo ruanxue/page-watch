@@ -35,6 +35,9 @@ services:
       # Read only by the one-time migration from the legacy encrypted format.
       PAGE_WATCH_ENCRYPTION_KEY_PATH: /data/app-encryption-key
       APP_SESSION_SECURE: ${APP_SESSION_SECURE:-false}
+      # 部署在反向代理（lucky / Nginx / 网关）后面时设为 true，或填写信任网段
+      # （如 172.16.0.0/12），让登录限流取到真实客户端 IP。
+      APP_TRUST_PROXY: ${APP_TRUST_PROXY:-false}
     volumes:
       - ../data:/data
     healthcheck:

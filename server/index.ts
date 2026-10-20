@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { ServerResponse } from 'node:http';
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
@@ -10,8 +10,30 @@ import { assertQbittorrentConfig, getQbittorrentTorrentStates, normalizeQbittorr
 import { assertJellyfinConfig, listJellyfinLibraries, normalizeJellyfinUrl, testJellyfinConnection } from './jellyfin.js';
 import { startRuntimeMemoryReporter } from './runtime-observability.js';
 import { clearJellyfinMediaIndex } from './jellyfin-cache.js';
-import { authenticate, clearSessionCookie, configurePassword, createSession, sessionCookie, statusFor, validatePassword } from './auth.js';
+import { authenticate, clearSessionCookie, configurePassword, createSession, revokeSessions, sessionCookie, statusFor, validatePassword } from './auth.js';
 import { defaultInspectionRules, getInspectionRules, inspectionRulesJson, normalizeInspectionRules, normalizeSiteUrl } from './inspection-rules.js';
+import {
+  BUILTIN_GROUP_NAME,
+  applyBuiltinStepFlags,
+  coerceRuleGroupReading,
+  coerceSupplementSteps,
+  collectReadingIssues,
+  collectSupplementStepIssues,
+  coerceRuleGroup,
+  isBuiltinGroup,
+  legacyMissavGroupName,
+  normalizeRuleGroupDescription,
+  normalizeRuleGroupName,
+  normalizeRuleGroupSites,
+  parseSitesJson,
+  parseStepsJson,
+  removedBuiltinSteps,
+  serializeSitesJson,
+  serializeStepsJson,
+  type RuleGroup,
+  type RuleGroupReading,
+  type SupplementStep
+} from './rule-groups.js';
 import { ExecutionEngineController } from './engine-controller.js';
 import { EngineWakeScheduler } from './engine-wake-scheduler.js';
 import { createTestNotification, deliverNotification, getNotificationSettings, normalizeNotificationSettings, publicNotificationSettings, saveNotificationSettings, type NotificationSettingsPayload } from './notifications.js';
@@ -24,8 +46,53 @@ import { webExecutor } from './web-executor-client.js';
 // publish task and SSE events without a separate supervisor.
 if (!process.env.WORKER_EVENT_TOKEN && process.env.NODE_ENV !== 'production') process.env.WORKER_EVENT_TOKEN = 'page-watch-dev-runner';
 
-const app = Fastify({ logger: { level: 'warn' } });
+// 网页服务只负责接口与调度，所有 Worker 都由统一执行引擎按需拉起；在模块加载
+// 阶段就关闭自启动，避免动态 import 下载观察器时在本进程里意外注册定时器。
+process.env.PAGE_WATCH_WORKER_AUTOSTART = '0';
+
+/**
+ * trustProxy 决定 request.ip 是否采信 X-Forwarded-For。
+ * - 未配置 / false：直连部署，不信任任何代理头，避免伪造 IP 绕过登录限流。
+ * - true：信任所有上游（反代与容器在同一台机器时最省事）。
+ * - 字符串：只信任指定地址或网段，例如 `172.16.0.0/12` 或 `127.0.0.1,172.17.0.1`。
+ */
+function trustProxyOption(): boolean | string {
+  const raw = process.env.APP_TRUST_PROXY?.trim();
+  if (!raw || raw === 'false') return false;
+  if (raw === 'true') return true;
+  return raw;
+}
+
+const app = Fastify({
+  logger: { level: 'warn' },
+  // 反向代理（NAS 常见）后面必须显式开启，否则 request.ip 永远拿到代理地址，
+  // 登录失败限流会把所有用户当成同一个 IP。默认关闭，避免被伪造的
+  // X-Forwarded-For 绕过限流。
+  trustProxy: trustProxyOption()
+});
 await app.register(fastifyCompress, { encodings: ['br', 'gzip'], threshold: 1024 });
+
+// 生产构建下补一组基础安全响应头。开发模式放宽，避免 Vite 的 HMR
+// 内联脚本与 WebSocket 被 CSP 拦掉。
+app.addHook('onSend', async (_request, reply, payload) => {
+  reply.header('X-Content-Type-Options', 'nosniff');
+  reply.header('X-Frame-Options', 'SAMEORIGIN');
+  reply.header('Referrer-Policy', 'no-referrer');
+  if (process.env.NODE_ENV === 'production') {
+    reply.header('Content-Security-Policy', [
+      "default-src 'self'",
+      "script-src 'self'",
+      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+      "font-src 'self' https://fonts.gstatic.com",
+      "img-src 'self' data:",
+      "connect-src 'self'",
+      "frame-ancestors 'none'",
+      "base-uri 'self'",
+      "form-action 'self'"
+    ].join('; '));
+  }
+  return payload;
+});
 const port = Number(process.env.PORT ?? 3030);
 const engineController = new ExecutionEngineController();
 const engineWakeScheduler = new EngineWakeScheduler(engineController);
@@ -56,6 +123,9 @@ engineController.onChange((snapshot) => {
 const loginFailures = new Map<string, { count: number; firstAt: number; lockedUntil: number }>();
 const loginWindowMs = 10 * 60_000;
 const loginLimit = 7;
+// 陌生 IP 的失败记录原本只在同一 IP 再次尝试时才清理，长期运行会只增不减。
+// 定期裁剪 + 条数上限让这张表始终停留在“最近一个窗口”的量级。
+const loginFailureEntryLimit = 200;
 type LiveChannel = 'archive' | 'logs' | 'subscriptions' | 'tasks' | 'task-summary' | 'task-active' | 'services' | 'metrics';
 const liveChannels = new Set<LiveChannel>(['archive', 'logs', 'subscriptions', 'tasks', 'task-summary', 'task-active', 'services', 'metrics']);
 type LiveClient = {
@@ -136,8 +206,35 @@ async function assertSafeUrl(raw: string) {
   return validateSafeUrl(raw, { allowUnresolvedViaProxy: true, hasOutboundProxy: Boolean(getOutboundProxyUrl()) });
 }
 
+/**
+ * 令牌比较必须走常量时间，避免通过响应耗时逐字节猜测内部令牌。
+ */
+function tokensMatch(given: unknown, expected: string) {
+  if (typeof given !== 'string' || !expected) return false;
+  const a = Buffer.from(given);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+/**
+ * 路由匹配器会先对路径做百分号解码（例如 `/%61pi/subscriptions` 会命中
+ * `/api/subscriptions`），如果这里仍拿原始字符串做前缀比对，就会出现
+ * 「路由命中了、鉴权却被跳过」的越权访问。这里做两轮解码以覆盖双重编码，
+ * 再把反斜杠与重复斜杠折叠，交给 URL 解析器消掉 `.` 与 `..` 段。
+ */
 function authPath(url: string) {
-  return url.split('?')[0];
+  const raw = url.split('?')[0];
+  try {
+    let decoded = raw;
+    for (let round = 0; round < 2; round += 1) {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    }
+    return new URL(decoded.replace(/\\/g, '/').replace(/\/{2,}/g, '/'), 'http://page-watch.internal').pathname;
+  } catch {
+    return raw;
+  }
 }
 
 /** Authenticated API payloads are revalidated, never shared. The lightweight
@@ -173,6 +270,24 @@ function recordFailedLogin(ip: string) {
   const next = !current || now - current.firstAt > loginWindowMs ? { count: 1, firstAt: now, lockedUntil: 0 } : { ...current, count: current.count + 1 };
   if (next.count >= loginLimit) next.lockedUntil = now + loginWindowMs;
   loginFailures.set(ip, next);
+  pruneLoginFailures(now);
+}
+
+/**
+ * 只清理已经过了窗口且不在锁定期的记录；仍在锁定期的一律保留，
+ * 否则超限裁剪会顺手把限流解除掉。
+ */
+function pruneLoginFailures(now = Date.now()) {
+  for (const [ip, record] of loginFailures) {
+    if (record.lockedUntil > now) continue;
+    if (now - record.firstAt > loginWindowMs) loginFailures.delete(ip);
+  }
+  if (loginFailures.size <= loginFailureEntryLimit) return;
+  const removable = [...loginFailures.entries()]
+    .filter(([, record]) => record.lockedUntil <= now)
+    .sort((left, right) => left[1].firstAt - right[1].firstAt)
+    .slice(0, loginFailures.size - loginFailureEntryLimit);
+  for (const [ip] of removable) loginFailures.delete(ip);
 }
 
 function writeSse(client: LiveClient, event: string, data?: unknown) {
@@ -311,6 +426,16 @@ livePollTimer.unref();
 
 app.addHook('onRequest', async (request, reply) => {
   const requestPath = authPath(request.url);
+  // CSRF 纵深防护：用浏览器自动附加的 Sec-Fetch-Site 判断来源，而不是比较
+  // Origin 与 Host —— 经过 Vite 代理或反向代理时 Host 会被改写，比较 Host 会
+  // 把正常的同源登录也拒掉。same-origin/none 放行，其余（cross-site 等）拒绝；
+  // 不带该头的请求来自 curl、内部 Worker 或旧浏览器，交给 SameSite=Lax 兜底。
+  if (requestPath.startsWith('/api/') && request.method !== 'GET' && request.method !== 'HEAD') {
+    const site = request.headers['sec-fetch-site'];
+    if (typeof site === 'string' && site && site !== 'same-origin' && site !== 'none') {
+      return reply.code(403).send({ error: '请求来源与当前站点不一致，已拒绝。' });
+    }
+  }
   if (!requestPath.startsWith('/api/') || requestPath === '/api/health' || requestPath === '/api/ready' || requestPath.startsWith('/api/auth/') || requestPath.startsWith('/api/internal/events')) return;
   if (!isDatabaseConfigured()) {
     if (requestPath === '/api/setup/database') return;
@@ -418,18 +543,18 @@ async function updatePresetList(tx: Pick<DatabaseClient, 'run' | 'get'>, rows: P
   return keptIds;
 }
 
-function simplifiedPreset(row: PresetListRow): PresetListRow {
-  return { name: row.name, description: row.description, renderMode: row.renderMode, selector: 'a.text-secondary[alt]', contentSource: 'attribute', attributeName: 'alt', matchPattern: '', titleSelector: 'a.text-secondary[alt]', titleContentSource: 'text', titleAttributeName: '', titleMatchPattern: '^[A-Za-z]+-\\d+\\s*(.+)$', resultMode: 'all', intervalMinutes: 60, paginationSelector: '#price-currency', paginationParameter: 'page', paginationMatchPattern: '/\\s*(\\d+)', isActive: true, id: row.id };
-}
-
 async function resolveMissavPayload(payload: SubscriptionPayload): Promise<{ values: Awaited<ReturnType<typeof normalizePayload>>; family: 'missav' | 'legacy_custom'; presetId: number | null; override: 'static' | 'dynamic' | null }> {
   if (payload.ruleFamily !== 'missav') return { values: await normalizePayload(payload), family: 'legacy_custom', presetId: null, override: null };
   const host = new URL((await assertSafeUrl(payload.url)).toString()).hostname.toLowerCase();
-  const missavHosts = [...defaultInspectionRules.sites, ...getInspectionRules().sites].map((site) => new URL(site).hostname.toLowerCase());
-  if (!missavHosts.includes(host)) throw new Error('MissAV 读取规则只适用于已配置的 MissAV 站点。');
   const presetId = Number(payload.presetId);
-  const preset = await db.get<Subscription>(`SELECT * FROM subscription_presets WHERE id=?`, [presetId]);
-  if (!preset) throw new Error('请选择有效的 MissAV 读取规则。');
+  const preset = await db.get<Subscription & { sites_json?: string | null }>(`SELECT * FROM subscription_presets WHERE id=?`, [presetId]);
+  if (!preset) throw new Error('请选择有效的检查规则组。');
+  // 只有规则组自己声明了站点时才限制主机名；站点为空表示任意网站都可以用这组规则。
+  const groupSites = parseSitesJson(preset.sites_json);
+  if (groupSites.length) {
+    const allowedHosts = groupSites.map((site) => { try { return new URL(site).hostname.toLowerCase(); } catch { return ''; } }).filter(Boolean);
+    if (!allowedHosts.includes(host)) throw new Error(`这组检查规则只适用于已声明的站点：${groupSites.join('、')}。`);
+  }
   const override = payload.renderModeOverride === 'static' || payload.renderModeOverride === 'dynamic' ? payload.renderModeOverride : null;
   const values = await normalizePayload({ ...payload, selector: preset.selector, renderMode: override ?? preset.render_mode, contentSource: preset.content_source, attributeName: preset.attribute_name ?? '', matchPattern: preset.match_pattern ?? '', titleSelector: preset.title_selector ?? '', titleContentSource: preset.title_content_source, titleAttributeName: preset.title_attribute_name ?? '', titleMatchPattern: preset.title_match_pattern ?? '', resultMode: preset.result_mode, paginationSelector: preset.pagination_selector ?? '', paginationParameter: preset.pagination_parameter, paginationMatchPattern: preset.pagination_match_pattern ?? '' });
   return { values, family: 'missav', presetId, override };
@@ -467,6 +592,160 @@ function normalizePresetPayload(payload: SubscriptionPresetPayload) {
   }
   if (!Number.isInteger(interval) || interval < 1 || interval > 10080) throw new Error('检查间隔需在 1 到 10080 分钟之间。');
   return { name, description, selector, renderMode, contentSource, attributeName, matchPattern, titleSelector, titleContentSource, titleAttributeName, titleMatchPattern, resultMode, interval, ...pagination, isActive: payload.isActive === false ? 0 : 1 };
+}
+
+/**
+ * 规则组改动后，把读取列复制到跟随它的订阅上。
+ *
+ * 订阅行保存的是读取配置的副本（Worker 只读订阅），所以改完规则组必须同步一次，
+ * 否则页面上的修改要等订阅重新保存才生效。presetId 为空时同步全部 missav 订阅，
+ * 供兼容接口沿用原有的整体保存行为。
+ */
+async function syncSubscriptionsFromPresets(tx: Pick<DatabaseClient, 'run'>, now: string, presetId?: number) {
+  const filter = presetId === undefined ? '' : ' AND p.id = ?';
+  const params = presetId === undefined ? [] : [presetId];
+  await tx.run(`UPDATE subscriptions s JOIN subscription_presets p ON p.id=s.preset_id
+    SET s.initial_scan_completed=0, s.initial_scan_total=NULL, s.initial_scan_pages_completed=0, s.initial_scan_next_page=1
+    WHERE s.rule_family='missav' AND s.pagination_selector IS NULL AND p.pagination_selector IS NOT NULL AND s.initial_scan_run_id IS NULL${filter}`, params);
+  await tx.run(`UPDATE subscriptions s JOIN subscription_presets p ON p.id=s.preset_id SET
+    s.selector=p.selector, s.render_mode=COALESCE(s.render_mode_override,p.render_mode), s.content_source=p.content_source,
+    s.attribute_name=p.attribute_name, s.match_pattern=p.match_pattern, s.title_selector=p.title_selector,
+    s.title_content_source=p.title_content_source, s.title_attribute_name=p.title_attribute_name,
+    s.title_match_pattern=p.title_match_pattern, s.result_mode=p.result_mode, s.pagination_selector=p.pagination_selector,
+    s.pagination_parameter=p.pagination_parameter, s.pagination_match_pattern=p.pagination_match_pattern, s.updated_at=?
+    WHERE s.rule_family='missav'${filter}`, [now, ...params]);
+}
+
+/**
+ * 数据库里的一组检查规则。读取列沿用 subscription_presets 原有字段，新增的只有
+ * sites_json / steps_json 两列 JSON。
+ */
+type RuleGroupRow = {
+  id: number;
+  name: string;
+  description: string;
+  selector: string;
+  render_mode: 'static' | 'dynamic';
+  content_source: 'text' | 'attribute';
+  attribute_name: string | null;
+  match_pattern: string | null;
+  title_selector: string | null;
+  title_content_source: 'text' | 'attribute';
+  title_attribute_name: string | null;
+  title_match_pattern: string | null;
+  result_mode: 'first' | 'all';
+  interval_minutes: number;
+  pagination_selector: string | null;
+  pagination_parameter: string;
+  pagination_match_pattern: string | null;
+  is_active: number;
+  sites_json: string | null;
+  steps_json: string | null;
+};
+
+const RULE_GROUP_COLUMNS = `id, name, description, selector, render_mode, content_source, attribute_name, match_pattern, title_selector, title_content_source, title_attribute_name, title_match_pattern, result_mode, interval_minutes, pagination_selector, pagination_parameter, pagination_match_pattern, is_active, sites_json, steps_json`;
+
+/** 行 → 接口对象。站点与步骤损坏时各自回落到空数组，整组规则仍然可读。 */
+function ruleGroupFromRow(row: RuleGroupRow): RuleGroup {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    sites: parseSitesJson(row.sites_json),
+    steps: parseStepsJson(row.steps_json),
+    reading: {
+      selector: row.selector,
+      renderMode: row.render_mode === 'dynamic' ? 'dynamic' : 'static',
+      contentSource: row.content_source === 'attribute' ? 'attribute' : 'text',
+      attributeName: row.attribute_name ?? '',
+      matchPattern: row.match_pattern ?? '',
+      titleSelector: row.title_selector ?? '',
+      titleContentSource: row.title_content_source === 'attribute' ? 'attribute' : 'text',
+      titleAttributeName: row.title_attribute_name ?? '',
+      titleMatchPattern: row.title_match_pattern ?? '',
+      resultMode: row.result_mode === 'all' ? 'all' : 'first',
+      intervalMinutes: row.interval_minutes,
+      paginationSelector: row.pagination_selector ?? '',
+      paginationParameter: row.pagination_parameter || 'page',
+      paginationMatchPattern: row.pagination_match_pattern ?? ''
+    }
+  };
+}
+
+/** 读取方式 → 数据库列。复用既有的分页校验，避免两套规则。 */
+function ruleGroupReadingColumns(reading: RuleGroupReading) {
+  const pagination = normalizePaginationPayload({
+    paginationSelector: reading.paginationSelector,
+    paginationParameter: reading.paginationParameter,
+    paginationMatchPattern: reading.paginationMatchPattern
+  });
+  return {
+    selector: reading.selector.trim(),
+    renderMode: reading.renderMode,
+    contentSource: reading.contentSource,
+    attributeName: reading.contentSource === 'attribute' ? reading.attributeName.trim() || null : null,
+    matchPattern: reading.matchPattern.trim() || null,
+    titleSelector: reading.titleSelector.trim() || null,
+    titleContentSource: reading.titleContentSource,
+    titleAttributeName: reading.titleSelector.trim() && reading.titleContentSource === 'attribute' ? reading.titleAttributeName.trim() || null : null,
+    titleMatchPattern: reading.titleSelector.trim() ? reading.titleMatchPattern.trim() || null : null,
+    resultMode: reading.resultMode,
+    interval: reading.intervalMinutes,
+    ...pagination
+  };
+}
+
+function assertReadingValid(reading: RuleGroupReading) {
+  const first = Object.values(collectReadingIssues(reading))[0];
+  if (first) throw new Error(first);
+}
+
+/** 规则组名称在库内唯一，避免订阅选择时看不出差别。 */
+async function assertGroupNameAvailable(name: string, excludeId: number | null) {
+  const existing = await db.get<{ id: number }>('SELECT id FROM subscription_presets WHERE name = ? AND id <> ? LIMIT 1', [name, excludeId ?? 0]);
+  if (existing) throw new Error('已有同名规则组，请换一个名称。');
+}
+
+async function loadRuleGroupRow(id: number) {
+  return db.get<RuleGroupRow>(`SELECT ${RULE_GROUP_COLUMNS} FROM subscription_presets WHERE id = ?`, [id]);
+}
+
+async function loadRuleGroup(id: number): Promise<RuleGroup | null> {
+  const row = await loadRuleGroupRow(id);
+  return row ? ruleGroupFromRow(row) : null;
+}
+
+/**
+ * 所有规则组站点的并集。写回 inspection_rules.sites 只是为了让仍然读取全局站点
+ * 的旧代码（例如 403 提示、发行日期读取）保持可用；执行层的站点已按规则组解析。
+ * 注意 getInspectionRules() 读取时会沿用旧的「最多 5 个」限制，因此这里如实写入
+ * 完整并集，由读取方决定截断——抓取主流程不依赖这份全局列表。
+ */
+async function collectGroupSiteUnion(client: Pick<DatabaseClient, 'all'>) {
+  const rows = await client.all<{ sites_json: string | null }>('SELECT sites_json FROM subscription_presets ORDER BY id');
+  const union: string[] = [];
+  for (const row of rows) {
+    for (const site of parseSitesJson(row.sites_json)) {
+      if (!union.includes(site)) union.push(site);
+    }
+  }
+  return union;
+}
+
+/**
+ * 只改写 inspection_rules 的 sites，其余补全规则保持原样。base 用于兼容层把
+ * 本次一并提交的发行日期、磁力链接规则合进来。
+ */
+async function writeInspectionSites(
+  client: Pick<DatabaseClient, 'run'>,
+  sites: string[],
+  now: string,
+  base: ReturnType<typeof getInspectionRules> = getInspectionRules()
+) {
+  const rules = { ...base, sites };
+  await client.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES ('inspection_rules', ?, ?)
+    ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`, [inspectionRulesJson(rules), now]);
+  return rules;
 }
 
 async function normalizePayload(payload: SubscriptionPayload) {
@@ -516,7 +795,17 @@ async function normalizePayload(payload: SubscriptionPayload) {
 }
 
 async function listSubscriptions() {
-  return db.all(`SELECT s.*,
+  // 列表只回传展示需要的列：last_content 是上次抓取的完整正文，页面上并不使用，
+  // 逐条回传会让列表接口多出几百 KB。这里显式列出字段，last_content 固定为 null
+  // 以保持响应结构不变。新增订阅字段时记得同步补进这份清单。
+  return db.all(`SELECT s.id, s.name, s.url, s.selector, s.render_mode, s.content_source, s.attribute_name,
+    s.match_pattern, s.title_selector, s.title_content_source, s.title_attribute_name, s.title_match_pattern,
+    s.result_mode, s.interval_minutes, s.schedule_type, s.schedule_interval_hours, s.schedule_time, s.schedule_weekday,
+    s.is_active, s.rule_family, s.preset_id, s.render_mode_override, s.last_checked_at, s.last_hash,
+    NULL AS last_content, s.last_error, s.last_scan_added_count, s.last_scan_seen_at,
+    s.pagination_selector, s.pagination_parameter, s.pagination_match_pattern, s.initial_scan_completed,
+    s.initial_scan_total, s.initial_scan_pages_completed, s.initial_scan_run_id, s.initial_scan_next_page,
+    s.next_scheduled_at, s.created_at, s.updated_at,
     rule.name AS preset_name,
     COALESCE(p.archive_total, 0) AS archive_count,
     COALESCE(p.jellyfin_available, 0) AS jellyfin_available_count,
@@ -542,7 +831,7 @@ async function listSubscriptions() {
 app.get('/api/health', async () => ({ ok: true }));
 app.post('/api/internal/events', async (request, reply) => {
   const token = process.env.WORKER_EVENT_TOKEN;
-  if (!token || request.headers['x-page-watch-worker-token'] !== token) return reply.code(403).send({ error: '内部事件令牌无效。' });
+  if (!token || !tokensMatch(request.headers['x-page-watch-worker-token'], token)) return reply.code(403).send({ error: '内部事件令牌无效。' });
   const body = request.body as { channel?: unknown; subscriptionId?: unknown };
   if (typeof body.channel !== 'string' || !liveChannels.has(body.channel as LiveChannel)) return reply.code(400).send({ error: '内部事件类型无效。' });
   const channel = body.channel as LiveChannel;
@@ -618,7 +907,11 @@ app.post('/api/auth/login', async (request, reply) => {
   reply.header('Set-Cookie', sessionCookie(await createSession()));
   return { authenticated: true };
 });
-app.post('/api/auth/logout', async (_request, reply) => {
+app.post('/api/auth/logout', async (request, reply) => {
+  // 递增会话版本，让这次登出同时吊销此前签发的所有 Cookie（含被窃取的那一份），
+  // 而不只是清掉当前浏览器的 Cookie。仅在当前请求确实持有有效会话时才递增，
+  // 否则任何人都能反复调用它把用户踢下线。
+  if ((await statusFor(request.headers.cookie)).authenticated) await revokeSessions();
   reply.header('Set-Cookie', clearSessionCookie());
   return reply.code(204).send();
 });
@@ -1079,6 +1372,172 @@ app.put('/api/inspection-rules', async (request, reply) => {
     return rules;
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '检查规则无法保存。' }); }
 });
+/** 规则组列表；builtinIds 供页面禁止删除内置组。 */
+app.get('/api/rule-groups', async () => {
+  const rows = await db.all<RuleGroupRow>(`SELECT ${RULE_GROUP_COLUMNS} FROM subscription_presets ORDER BY id ASC`);
+  const groups = rows.map(ruleGroupFromRow);
+  return {
+    groups,
+    builtinIds: groups.filter((group) => group.id !== null && isBuiltinGroup(group)).map((group) => group.id as number)
+  };
+});
+
+/**
+ * 新建规则组。名称与读取方式必须合法；适用站点可以为空（不限站点），补充步骤
+ * 可以为空。这里只开一个事务写这一组，不影响其他规则组。
+ */
+app.post('/api/rule-groups', async (request, reply) => {
+  try {
+    const input = coerceRuleGroup(request.body);
+    const name = normalizeRuleGroupName(input.name);
+    const description = normalizeRuleGroupDescription(input.description);
+    assertReadingValid(input.reading);
+    // 新建的规则组没有内置步骤：即使请求里带了 builtin 标记也要去掉，避免普通规则组
+    // 变成「不可删除」的内置组。
+    const steps = applyBuiltinStepFlags([], coerceSupplementSteps(input.steps));
+    const stepIssues = collectSupplementStepIssues(steps);
+    if (Object.keys(stepIssues).length) {
+      const first = Object.values(stepIssues)[0];
+      return reply.code(400).send({ error: first, fields: stepIssues });
+    }
+    await assertGroupNameAvailable(name, null);
+    const now = new Date().toISOString();
+    const columns = ruleGroupReadingColumns(input.reading);
+    const groupId = await db.transaction(async (tx) => {
+      const inserted = await tx.run(`INSERT INTO subscription_presets
+        (name, description, selector, render_mode, content_source, attribute_name, match_pattern, title_selector, title_content_source, title_attribute_name, title_match_pattern, result_mode, interval_minutes, pagination_selector, pagination_parameter, pagination_match_pattern, is_active, sites_json, steps_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [name, description, columns.selector, columns.renderMode, columns.contentSource, columns.attributeName, columns.matchPattern,
+        columns.titleSelector, columns.titleContentSource, columns.titleAttributeName, columns.titleMatchPattern, columns.resultMode,
+        columns.interval, columns.paginationSelector, columns.paginationParameter, columns.paginationMatchPattern, 1,
+        serializeSitesJson(input.sites), serializeStepsJson(steps), now, now]);
+      // 站点非空时才需要更新全局并集，避免每次新建都重写 inspection_rules。
+      if (input.sites.length) await writeInspectionSites(tx, await collectGroupSiteUnion(tx), now);
+      return inserted.lastInsertRowid;
+    });
+    if (input.sites.length) await refreshSettings(true);
+    return reply.code(201).send({ group: await loadRuleGroup(groupId) });
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : '无法创建规则组。' });
+  }
+});
+
+/** 修改名称、说明与「读取方式」；适用站点与补充步骤各有独立接口。 */
+app.patch('/api/rule-groups/:id', async (request, reply) => {
+  const id = Number((request.params as { id: string }).id);
+  if (!Number.isInteger(id) || id < 1) return reply.code(400).send({ error: '规则组标识无效。' });
+  const current = await loadRuleGroupRow(id);
+  if (!current) return reply.code(404).send({ error: '规则组不存在。' });
+  try {
+    const body = (request.body ?? {}) as { name?: unknown; description?: unknown; reading?: unknown };
+    const existing = ruleGroupFromRow(current);
+    const name = body.name === undefined ? existing.name : normalizeRuleGroupName(body.name);
+    const description = body.description === undefined ? existing.description : normalizeRuleGroupDescription(body.description);
+    const reading = body.reading === undefined ? existing.reading : coerceRuleGroupReading(body.reading);
+    assertReadingValid(reading);
+    if (name !== existing.name) await assertGroupNameAvailable(name, id);
+    const columns = ruleGroupReadingColumns(reading);
+    const now = new Date().toISOString();
+    await db.transaction(async (tx) => {
+      await tx.run(`UPDATE subscription_presets SET name=?, description=?, selector=?, render_mode=?, content_source=?, attribute_name=?, match_pattern=?, title_selector=?, title_content_source=?, title_attribute_name=?, title_match_pattern=?, result_mode=?, interval_minutes=?, pagination_selector=?, pagination_parameter=?, pagination_match_pattern=?, updated_at=? WHERE id=?`,
+        [name, description, columns.selector, columns.renderMode, columns.contentSource, columns.attributeName, columns.matchPattern,
+          columns.titleSelector, columns.titleContentSource, columns.titleAttributeName, columns.titleMatchPattern, columns.resultMode,
+          columns.interval, columns.paginationSelector, columns.paginationParameter, columns.paginationMatchPattern, now, id]);
+      // 订阅行保存的是读取配置副本，这里同步一次，改完立刻在下一次检查生效。
+      await syncSubscriptionsFromPresets(tx, now, id);
+    });
+    return { group: await loadRuleGroup(id) };
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : '无法保存规则组。' });
+  }
+});
+
+/** 删除规则组：内置组禁止删除；使用中的订阅改挂到仍存在的规则组上。 */
+app.delete('/api/rule-groups/:id', async (request, reply) => {
+  const id = Number((request.params as { id: string }).id);
+  if (!Number.isInteger(id) || id < 1) return reply.code(400).send({ error: '规则组标识无效。' });
+  const row = await loadRuleGroupRow(id);
+  if (!row) return reply.code(404).send({ error: '规则组不存在。' });
+  if (isBuiltinGroup(ruleGroupFromRow(row))) return reply.code(400).send({ error: '内置规则组不能删除，只能修改其中的配置。' });
+  const remaining = (await db.all<RuleGroupRow>(`SELECT ${RULE_GROUP_COLUMNS} FROM subscription_presets WHERE id <> ? ORDER BY id ASC`, [id]))
+    .map(ruleGroupFromRow);
+  if (!remaining.length) return reply.code(400).send({ error: '请至少保留一组检查规则。' });
+  const fallback = remaining.find((group) => isBuiltinGroup(group)) ?? remaining[0];
+  const now = new Date().toISOString();
+  try {
+    await db.transaction(async (tx) => {
+      if (fallback.id !== null) {
+        await tx.run("UPDATE subscriptions SET preset_id=?, updated_at=? WHERE rule_family='missav' AND preset_id=?", [fallback.id, now, id]);
+        // 改挂之后重新复制一次读取配置，避免订阅继续使用已删除规则组的旧选择器。
+        await syncSubscriptionsFromPresets(tx, now, fallback.id);
+      }
+      await tx.run('DELETE FROM subscription_presets WHERE id = ?', [id]);
+      await writeInspectionSites(tx, await collectGroupSiteUnion(tx), now);
+    });
+    await refreshSettings(true);
+    return { ok: true, reassignedPresetId: fallback.id };
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : '无法删除规则组。' });
+  }
+});
+
+/**
+ * 只保存「适用站点」这一段。允许空数组：空表示不限站点，此时抓取直接读取订阅
+ * 原地址。成功后把全部规则组的站点并集写回 inspection_rules.sites。
+ */
+app.put('/api/rule-groups/:id/sites', async (request, reply) => {
+  const id = Number((request.params as { id: string }).id);
+  if (!Number.isInteger(id) || id < 1) return reply.code(400).send({ error: '规则组标识无效。' });
+  if (!await loadRuleGroupRow(id)) return reply.code(404).send({ error: '规则组不存在。' });
+  try {
+    const body = (request.body ?? {}) as { sites?: unknown };
+    // 必须显式提交数组：漏传字段与「清空站点」必须区分开。
+    if (!Array.isArray(body.sites)) throw new Error('请提交站点数组；不限站点时提交空数组。');
+    const sites = normalizeRuleGroupSites(body.sites);
+    const now = new Date().toISOString();
+    const union = await db.transaction(async (tx) => {
+      await tx.run('UPDATE subscription_presets SET sites_json=?, updated_at=? WHERE id=?', [serializeSitesJson(sites), now, id]);
+      const next = await collectGroupSiteUnion(tx);
+      await writeInspectionSites(tx, next, now);
+      return next;
+    });
+    await refreshSettings(true);
+    return { group: await loadRuleGroup(id), sites: union };
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : '无法保存适用站点。' });
+  }
+});
+
+/**
+ * 只保存「补充步骤」这一段（0~5 步）。逐项校验，失败时通过 fields 返回每一步的
+ * 具体原因；内置步骤不能删除，只能停用。
+ */
+app.put('/api/rule-groups/:id/steps', async (request, reply) => {
+  const id = Number((request.params as { id: string }).id);
+  if (!Number.isInteger(id) || id < 1) return reply.code(400).send({ error: '规则组标识无效。' });
+  const row = await loadRuleGroupRow(id);
+  if (!row) return reply.code(404).send({ error: '规则组不存在。' });
+  try {
+    const body = (request.body ?? {}) as { steps?: unknown };
+    if (!Array.isArray(body.steps)) throw new Error('请提交步骤数组；没有补充步骤时提交空数组。');
+    const existing = ruleGroupFromRow(row);
+    const steps = applyBuiltinStepFlags(existing.steps, coerceSupplementSteps(body.steps));
+    const issues = collectSupplementStepIssues(steps);
+    const removed = removedBuiltinSteps(existing.steps, steps);
+    if (removed.length) {
+      issues.steps = `内置步骤“${removed.map((step) => step.name).join('、')}”不能删除，只能停用。`;
+    }
+    if (Object.keys(issues).length) {
+      return reply.code(400).send({ error: Object.values(issues)[0], fields: issues });
+    }
+    await db.run('UPDATE subscription_presets SET steps_json=?, updated_at=? WHERE id=?',
+      [serializeStepsJson(steps), new Date().toISOString(), id]);
+    return { group: await loadRuleGroup(id) };
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : '无法保存补充步骤。' });
+  }
+});
+
 /**
  * 「检查规则」页面把列表读取规则、站点和归档补全放在一起编辑，因此这里提供
  * 一次性保存全部内容的入口：预设列表整体替换，站点与补全规则同时更新。
@@ -1095,40 +1554,44 @@ app.put('/api/rules/missav/presets', async (request, reply) => {
     for (const interval of [incoming?.releaseDate?.requestIntervalMs, incoming?.magnet?.requestIntervalMs]) {
       if (!Number.isInteger(interval) || Number(interval) < 250 || Number(interval) > 60000) throw new Error('访问间隔需在 250 到 60000 毫秒之间。');
     }
+    const sites = normalizeRuleGroupSites(payload.sites);
     const rules = normalizeInspectionRules({
-      sites: payload.sites,
+      sites,
       releaseDate: { ...defaultInspectionRules.releaseDate, renderMode: incoming?.releaseDate?.renderMode, requestIntervalMs: incoming?.releaseDate?.requestIntervalMs, enabled: true },
       magnet: { ...defaultInspectionRules.magnet, origins: incoming?.magnet?.origins, filenamePrefix: incoming?.magnet?.filenamePrefix, fallbackFilenamePrefixes: incoming?.magnet?.fallbackFilenamePrefixes, requestIntervalMs: incoming?.magnet?.requestIntervalMs, enabled: true }
     });
-    // 先校验全部内容，再写库，避免出现只保存了一半的规则。
+    // 兼容层：老页面仍按「一次性保存」提交。这里改成依次写入三段（读取方式、
+    // 适用站点、补充步骤），并沿用原来的整体事务；先校验再写，避免半套数据。
+    const submittedIds = new Set(rows.map((row) => Number(row.id)).filter((id) => Number.isInteger(id) && id > 0));
+    const builtinRows = await db.all<{ id: number; steps_json: string | null }>('SELECT id, steps_json FROM subscription_presets ORDER BY id');
+    const missingBuiltin = builtinRows
+      .filter((row) => isBuiltinGroup({ steps: parseStepsJson(row.steps_json) }) && !submittedIds.has(row.id));
+    if (missingBuiltin.length) throw new Error(`内置规则组“${BUILTIN_GROUP_NAME}”不能删除，请在提交内容中保留它。`);
+    // 先逐组校验读取方式，任何一组非法都在写库前返回。
+    for (const row of rows) normalizePresetPayload(row as unknown as SubscriptionPresetPayload);
     const now = new Date().toISOString();
+    let finalRules = rules;
     await db.transaction(async (tx) => {
-      const keptIds = await updatePresetList(tx, rows.map(simplifiedPreset), now);
+      const keptIds = await updatePresetList(tx, rows, now);
+      // 老页面只有一份全局站点：把它写到本次提交的每一组上，行为与改造前一致。
+      for (const keptId of keptIds) {
+        await tx.run('UPDATE subscription_presets SET sites_json=?, steps_json=COALESCE(steps_json, \'[]\') WHERE id=?', [serializeSitesJson(sites), keptId]);
+      }
       await tx.run(`UPDATE subscriptions SET preset_id=? WHERE rule_family='missav' AND (preset_id IS NULL OR preset_id NOT IN (${keptIds.map(() => '?').join(',')}))`, [keptIds[0], ...keptIds]);
-      await tx.run(`UPDATE subscriptions s JOIN subscription_presets p ON p.id=s.preset_id
-        SET s.initial_scan_completed=0, s.initial_scan_total=NULL, s.initial_scan_pages_completed=0, s.initial_scan_next_page=1
-        WHERE s.rule_family='missav' AND s.pagination_selector IS NULL AND p.pagination_selector IS NOT NULL AND s.initial_scan_run_id IS NULL`);
-      await tx.run(`UPDATE subscriptions s JOIN subscription_presets p ON p.id=s.preset_id SET
-        s.selector=p.selector, s.render_mode=COALESCE(s.render_mode_override,p.render_mode), s.content_source=p.content_source,
-        s.attribute_name=p.attribute_name, s.match_pattern=p.match_pattern, s.title_selector=p.title_selector,
-        s.title_content_source=p.title_content_source, s.title_attribute_name=p.title_attribute_name,
-        s.title_match_pattern=p.title_match_pattern, s.result_mode=p.result_mode, s.pagination_selector=p.pagination_selector,
-        s.pagination_parameter=p.pagination_parameter, s.pagination_match_pattern=p.pagination_match_pattern, s.updated_at=?
-        WHERE s.rule_family='missav'`, [now]);
-      await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES ('inspection_rules', ?, ?)
-        ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`, [inspectionRulesJson(rules), now]);
-      if (!rules.releaseDate.enabled) {
+      await syncSubscriptionsFromPresets(tx, now);
+      finalRules = await writeInspectionSites(tx, await collectGroupSiteUnion(tx), now, rules);
+      if (!finalRules.releaseDate.enabled) {
         await tx.run("UPDATE release_jobs SET status = 'completed', finished_at = ?, error = '发行日期规则已停用' WHERE status = 'queued'", [now]);
         await tx.run("UPDATE archive_entries SET release_status = 'unsearched', release_error = NULL, updated_at = ? WHERE release_status = 'pending'", [now]);
       }
-      if (!rules.magnet.enabled) {
+      if (!finalRules.magnet.enabled) {
         await tx.run("UPDATE magnet_jobs SET status = 'completed', finished_at = ?, error = '磁力检索规则已停用' WHERE status = 'queued'", [now]);
         await tx.run("UPDATE archive_entries SET magnet_status = 'unsearched', magnet_error = NULL, updated_at = ? WHERE magnet_status = 'pending'", [now]);
       }
     });
     await refreshSettings(true);
     await appendRuntimeLog({ level: 'success', source: 'system', message: '检查规则已更新；后续归档会按新规则执行。' });
-    return { presets: await db.all('SELECT * FROM subscription_presets ORDER BY id ASC'), inspectionRules: rules };
+    return { presets: await db.all('SELECT * FROM subscription_presets ORDER BY id ASC'), inspectionRules: finalRules };
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '检查规则无法保存。' }); }
 });
 
@@ -1146,7 +1609,7 @@ app.put('/api/rules/missav', async (request, reply) => {
     const presetId = await db.transaction(async (tx) => {
       const existing = Number.isInteger(requestedId) && requestedId > 0
         ? await tx.get<{ id: number }>('SELECT id FROM subscription_presets WHERE id = ?', [requestedId])
-        : await tx.get<{ id: number }>("SELECT id FROM subscription_presets WHERE name = 'MissAV 番号列表' ORDER BY id ASC LIMIT 1");
+        : await tx.get<{ id: number }>("SELECT id FROM subscription_presets WHERE name IN (?, ?) ORDER BY CASE WHEN name = ? THEN 0 ELSE 1 END, id ASC LIMIT 1", [BUILTIN_GROUP_NAME, legacyMissavGroupName, legacyMissavGroupName]);
       let id: number;
       if (existing) {
         id = existing.id;
@@ -1183,6 +1646,8 @@ app.post('/api/code-search', async (request, reply) => {
   const codeKey = code.toLowerCase();
   const matches = await findArchiveCodeMatches(db, [codeKey]);
   const ids = [...new Set(matches.map((row) => row.id))];
+  // 结果最终只用前 100 条，所以这里也只取 100 行正文：a.content 是这批数据里
+  // 最大的字段，按 500 行取回来再丢掉 400 行是纯浪费（单次请求可能多占几十 MB）。
   const archivedCandidates = ids.length ? await db.all<{
     id: number; content: string; archive_code: string | null; title: string | null; detail_url: string | null; first_seen_at: string;
     release_date: string | null; release_status: string; release_error: string | null;
@@ -1192,7 +1657,7 @@ app.post('/api/code-search', async (request, reply) => {
       a.archive_code, a.magnet_status, a.magnet_value, a.magnet_error, s.id AS subscription_id, s.name AS subscription_name, s.url AS subscription_url
     FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
     WHERE a.id IN (${ids.map(() => '?').join(', ')})
-    ORDER BY a.first_seen_at DESC, a.id DESC LIMIT 500`, ids) : [];
+    ORDER BY a.first_seen_at DESC, a.id DESC LIMIT 100`, ids) : [];
   const archived = archivedCandidates.filter((item) => item.archive_code?.toLowerCase() === codeKey || productCodeKeys(item.content).includes(codeKey) || productCodeKeys(item.title ?? '').includes(codeKey)).slice(0, 100);
   if (archived.length) return { source: 'archive', code, items: archived };
 
@@ -1304,8 +1769,8 @@ app.post('/api/code-search/subscribe', async (request, reply) => {
         selector: string; render_mode: string; content_source: string; attribute_name: string | null; match_pattern: string | null;
         title_selector: string | null; title_content_source: string; title_attribute_name: string | null; title_match_pattern: string | null;
         result_mode: string; interval_minutes: number; pagination_selector: string | null; pagination_parameter: string; pagination_match_pattern: string | null;
-      }>("SELECT id, selector, render_mode, content_source, attribute_name, match_pattern, title_selector, title_content_source, title_attribute_name, title_match_pattern, result_mode, interval_minutes, pagination_selector, pagination_parameter, pagination_match_pattern FROM subscription_presets ORDER BY CASE WHEN name='MissAV 番号列表' THEN 0 ELSE 1 END, id ASC LIMIT 1");
-      if (!preset) return reply.code(409).send({ error: '找不到“MissAV 番号列表”预设，请在订阅规则中恢复该预设后重试。' });
+      }>("SELECT id, selector, render_mode, content_source, attribute_name, match_pattern, title_selector, title_content_source, title_attribute_name, title_match_pattern, result_mode, interval_minutes, pagination_selector, pagination_parameter, pagination_match_pattern FROM subscription_presets ORDER BY CASE WHEN name IN (?, ?) THEN 0 ELSE 1 END, id ASC LIMIT 1", [BUILTIN_GROUP_NAME, legacyMissavGroupName]);
+      if (!preset) return reply.code(409).send({ error: `找不到“${BUILTIN_GROUP_NAME}”规则组，请在检查规则中恢复该规则组后重试。` });
       presetValues = await normalizePayload({
         name: actress.name, url: subscriptionUrl, selector: preset.selector,
         renderMode: preset.render_mode === 'dynamic' ? 'dynamic' : 'static',
@@ -1944,7 +2409,7 @@ app.delete('/api/subscriptions/:id/archive', async (request, reply) => {
 
 app.post('/api/subscriptions/preview', async (request, reply) => {
   try {
-    const { values, family } = await resolveMissavPayload(request.body as SubscriptionPayload);
+    const { values, family, presetId } = await resolveMissavPayload(request.body as SubscriptionPayload);
     const token = process.env.WORKER_EVENT_TOKEN || (process.env.NODE_ENV === 'production' ? '' : 'page-watch-dev-runner');
     if (!token) throw new Error('统一执行引擎尚未就绪，请稍后重试。');
     await engineWakeScheduler.wake('规则预览');
@@ -1954,7 +2419,7 @@ app.post('/api/subscriptions/preview', async (request, reply) => {
       const response = await fetch(`http://127.0.0.1:${process.env.RUNNER_INTERNAL_PORT || '3031'}/preview`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-page-watch-worker-token': token },
-        body: JSON.stringify({ url: values.url, selector: values.selector, render_mode: values.renderMode as Subscription['render_mode'], content_source: values.contentSource as Subscription['content_source'], attribute_name: values.attributeName, match_pattern: values.matchPattern, title_selector: values.titleSelector, title_content_source: values.titleContentSource as Subscription['title_content_source'], title_attribute_name: values.titleAttributeName, title_match_pattern: values.titleMatchPattern, result_mode: values.resultMode as Subscription['result_mode'], rule_family: family }),
+        body: JSON.stringify({ url: values.url, selector: values.selector, render_mode: values.renderMode as Subscription['render_mode'], content_source: values.contentSource as Subscription['content_source'], attribute_name: values.attributeName, match_pattern: values.matchPattern, title_selector: values.titleSelector, title_content_source: values.titleContentSource as Subscription['title_content_source'], title_attribute_name: values.titleAttributeName, title_match_pattern: values.titleMatchPattern, result_mode: values.resultMode as Subscription['result_mode'], rule_family: family, preset_id: presetId }),
         signal: controller.signal
       });
       const result = await response.json().catch(() => ({}));
@@ -2003,9 +2468,11 @@ if (process.env.NODE_ENV === 'production') {
   await app.register(fastifyStatic, {
     root: dist,
     wildcard: false,
-    setHeaders(response, filePath) {
-      if (/[/\\]assets[/\\].*-[A-Za-z0-9_-]{8,}\./.test(filePath)) response.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-      else response.setHeader('Cache-Control', 'no-cache');
+    // @fastify/static v10 起，setHeaders 的第一个参数是 Fastify 的 reply，
+    // 不再是 Node 的 ServerResponse，因此必须用 reply.header() 设置响应头。
+    setHeaders(reply, filePath) {
+      const cacheControl = /[/\\]assets[/\\].*-[A-Za-z0-9_-]{8,}\./.test(filePath) ? 'public, max-age=31536000, immutable' : 'no-cache';
+      void reply.header('Cache-Control', cacheControl);
     }
   });
   app.get('/*', async (_request, reply) => {
@@ -2058,7 +2525,6 @@ function startOperationalServices() {
       const pausedCount = Number(initial?.paused ?? 0);
       let delay = activeCount > 0 ? 10_000 : 60_000;
       if (activeCount > 0 || pausedCount > 0) {
-        process.env.PAGE_WATCH_WORKER_AUTOSTART = '0';
         const observer = await import('./download-worker.js');
         if (await observer.observeQbittorrentDownloads()) await engineWakeScheduler.wake('下载完成通知已入队');
       }
@@ -2100,8 +2566,48 @@ function startOperationalServices() {
   maintenanceTimer.unref();
 }
 
+/**
+ * 网页服务是唯一永不退出的进程，因此也最需要一条“只观察、只告警”的兜底线。
+ * 它不做重启（会掐断 SSE 与登录会话），只在 RSS 超出阈值时记录一次日志，
+ * 并在进程带 --expose-gc 时顺手做一次受控 GC。登录失败表也顺带定期裁剪。
+ */
+function startApiMemoryGuard() {
+  const configured = Number(process.env.APP_MEMORY_GUARD_MB);
+  const thresholdMb = Number.isFinite(configured) && configured > 0 ? Math.min(4096, Math.max(64, configured)) : 256;
+  const thresholdBytes = thresholdMb * 1024 * 1024;
+  const logIntervalMs = 30 * 60_000;
+  const pruneIntervalMs = 5 * 60_000;
+  let lastLoggedAt = 0;
+  let lastPrunedAt = Date.now();
+  const guard = () => {
+    const now = Date.now();
+    if (now - lastPrunedAt >= pruneIntervalMs) {
+      lastPrunedAt = now;
+      pruneLoginFailures(now);
+    }
+    const before = process.memoryUsage().rss;
+    if (before <= thresholdBytes) return;
+    const gc = (globalThis as typeof globalThis & { gc?: () => void }).gc;
+    if (gc) gc();
+    // 只在第一次越过阈值和之后每 30 分钟说一次，避免把日志表刷满。
+    if (now - lastLoggedAt < logIntervalMs) return;
+    lastLoggedAt = now;
+    const after = Math.round(process.memoryUsage().rss / 1024 / 1024);
+    void appendRuntimeLog({
+      level: 'info',
+      source: 'system',
+      message: `网页服务进程内存偏高：RSS 约 ${Math.round(before / 1024 / 1024)}MB（告警阈值 ${thresholdMb}MB）`
+        + (gc ? `，已执行受控 GC，现约 ${after}MB。` : `，当前进程未开启受控 GC（${after}MB）。`)
+        + ' 若持续上涨，请在运行中心查看各进程内存。'
+    }).catch(() => undefined);
+  };
+  const timer = setInterval(guard, 60_000);
+  timer.unref();
+}
+
 app.listen({ port, host: '0.0.0.0' }).then(() => {
   startRuntimeMemoryReporter('api');
+  startApiMemoryGuard();
   startOperationalServices();
 }).catch((error) => {
   app.log.error(error);

@@ -24,6 +24,9 @@ services:
       # Migration-only: keep the original value while upgrading legacy pwenc:v1 data.
       APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:-}
       APP_SESSION_SECURE: ${APP_SESSION_SECURE:-false}
+      # 部署在反向代理后面时设为 true（或填写信任网段，如 172.16.0.0/12），
+      # 让登录限流取到真实客户端 IP；直接暴露端口时保持 false。
+      APP_TRUST_PROXY: ${APP_TRUST_PROXY:-false}
     volumes:
       - ./data:/data
     healthcheck:

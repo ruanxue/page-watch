@@ -9,6 +9,7 @@ import { archiveKey } from './jellyfin-match.js';
 import { findArchiveCodeMatches, replaceArchiveCodes, type ArchiveCodeRow } from './archive-code-index.js';
 import { missavFallbackFailure, shouldTryMissavBackup } from './site-fallback.js';
 import { orderedSiteUrls } from './site-list.js';
+import { parseSitesJson } from './rule-groups.js';
 import { assertSafeUrl as validateSafeUrl } from './url-safety.js';
 import { readResponseText } from './bounded-body.js';
 import { createContentDiscoveredNotification, enqueueNotification } from './notifications.js';
@@ -259,20 +260,32 @@ async function captureWithFallback<T>(sites: string[], url: URL, read: (target: 
   throw lastError;
 }
 
-export async function previewCapture(input: Pick<Subscription, 'url' | 'selector' | 'render_mode' | 'content_source' | 'attribute_name' | 'match_pattern' | 'title_selector' | 'title_content_source' | 'title_attribute_name' | 'title_match_pattern' | 'result_mode'> & { rule_family?: Subscription['rule_family'] }) {
+/**
+ * 订阅所属检查规则组的适用站点。空数组表示「不限站点」：captureWithFallback
+ * 会直接读取订阅原地址，正好等于不限制站点，因此这里不做任何默认值回落。
+ */
+async function ruleGroupSites(presetId: number | null | undefined) {
+  const id = Number(presetId);
+  if (!Number.isInteger(id) || id < 1) return [];
+  const row = await db.get<{ sites_json: string | null }>('SELECT sites_json FROM subscription_presets WHERE id = ?', [id]);
+  return parseSitesJson(row?.sites_json);
+}
+
+export async function previewCapture(input: Pick<Subscription, 'url' | 'selector' | 'render_mode' | 'content_source' | 'attribute_name' | 'match_pattern' | 'title_selector' | 'title_content_source' | 'title_attribute_name' | 'title_match_pattern' | 'result_mode'> & { rule_family?: Subscription['rule_family']; preset_id?: number | null }) {
   const url = await assertSafeUrl(input.url);
   if (!input.selector.trim()) throw new Error('请填写 CSS 选择器。');
   if (input.content_source === 'attribute' && !input.attribute_name?.trim()) throw new Error('请填写要提取的属性名。');
-  const { sites } = getInspectionRules();
-  return captureWithFallback(input.rule_family === 'missav' ? sites : [], url, (target) => input.render_mode === 'dynamic'
+  const sites = input.rule_family === 'missav' ? await ruleGroupSites(input.preset_id) : [];
+  return captureWithFallback(sites, url, (target) => input.render_mode === 'dynamic'
     ? getDynamic(target, input.selector, input.content_source, input.attribute_name, input.match_pattern, input.result_mode, undefined, undefined, input.title_selector, input.title_content_source, input.title_attribute_name, input.title_match_pattern, 100)
     : getStatic(target, input.selector, input.content_source, input.attribute_name, input.match_pattern, input.result_mode, undefined, undefined, input.title_selector, input.title_content_source, input.title_attribute_name, input.title_match_pattern));
 }
 
 async function capturePage(subscription: Subscription, rawUrl: string, includePageCount = false, browserPriority = 0) {
   const url = await assertSafeUrl(rawUrl);
-  const { sites } = getInspectionRules();
-  return captureWithFallback(subscription.rule_family === 'missav' ? sites : [], url, (target) => subscription.render_mode === 'dynamic'
+  // 站点来源改为订阅所属规则组：组内没有站点时传空数组，等价于「不限站点」。
+  const sites = subscription.rule_family === 'missav' ? await ruleGroupSites(subscription.preset_id) : [];
+  return captureWithFallback(sites, url, (target) => subscription.render_mode === 'dynamic'
     ? getDynamic(target, subscription.selector, subscription.content_source, subscription.attribute_name, subscription.match_pattern, subscription.result_mode, includePageCount ? subscription.pagination_selector : null, subscription.pagination_match_pattern, subscription.title_selector, subscription.title_content_source, subscription.title_attribute_name, subscription.title_match_pattern, browserPriority)
     : getStatic(target, subscription.selector, subscription.content_source, subscription.attribute_name, subscription.match_pattern, subscription.result_mode, includePageCount ? subscription.pagination_selector : null, subscription.pagination_match_pattern, subscription.title_selector, subscription.title_content_source, subscription.title_attribute_name, subscription.title_match_pattern));
 }

@@ -14,6 +14,11 @@ startRuntimeMemoryReporter('runner');
 const ENGINE_IDLE_EXIT_CODE = 76;
 const ENGINE_IDLE_MS = 2 * 60_000;
 const HEARTBEAT_KEEPALIVE_MS = 15_000;
+// 浏览器只是“开着但空闲”（等 browserIdleMinutes 到点关闭）时，队列必然为空，
+// 否则上面的 runnableHandlers 会命中并进入处理分支。这段时间没必要按 5 秒重跑
+// 那条含 8 段 UNION 的队列查询：真正的任务由 API 的唤醒消息立即触发，不依赖
+// 这个定时器；qBittorrent 状态同步也由 API 进程自己的观察器负责，与本循环无关。
+const BROWSER_IDLE_RECHECK_MS = 20_000;
 let dispatchTimer: NodeJS.Timeout | null = null;
 let heartbeatTimer: NodeJS.Timeout | null = null;
 let idleSince: number | null = null;
@@ -109,7 +114,10 @@ async function requestDispatch(_reason = '事件唤醒') {
     // starts below.
     if (activeHandlers.size || web.state !== 'offline' || librarySync.active) {
       idleSince = null;
-      scheduleDispatch(5_000);
+      // 只有“浏览器仍开着、但没有任务在处理”这一种情况可以降频；同步器在跑或
+      // handler 未收尾时仍需保持 5 秒，避免拖慢正在进行的批次。
+      const waitingForBrowserIdle = !activeHandlers.size && !librarySync.active && web.state === 'browser_idle';
+      scheduleDispatch(waitingForBrowserIdle ? BROWSER_IDLE_RECHECK_MS : 5_000);
       return;
     }
     idleSince ??= Date.now();

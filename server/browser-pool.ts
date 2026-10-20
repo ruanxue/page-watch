@@ -1,11 +1,17 @@
 import { chromium, type Browser, type Page } from 'playwright';
 import { getOutboundProxyUrl, getRuntimeSettings, recordPerformanceMetric } from './db.js';
+import { shouldRebuildBrowserAfterTaskError } from './browser-lifecycle-policy.js';
 
 type BrowserScope = 'capture' | 'release';
 // The queue stores heterogeneous task results. The public `use` method keeps
 // the generic result type; the runner only needs to pass that result through.
 type BrowserTask = { scope: BrowserScope; priority: number; requestedAt: number; run: (page: Page) => Promise<unknown>; resolve: (value: any) => void; reject: (reason: unknown) => void };
 type BrowserCloseReason = 'disconnected' | 'proxy_changed' | 'page_limit' | 'age_limit' | 'idle' | 'error';
+
+// 每个排队项都闭包持有一个完整订阅对象（含上次抓取的正文），不设上限就等于把
+// 内存交给外部请求量决定。正常并发只有 1-2 个，32 已足够宽松；超限时立即拒绝，
+// 由任务层的“临时故障”重试接管，而不是在这里无限堆积。
+const MAX_QUEUED_TASKS = 32;
 
 export type BrowserPoolSnapshot = {
   state: 'active' | 'idle' | 'closed';
@@ -36,6 +42,9 @@ export class BrowserPool {
   private pendingRecycle: BrowserCloseReason | null = null;
 
   async use<T>(scope: BrowserScope, work: (page: Page) => Promise<T>, priority = 0) {
+    if (this.queue.length >= MAX_QUEUED_TASKS) {
+      throw new Error(`网页渲染排队已满（${this.queue.length} 个等待中），请稍后重试。`);
+    }
     return new Promise<T>((resolve, reject) => {
       this.queue.push({ scope, priority, requestedAt: Date.now(), run: work, resolve, reject });
       this.drain();
@@ -126,7 +135,13 @@ export class BrowserPool {
       this.navigationCount += 1;
       task.resolve(result);
     } catch (error) {
-      await this.close('error', task.scope);
+      // 页面级失败不再拆掉共享浏览器，交给 context 关闭即可回收这一页的内存。
+      const rebuilt = shouldRebuildBrowserAfterTaskError({
+        contextCreated: Boolean(context),
+        browserConnected: Boolean(this.browser?.isConnected())
+      });
+      if (rebuilt) await this.close('error', task.scope);
+      else await recordPerformanceMetric({ scope: task.scope, metric: 'chromium_rebuild', dimension: 'page_kept' }).catch(() => undefined);
       task.reject(error);
     } finally {
       await context?.close().catch(() => undefined);

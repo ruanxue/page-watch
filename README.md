@@ -83,7 +83,7 @@ npm run migrate:mysql
 
 也可在 NAS 的 `.env` 中设置 `OUTBOUND_PROXY=http://代理地址:端口`，它会覆盖网页内的设置。若代理运行在 NAS 外的另一台设备，请使用其局域网 IP；容器中的 `127.0.0.1` 指向容器自身。
 
-本地开发使用项目版本对应的 Playwright Chromium；首次运行前执行 `npx playwright install chromium`，不要依赖系统已安装的 Chrome 或 Edge。NAS 的 Docker 镜像已自带 Chromium。若需指定其他浏览器，可设置 `PLAYWRIGHT_EXECUTABLE_PATH`。网页中的“网络代理”设置同时提供“运行性能”：默认“稳妥”模式只运行一个 MissAV 页面，浏览器空闲 10 分钟自动回收；“性能”模式最多两页并发，会增加内存和站点访问风险。运行中心会分别显示 API、执行引擎、网页执行器与 Jellyfin 同步器的内存；网页执行器显示“已回收”时，承载 Playwright/Cheerio 的 Node 进程和 Chromium 都已退出。大批任务完成后，若网页执行器和 Jellyfin 同步器均已退出、所有队列和 Worker 都持续空闲而执行引擎 RSS 仍超过 160MB，系统会先执行受控 GC；仍未回落才只重启执行引擎。网页 API、SSE 与登录会话不中断，全部任务状态由 MySQL 队列续跑。
+本地开发使用项目版本对应的 Playwright Chromium；首次运行前执行 `npx playwright install chromium`，不要依赖系统已安装的 Chrome 或 Edge。NAS 的 Docker 镜像已自带 Chromium。若需指定其他浏览器，可设置 `PLAYWRIGHT_EXECUTABLE_PATH`。网页中的“网络代理”设置同时提供“运行性能”：默认“稳妥”模式只运行一个 MissAV 页面，浏览器空闲 10 分钟自动回收；“性能”模式最多两页并发，会增加内存和站点访问风险。运行中心会分别显示 API、执行引擎、网页执行器与 Jellyfin 同步器的内存；网页执行器显示“已回收”时，承载 Playwright/Cheerio 的 Node 进程和 Chromium 都已退出。大批任务完成后，若网页执行器和 Jellyfin 同步器均已退出、所有队列和 Worker 都持续空闲而执行引擎 RSS 仍超过回收阈值（默认 160MB，可用 `ENGINE_MEMORY_RECYCLE_THRESHOLD_MB` 调整，有效范围 64-4096），系统会先执行受控 GC；仍未回落才只重启执行引擎。网页服务自身则只做内存告警（默认 256MB，可用 `APP_MEMORY_GUARD_MB` 调整），不会因内存偏高而重启，以免中断 SSE 与登录会话。网页 API、SSE 与登录会话不中断，全部任务状态由 MySQL 队列续跑。
 
 ### 推荐的 NAS 持续部署
 

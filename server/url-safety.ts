@@ -11,8 +11,30 @@ setDefaultResultOrder('ipv4first');
 
 const blockedHosts = new Set(['localhost', 'localhost.localdomain', 'metadata.google.internal']);
 
-function isPrivateIp(value: string) {
-  const hostname = value.replace(/^\[|\]$/g, '').toLowerCase();
+/**
+ * 把 IPv4-mapped IPv6（`::ffff:127.0.0.1`、`0:0:0:0:0:ffff:7f00:1`）还原成 IPv4。
+ * 这类地址在多数系统上等价于直接连接该 IPv4 地址，若不还原就会绕过内网判断。
+ */
+function ipv4FromMappedIpv6(value: string): string | null {
+  const host = value.replace(/^\[|\]$/g, '').toLowerCase();
+  const match = /^(?:::ffff:|0:0:0:0:0:ffff:)(.+)$/.exec(host);
+  if (!match) return null;
+  const tail = match[1];
+  if (net.isIP(tail) === 4) return tail;
+  const groups = tail.split(':');
+  if (groups.length !== 2) return null;
+  const high = Number.parseInt(groups[0], 16);
+  const low = Number.parseInt(groups[1], 16);
+  if (!Number.isInteger(high) || !Number.isInteger(low)) return null;
+  return `${(high >> 8) & 0xff}.${high & 0xff}.${(low >> 8) & 0xff}.${low & 0xff}`;
+}
+
+function normalizeIp(value: string) {
+  return ipv4FromMappedIpv6(value) ?? value.replace(/^\[|\]$/g, '').toLowerCase();
+}
+
+export function isPrivateIp(value: string) {
+  const hostname = normalizeIp(value);
   if (!net.isIP(hostname)) return false;
   if (hostname === '::1' || hostname === '::' || hostname === '0.0.0.0') return true;
   if (hostname.startsWith('fc') || hostname.startsWith('fd') || hostname.startsWith('fe80:')) return true;
