@@ -125,31 +125,31 @@ type ActiveDownloadRow = { id: number; subscription_id: number; subscription_nam
 const taskQueueUnion = `
   SELECT CASE WHEN s.pagination_selector IS NOT NULL AND s.initial_scan_completed = 0 THEN 'full_scan' ELSE 'check' END AS kind,
     j.id AS task_id, j.status, j.priority, j.requested_at, j.started_at, j.finished_at, j.retry_after, j.error, j.attempt_count,
-    s.id AS subscription_id, s.name AS subscription_name, NULL AS content, NULL AS title,
+    s.id AS subscription_id, s.name AS subscription_name, NULL::text AS content, NULL::text AS title,
     CASE WHEN s.pagination_selector IS NOT NULL AND s.initial_scan_completed = 0 THEN s.initial_scan_pages_completed ELSE NULL END AS progress_current,
     CASE WHEN s.pagination_selector IS NOT NULL AND s.initial_scan_completed = 0 THEN s.initial_scan_total ELSE NULL END AS progress_total,
     CASE WHEN s.pagination_selector IS NOT NULL AND s.initial_scan_completed = 0 THEN CONCAT('下一个页面：', s.initial_scan_next_page) ELSE NULL END AS progress_label,
-    NULL AS download_progress
+    NULL::numeric AS download_progress
   FROM jobs j JOIN subscriptions s ON s.id = j.subscription_id
   UNION ALL
   SELECT 'release', j.id, j.status, j.priority, j.requested_at, j.started_at, j.finished_at, j.retry_after, j.error, j.attempt_count,
-    a.subscription_id, s.name, a.content, a.title, NULL, NULL, NULL, NULL
+    a.subscription_id, s.name, a.content, a.title, NULL::int, NULL::int, NULL::text, NULL::numeric
   FROM release_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id
   UNION ALL
   SELECT 'magnet', j.id, j.status, j.priority, j.requested_at, j.started_at, j.finished_at, j.retry_after, j.error, j.attempt_count,
-    a.subscription_id, s.name, a.content, a.title, NULL, NULL, NULL, NULL
+    a.subscription_id, s.name, a.content, a.title, NULL::int, NULL::int, NULL::text, NULL::numeric
   FROM magnet_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id
   UNION ALL
   SELECT 'library', j.id, j.status, j.priority, j.requested_at, j.started_at, j.finished_at, j.retry_after, j.error, j.attempt_count,
-    a.subscription_id, s.name, a.content, a.title, NULL, NULL, NULL, NULL
+    a.subscription_id, s.name, a.content, a.title, NULL::int, NULL::int, NULL::text, NULL::numeric
   FROM library_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id
   UNION ALL
   SELECT 'download', j.id, j.status, j.priority, j.requested_at, j.started_at, j.finished_at, j.retry_after, j.error, j.attempt_count,
-    a.subscription_id, s.name, a.content, a.title, NULL, NULL, NULL, a.download_progress
+    a.subscription_id, s.name, a.content, a.title, NULL::int, NULL::int, NULL::text, a.download_progress
   FROM download_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id JOIN subscriptions s ON s.id = a.subscription_id
   UNION ALL
-  SELECT 'library_sync', j.id, j.status, j.priority, j.requested_at, j.started_at, j.finished_at, NULL, j.error, 0,
-    NULL, NULL, NULL, NULL, j.progress_current, j.progress_total, j.progress_label, NULL
+  SELECT 'library_sync', j.id, j.status, j.priority, j.requested_at, j.started_at, j.finished_at, NULL::text, j.error, 0,
+    NULL::int, NULL::text, NULL::text, NULL::text, j.progress_current, j.progress_total, j.progress_label, NULL::numeric
   FROM library_sync_jobs j`;
 
 function taskStatus(row: Pick<TaskQueueRow, 'status' | 'retry_after'>) {
