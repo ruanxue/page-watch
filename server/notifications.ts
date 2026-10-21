@@ -384,7 +384,8 @@ export async function enqueueNotification(payload: NotificationPayload, client: 
     const expiresAt = new Date(now.getTime() + dedupeWindowMs).toISOString();
     const dedupe = await client.run(`INSERT INTO notification_dedupes (dedupe_key, expires_at, created_at)
       VALUES (?, ?, ?)
-      ON DUPLICATE KEY UPDATE expires_at = IF(expires_at <= VALUES(created_at), VALUES(expires_at), expires_at), created_at = IF(expires_at <= VALUES(created_at), VALUES(created_at), created_at)`, [dedupeKey, expiresAt, createdAt]);
+      ON CONFLICT (dedupe_key) DO UPDATE SET expires_at = EXCLUDED.expires_at, created_at = EXCLUDED.created_at
+        WHERE notification_dedupes.expires_at <= EXCLUDED.created_at`, [dedupeKey, expiresAt, createdAt]);
     if (dedupe.changes === 0) return { queued: false, deduped: true, id: null as number | null };
   }
   const result = await client.run(`INSERT INTO notification_outbox
@@ -450,9 +451,9 @@ async function finalizeOneFullScanBatch() {
     if (Number(active?.count ?? 0) > 0) return false;
 
     const totals = await tx.get<{ entry_count: number; magnet_found: number; magnet_not_found: number; failed_count: number }>(`SELECT COUNT(*) AS entry_count,
-        COALESCE(SUM(magnet_status = 'found'), 0) AS magnet_found,
-        COALESCE(SUM(magnet_status = 'not_found'), 0) AS magnet_not_found,
-        COALESCE(SUM(magnet_status IN ('failed','pending')), 0) + COALESCE(SUM(release_status IN ('failed','pending')), 0) AS failed_count
+        COUNT(*) FILTER (WHERE magnet_status = 'found') AS magnet_found,
+        COUNT(*) FILTER (WHERE magnet_status = 'not_found') AS magnet_not_found,
+        COUNT(*) FILTER (WHERE magnet_status IN ('failed','pending')) + COUNT(*) FILTER (WHERE release_status IN ('failed','pending')) AS failed_count
       FROM archive_entries WHERE full_scan_batch_id = ?`, [batch.id]);
     const items = await tx.all<{ content: string; title: string | null; detail_url: string | null }>(`SELECT content, title, detail_url FROM archive_entries
       WHERE full_scan_batch_id = ? ORDER BY id ASC LIMIT 5`, [batch.id]);

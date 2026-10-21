@@ -1,5 +1,8 @@
 import 'dotenv/config';
 import mysql, { type Pool, type PoolConnection, type ResultSetHeader } from 'mysql2/promise';
+import { Pool as PgPool, type PoolClient } from 'pg';
+import { createPostgresPool, pgClientFor } from './pg-connection.js';
+import { ensurePostgresSchema } from './postgres-schema.js';
 import { ensureMySqlSchema } from './mysql-schema.js';
 import { databaseBootstrapForStartup, databaseBootstrapNeedsMigration, environmentDatabaseSettings, migrateLegacyDatabaseSettingsToPlaintext, normalizeDatabaseSettings, savedDatabaseSettings, saveDatabaseSettings, type MySqlConnectionSettings } from './database-bootstrap.js';
 import { defaultInspectionRules, inspectionRulesJson } from './inspection-rules.js';
@@ -9,7 +12,22 @@ import { decryptSecret, isEncryptedSecret, isPageWatchEncryptedValue, readOption
 import { resolveHeartbeatWrite, type WorkerHeartbeatContext, type WorkerHeartbeatOptions, type WorkerName, type WorkerTaskContext } from './worker-heartbeat.js';
 import { defaultRuntimeSettings, normalizeRuntimeSettings, type RuntimeSettings } from './runtime-settings.js';
 
-let pool: Pool | null = null;
+/**
+ * 当前生效的数据库驱动。新安装默认 PostgreSQL；引导文件里写明 driver 时以文件为准，
+ * 因此旧的 MySQL 配置文件（没有 driver 字段）会被识别成 MySQL，不会连错库。
+ * 需要临时指定时可用环境变量 DB_DRIVER=mysql|postgres 覆盖。
+ */
+export type DatabaseDriver = 'mysql' | 'postgres';
+export let databaseDriver: DatabaseDriver = 'postgres';
+
+/** 依据连接配置决定驱动：文件里写了就用文件的，否则看环境变量。 */
+function driverFrom(config: MySqlConnectionSettings): DatabaseDriver {
+  if (config.driver === 'postgres') return 'postgres';
+  if (config.driver === 'mysql') return 'mysql';
+  return process.env.DB_DRIVER === 'mysql' ? 'mysql' : 'postgres';
+}
+
+let pool: Pool | PgPool | null = null;
 let databaseSource: 'environment' | 'saved' | null = null;
 let databaseConfigurationProblem: string | null = null;
 let databaseConfigurationInProgress = false;
@@ -17,6 +35,7 @@ let legacyBootstrapCiphertextForMigration: string | null = null;
 let legacyBootstrapSettingsForMigration: MySqlConnectionSettings | null = null;
 
 function createPool(config: MySqlConnectionSettings) {
+  if (databaseDriver === 'postgres') return createPostgresPool(config);
   return mysql.createPool({
   host: config.host,
   port: config.port,
@@ -31,6 +50,12 @@ function createPool(config: MySqlConnectionSettings) {
   charset: 'utf8mb4_unicode_ci',
   timezone: 'Z'
   });
+}
+
+/** 按驱动建表：两边结构一一对应，新库直接是最终形态。 */
+async function ensureSchema(target: Pool | PgPool) {
+  if (databaseDriver === 'postgres') return ensurePostgresSchema(target as PgPool);
+  return ensureMySqlSchema(target as Pool);
 }
 
 function loadDatabasePool() {
@@ -49,6 +74,7 @@ function loadDatabasePool() {
     const config = environment ?? saved;
     if (!config) return null;
     databaseSource = environment ? 'environment' : 'saved';
+    databaseDriver = driverFrom(config);
     return createPool(config);
   } catch (error) {
     databaseConfigurationProblem = error instanceof Error ? error.message : '已保存的数据库连接无法读取。请确认 APP_ENCRYPTION_KEY 未变更。';
@@ -69,8 +95,7 @@ function requirePool() {
   if (!pool) throw new DatabaseNotConfiguredError();
   return pool;
 }
-
-type Runner = Pool | PoolConnection;
+type Runner = Pool | PoolConnection | PgPool | PoolClient;
 export type RunResult = { changes: number; lastInsertRowid: number };
 export type DatabaseClient = {
   all<T>(sql: string, params?: unknown[]): Promise<T[]>;
@@ -79,17 +104,21 @@ export type DatabaseClient = {
 };
 
 function clientFor(runner: Runner): DatabaseClient {
+  // PostgreSQL 走统一适配层：翻译占位符、把 rowCount 映射成 changes、
+  // 用 RETURNING 取回自增 id。MySQL 仍是原来的实现。
+  if (databaseDriver === 'postgres') return pgClientFor(runner as PgPool | PoolClient) as DatabaseClient;
+  const queryable = runner as Pool | PoolConnection;
   return {
     async all<T>(sql: string, params: unknown[] = []) {
-      const [rows] = await runner.query(sql, params as any);
+      const [rows] = await queryable.query(sql, params as any);
       return rows as T[];
     },
     async get<T>(sql: string, params: unknown[] = []) {
-      const [rows] = await runner.query(sql, params as any);
+      const [rows] = await queryable.query(sql, params as any);
       return (rows as T[])[0];
     },
     async run(sql: string, params: unknown[] = []) {
-      const [result] = await runner.execute(sql, params as any);
+      const [result] = await queryable.execute(sql, params as any);
       const header = result as ResultSetHeader;
       return { changes: header.affectedRows, lastInsertRowid: Number(header.insertId) };
     }
@@ -101,7 +130,22 @@ export const db: DatabaseClient & { transaction<T>(work: (tx: DatabaseClient) =>
   async get<T>(sql: string, params: unknown[] = []) { return clientFor(requirePool()).get<T>(sql, params); },
   async run(sql: string, params: unknown[] = []) { return clientFor(requirePool()).run(sql, params); },
   async transaction<T>(work: (tx: DatabaseClient) => Promise<T>) {
-    const connection = await requirePool().getConnection();
+    const target = requirePool();
+    if (databaseDriver === 'postgres') {
+      const client = await (target as PgPool).connect();
+      try {
+        await client.query('BEGIN');
+        const result = await work(clientFor(client));
+        await client.query('COMMIT');
+        return result;
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
+    const connection = await (target as Pool).getConnection();
     try {
       await connection.beginTransaction();
       const result = await work(clientFor(connection));
@@ -126,14 +170,17 @@ export async function configureDatabase(input: Partial<MySqlConnectionSettings>)
     throw new Error('旧版数据库引导配置尚未迁移；请保留原数据库连接和旧密钥，让新版先完成迁移，再更改 MySQL 地址。');
   }
   const settings = normalizeDatabaseSettings(input);
+  const previousDriver = databaseDriver;
+  databaseDriver = driverFrom(settings);
   const candidate = createPool(settings);
   const previousPool = pool;
   const previousSource = databaseSource;
   const previousProblem = databaseConfigurationProblem;
   const previousInitialization = initialization;
   try {
-    await candidate.query('SELECT 1');
-    await ensureMySqlSchema(candidate);
+    // 两种驱动的 pool 都提供 query，但联合类型的签名无法直接调用，这里收敛成最小接口。
+    await (candidate as { query(sql: string): Promise<unknown> }).query('SELECT 1');
+    await ensureSchema(candidate);
     pool = candidate;
     databaseSource = 'saved';
     databaseConfigurationProblem = null;
@@ -147,6 +194,7 @@ export async function configureDatabase(input: Partial<MySqlConnectionSettings>)
     databaseConfigurationInProgress = false;
     await previousPool?.end().catch((error) => console.warn(`Unable to close previous database pool: ${error instanceof Error ? error.message : String(error)}`));
   } catch (error) {
+    databaseDriver = previousDriver;
     if (pool === candidate) {
       pool = previousPool;
       databaseSource = previousSource;
@@ -270,7 +318,7 @@ export async function reportWorkerHeartbeat(workerName: WorkerName, detail: stri
   if (!write.signature) return;
   await db.run(`INSERT INTO worker_heartbeats (worker_name, status, detail, task_kind, subscription_id, archive_entry_id, task_content, progress_current, progress_total, progress_label, last_seen_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON DUPLICATE KEY UPDATE status = VALUES(status), detail = VALUES(detail), task_kind = VALUES(task_kind), subscription_id = VALUES(subscription_id), archive_entry_id = VALUES(archive_entry_id), task_content = VALUES(task_content), progress_current = VALUES(progress_current), progress_total = VALUES(progress_total), progress_label = VALUES(progress_label), last_seen_at = VALUES(last_seen_at)`,
+    ON CONFLICT (worker_name) DO UPDATE SET status = EXCLUDED.status, detail = EXCLUDED.detail, task_kind = EXCLUDED.task_kind, subscription_id = EXCLUDED.subscription_id, archive_entry_id = EXCLUDED.archive_entry_id, task_content = EXCLUDED.task_content, progress_current = EXCLUDED.progress_current, progress_total = EXCLUDED.progress_total, progress_label = EXCLUDED.progress_label, last_seen_at = EXCLUDED.last_seen_at`,
   [workerName, normalized.status, normalized.detail, normalized.kind, normalized.subscriptionId, normalized.archiveEntryId, normalized.content, normalized.current, normalized.total, normalized.label, new Date(nowMs).toISOString()]);
   if (write.changed) {
     notifyLive('services');
@@ -302,22 +350,22 @@ export async function rebuildSubscriptionProgress(subscriptionId?: number, clien
     (subscription_id, archive_total, jellyfin_available, release_total, release_done, magnet_total, magnet_done, library_total, library_done, download_total, download_done, updated_at)
     SELECT s.id,
       COUNT(a.id),
-      COALESCE(SUM(a.jellyfin_status = 'available'), 0),
-      COALESCE(SUM(a.release_status <> 'unsearched'), 0),
-      COALESCE(SUM(a.release_status IN ('found','unavailable','failed')), 0),
-      COALESCE(SUM(a.magnet_status <> 'unsearched'), 0),
-      COALESCE(SUM(a.magnet_status IN ('found','not_found','failed','skipped')), 0),
-      COALESCE(SUM(a.jellyfin_status <> 'unconfigured'), 0),
-      COALESCE(SUM(a.jellyfin_status IN ('available','not_found','failed')), 0),
-      COALESCE(SUM(a.download_status <> 'not_queued'), 0),
-      COALESCE(SUM(a.download_status IN ('completed','removed','failed','filtered','not_queued')), 0),
+      COUNT(*) FILTER (WHERE a.jellyfin_status = 'available'),
+      COUNT(*) FILTER (WHERE a.release_status <> 'unsearched'),
+      COUNT(*) FILTER (WHERE a.release_status IN ('found','unavailable','failed')),
+      COUNT(*) FILTER (WHERE a.magnet_status <> 'unsearched'),
+      COUNT(*) FILTER (WHERE a.magnet_status IN ('found','not_found','failed','skipped')),
+      COUNT(*) FILTER (WHERE a.jellyfin_status <> 'unconfigured'),
+      COUNT(*) FILTER (WHERE a.jellyfin_status IN ('available','not_found','failed')),
+      COUNT(*) FILTER (WHERE a.download_status <> 'not_queued'),
+      COUNT(*) FILTER (WHERE a.download_status IN ('completed','removed','failed','filtered','not_queued')),
       ?
     FROM subscriptions s LEFT JOIN archive_entries a ON a.subscription_id = s.id
     ${where}
     GROUP BY s.id
-    ON DUPLICATE KEY UPDATE archive_total=VALUES(archive_total), jellyfin_available=VALUES(jellyfin_available),
-      release_total=VALUES(release_total), release_done=VALUES(release_done), magnet_total=VALUES(magnet_total), magnet_done=VALUES(magnet_done),
-      library_total=VALUES(library_total), library_done=VALUES(library_done), download_total=VALUES(download_total), download_done=VALUES(download_done), updated_at=VALUES(updated_at)`, params);
+    ON CONFLICT (subscription_id) DO UPDATE SET archive_total=EXCLUDED.archive_total, jellyfin_available=EXCLUDED.jellyfin_available,
+      release_total=EXCLUDED.release_total, release_done=EXCLUDED.release_done, magnet_total=EXCLUDED.magnet_total, magnet_done=EXCLUDED.magnet_done,
+      library_total=EXCLUDED.library_total, library_done=EXCLUDED.library_done, download_total=EXCLUDED.download_total, download_done=EXCLUDED.download_done, updated_at=EXCLUDED.updated_at`, params);
 }
 
 // NAS MySQL deployments commonly deny CREATE TRIGGER while binary logging is
@@ -499,7 +547,7 @@ function readableSettingValue(key: string, value: string) {
 
 export async function setSetting(key: string, value: string) {
   await db.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, ?, ?)
-    ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`, [key, value, new Date().toISOString()]);
+    ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`, [key, value, new Date().toISOString()]);
   settings.set(key, value);
 }
 
@@ -575,7 +623,7 @@ async function recordPerformanceMetricNow(input: PerformanceMetricInput, bucket 
   const duration = Math.max(0, Math.floor(input.durationMs ?? 0));
   await db.run(`INSERT INTO performance_metrics (granularity, bucket_start, scope, metric, dimension, sample_count, duration_ms)
     VALUES ('minute', ?, ?, ?, ?, ?, ?)
-    ON DUPLICATE KEY UPDATE sample_count = sample_count + VALUES(sample_count), duration_ms = duration_ms + VALUES(duration_ms)`,
+    ON CONFLICT (granularity, bucket_start, scope, metric, dimension) DO UPDATE SET sample_count = performance_metrics.sample_count + EXCLUDED.sample_count, duration_ms = performance_metrics.duration_ms + EXCLUDED.duration_ms`,
   [bucket, input.scope, input.metric, dimension, count, duration]);
   notifyLive('metrics');
 }
@@ -667,7 +715,7 @@ export async function reportRuntimeMetrics(metrics: RuntimeMetric[]) {
   const values = metrics.flatMap((metric) => [metric.key.slice(0, 64), metric.value ?? null, metric.text?.slice(0, 64) ?? null, now]);
   const placeholders = metrics.map(() => '(?, ?, ?, ?)').join(', ');
   await db.run(`INSERT INTO runtime_metrics (metric_key, numeric_value, text_value, updated_at) VALUES ${placeholders}
-    ON DUPLICATE KEY UPDATE numeric_value = VALUES(numeric_value), text_value = VALUES(text_value), updated_at = VALUES(updated_at)`, values);
+    ON CONFLICT (metric_key) DO UPDATE SET numeric_value = EXCLUDED.numeric_value, text_value = EXCLUDED.text_value, updated_at = EXCLUDED.updated_at`, values);
   for (const metric of metrics) runtimeMetricCache.set(metric.key.slice(0, 64), { value: metric.value ?? null, text: metric.text?.slice(0, 64) ?? null, persistedAt: nowMs });
   if (changed) notifyLive('metrics');
 }
@@ -688,7 +736,7 @@ export async function reportIntegrationStatus(service: IntegrationService, statu
   const changed = previous?.signature !== signature;
   if (!changed && previous && nowMs - previous.persistedAt < 60_000) return;
   await db.run(`INSERT INTO integration_status (service_name, status, detail, checked_at) VALUES (?, ?, ?, ?)
-    ON DUPLICATE KEY UPDATE status = VALUES(status), detail = VALUES(detail), checked_at = VALUES(checked_at)`,
+    ON CONFLICT (service_name) DO UPDATE SET status = EXCLUDED.status, detail = EXCLUDED.detail, checked_at = EXCLUDED.checked_at`,
   [service, status, normalizedDetail, new Date(nowMs).toISOString()]);
   integrationCache.set(service, { signature, persistedAt: nowMs });
   if (changed) notifyLive('services');
@@ -796,7 +844,7 @@ async function seedDefaultSubscriptionPresets() {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [...preset, now, now]);
     }
     await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, ?, ?)
-      ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`, ['subscription_presets_seeded', '1', now]);
+      ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`, ['subscription_presets_seeded', '1', now]);
   });
   settings.set('subscription_presets_seeded', '1');
 }
@@ -825,7 +873,7 @@ async function backfillMissavPaginationDefaults() {
         AND (url LIKE 'https://missav123.com/%' OR url LIKE 'http://missav123.com/%')`,
     ['#price-currency', 'page', '/\\s*(\\d+)', now]);
     await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, '1', ?)
-      ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`, [migrationKey, now]);
+      ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`, [migrationKey, now]);
   });
   settings.set(migrationKey, '1');
 }
@@ -863,7 +911,7 @@ async function assignLegacyMissavRules() {
       }
       lastId = batch[batch.length - 1].id;
     }
-    await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, '1', ?) ON DUPLICATE KEY UPDATE value=VALUES(value), updated_at=VALUES(updated_at)`, [migrationKey, now]);
+    await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, '1', ?) ON CONFLICT ("key") DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at`, [migrationKey, now]);
   });
   settings.set(migrationKey, '1');
 }
@@ -912,7 +960,7 @@ async function migrateRuleGroups() {
     await tx.run(`UPDATE subscription_presets SET sites_json = COALESCE(sites_json, '[]'), steps_json = COALESCE(steps_json, '[]')
       WHERE sites_json IS NULL OR steps_json IS NULL`);
     await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, '1', ?)
-      ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`, [migrationKey, now]);
+      ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`, [migrationKey, now]);
   });
   settings.set(migrationKey, '1');
 }
@@ -927,7 +975,7 @@ let initialization: Promise<void> | null = null;
  */
 export function initializeDatabase() {
   if (!initialization) initialization = (async () => {
-    await ensureMySqlSchema(requirePool());
+    await ensureSchema(requirePool());
     await migrateEncryptedSettingsToPlaintext();
     await migrateDatabaseBootstrapToPlaintext();
     await preloadSettings();

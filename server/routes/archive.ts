@@ -24,7 +24,8 @@ export function registerArchiveRoutes(app: FastifyInstance) {
     const clauses: string[] = [];
     const params: unknown[] = [];
     if (hasSubscriptionId) { clauses.push('a.subscription_id = ?'); params.push(subscriptionId); }
-    if (keyword) { clauses.push('(a.content LIKE ? OR a.title LIKE ?)'); params.push(`%${keyword}%`, `%${keyword}%`); }
+    // PostgreSQL 的 LIKE 区分大小写，这里用 ILIKE 保持原来「输入小写也能搜到」的行为。
+    if (keyword) { clauses.push('(a.content ILIKE ? OR a.title ILIKE ?)'); params.push(`%${keyword}%`, `%${keyword}%`); }
     if (releaseFrom) { clauses.push('a.release_date >= ?'); params.push(releaseFrom); }
     if (releaseTo) { clauses.push('a.release_date <= ?'); params.push(releaseTo); }
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';

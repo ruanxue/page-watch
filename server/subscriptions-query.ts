@@ -21,12 +21,12 @@ export async function listSubscriptions() {
     rule.name AS preset_name,
     COALESCE(p.archive_total, 0) AS archive_count,
     COALESCE(p.jellyfin_available, 0) AS jellyfin_available_count,
-    JSON_OBJECT(
-      'check', JSON_OBJECT('done', 0, 'total', (SELECT COUNT(*) FROM jobs j WHERE j.subscription_id = s.id AND j.status IN ('queued','running'))),
-      'release', JSON_OBJECT('done', COALESCE(p.release_done, 0), 'total', COALESCE(p.release_total, 0)),
-      'magnet', JSON_OBJECT('done', COALESCE(p.magnet_done, 0), 'total', COALESCE(p.magnet_total, 0)),
-      'library', JSON_OBJECT('done', COALESCE(p.library_done, 0), 'total', COALESCE(p.library_total, 0)),
-      'download', JSON_OBJECT('done', COALESCE(p.download_done, 0), 'total', COALESCE(p.download_total, 0))
+    json_build_object(
+      'check', json_build_object('done', 0, 'total', (SELECT COUNT(*) FROM jobs j WHERE j.subscription_id = s.id AND j.status IN ('queued','running'))),
+      'release', json_build_object('done', COALESCE(p.release_done, 0), 'total', COALESCE(p.release_total, 0)),
+      'magnet', json_build_object('done', COALESCE(p.magnet_done, 0), 'total', COALESCE(p.magnet_total, 0)),
+      'library', json_build_object('done', COALESCE(p.library_done, 0), 'total', COALESCE(p.library_total, 0)),
+      'download', json_build_object('done', COALESCE(p.download_done, 0), 'total', COALESCE(p.download_total, 0))
     ) AS queue_summary,
     CASE
       WHEN s.pagination_selector IS NOT NULL

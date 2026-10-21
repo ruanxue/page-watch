@@ -45,10 +45,10 @@ export function registerSubscriptionsRoutes(app: FastifyInstance, deps: { wakeEn
   app.delete('/api/subscriptions/:id', async (request, reply) => {
     const id = Number((request.params as { id: string }).id);
     await db.transaction(async (tx) => {
-      await tx.run('DELETE d FROM download_jobs d JOIN archive_entries a ON a.id = d.archive_entry_id WHERE a.subscription_id = ?', [id]);
-      await tx.run('DELETE r FROM release_jobs r JOIN archive_entries a ON a.id = r.archive_entry_id WHERE a.subscription_id = ?', [id]);
-      await tx.run('DELETE m FROM magnet_jobs m JOIN archive_entries a ON a.id = m.archive_entry_id WHERE a.subscription_id = ?', [id]);
-      await tx.run('DELETE l FROM library_jobs l JOIN archive_entries a ON a.id = l.archive_entry_id WHERE a.subscription_id = ?', [id]);
+      await tx.run('DELETE FROM download_jobs d USING archive_entries a WHERE a.id = d.archive_entry_id AND a.subscription_id = ?', [id]);
+      await tx.run('DELETE FROM release_jobs r USING archive_entries a WHERE a.id = r.archive_entry_id AND a.subscription_id = ?', [id]);
+      await tx.run('DELETE FROM magnet_jobs m USING archive_entries a WHERE a.id = m.archive_entry_id AND a.subscription_id = ?', [id]);
+      await tx.run('DELETE FROM library_jobs l USING archive_entries a WHERE a.id = l.archive_entry_id AND a.subscription_id = ?', [id]);
       await tx.run('DELETE FROM archive_entry_codes WHERE subscription_id = ?', [id]);
       await tx.run('DELETE FROM initial_scan_items WHERE subscription_id = ?', [id]);
       await tx.run('DELETE FROM archive_entries WHERE subscription_id = ?', [id]);
@@ -65,17 +65,17 @@ export function registerSubscriptionsRoutes(app: FastifyInstance, deps: { wakeEn
     if (!await getSubscription(id)) return reply.code(404).send({ error: '订阅不存在。' });
     const now = new Date().toISOString();
     await db.transaction(async (tx) => {
-      await tx.run('DELETE d FROM download_jobs d JOIN archive_entries a ON a.id = d.archive_entry_id WHERE a.subscription_id = ?', [id]);
-      await tx.run('DELETE r FROM release_jobs r JOIN archive_entries a ON a.id = r.archive_entry_id WHERE a.subscription_id = ?', [id]);
-      await tx.run('DELETE m FROM magnet_jobs m JOIN archive_entries a ON a.id = m.archive_entry_id WHERE a.subscription_id = ?', [id]);
-      await tx.run('DELETE l FROM library_jobs l JOIN archive_entries a ON a.id = l.archive_entry_id WHERE a.subscription_id = ?', [id]);
+      await tx.run('DELETE FROM download_jobs d USING archive_entries a WHERE a.id = d.archive_entry_id AND a.subscription_id = ?', [id]);
+      await tx.run('DELETE FROM release_jobs r USING archive_entries a WHERE a.id = r.archive_entry_id AND a.subscription_id = ?', [id]);
+      await tx.run('DELETE FROM magnet_jobs m USING archive_entries a WHERE a.id = m.archive_entry_id AND a.subscription_id = ?', [id]);
+      await tx.run('DELETE FROM library_jobs l USING archive_entries a WHERE a.id = l.archive_entry_id AND a.subscription_id = ?', [id]);
       await tx.run('DELETE FROM archive_entry_codes WHERE subscription_id = ?', [id]);
       await tx.run('DELETE FROM initial_scan_items WHERE subscription_id = ?', [id]);
       await tx.run('DELETE FROM archive_entries WHERE subscription_id = ?', [id]);
       await tx.run(`INSERT INTO subscription_progress
         (subscription_id, archive_total, jellyfin_available, release_total, release_done, magnet_total, magnet_done, library_total, library_done, download_total, download_done, updated_at)
         VALUES (?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ?)
-        ON DUPLICATE KEY UPDATE archive_total=0, jellyfin_available=0, release_total=0, release_done=0, magnet_total=0, magnet_done=0, library_total=0, library_done=0, download_total=0, download_done=0, updated_at=VALUES(updated_at)`, [id, now]);
+        ON CONFLICT (subscription_id) DO UPDATE SET archive_total=0, jellyfin_available=0, release_total=0, release_done=0, magnet_total=0, magnet_done=0, library_total=0, library_done=0, download_total=0, download_done=0, updated_at=EXCLUDED.updated_at`, [id, now]);
       await tx.run("DELETE FROM jobs WHERE subscription_id = ? AND status = 'queued'", [id]);
       await tx.run(`UPDATE subscriptions
         SET last_checked_at = NULL, last_hash = NULL, last_content = NULL, last_error = NULL,
@@ -134,7 +134,7 @@ export function registerSubscriptionsRoutes(app: FastifyInstance, deps: { wakeEn
       await tx.run(`UPDATE subscriptions SET initial_scan_completed = 0, initial_scan_total = NULL, initial_scan_pages_completed = 0, initial_scan_run_id = NULL, initial_scan_next_page = 1, last_error = NULL, updated_at = ? WHERE id = ?`, [now, id]);
       await tx.run(`INSERT INTO full_scan_batches (id, subscription_id, subscription_name, status, is_initial, page_count, scanned_count, archived_count, created_at)
         VALUES (?, ?, ?, 'scanning', ?, NULL, 0, 0, ?)
-        ON DUPLICATE KEY UPDATE subscription_name = VALUES(subscription_name), status = 'scanning', is_initial = VALUES(is_initial), page_count = NULL, scanned_count = 0, archived_count = 0, completed_at = NULL, created_at = VALUES(created_at)`,
+        ON CONFLICT (id) DO UPDATE SET subscription_name = EXCLUDED.subscription_name, status = 'scanning', is_initial = EXCLUDED.is_initial, page_count = NULL, scanned_count = 0, archived_count = 0, completed_at = NULL, created_at = EXCLUDED.created_at`,
       [batchId, id, subscription.name, subscription.last_hash ? 0 : 1, now]);
     });
     const queued = await queueJob(id, JOB_PRIORITY.manual);

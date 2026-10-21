@@ -3,7 +3,14 @@ import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, ren
 import { basename, dirname, resolve } from 'node:path';
 import { decryptSecret, isEncryptedSecret, readOptionalLegacyApplicationEncryptionKey } from './secret-storage.js';
 
+export type DatabaseDriver = 'mysql' | 'postgres';
+
+/**
+ * 数据库连接设置。`driver` 是后加的字段：旧引导文件没有它，按 MySQL 处理，
+ * 所以升级不会把已有的 MySQL 配置误当成 PostgreSQL。
+ */
 export type MySqlConnectionSettings = {
+  driver?: DatabaseDriver;
   host: string;
   port: number;
   database: string;
@@ -19,22 +26,36 @@ type DatabaseBootstrap = DatabaseBootstrapV1 | DatabaseBootstrapV2;
 const bootstrapPath = resolve(process.env.PAGE_WATCH_BOOTSTRAP_PATH?.trim() || './data/database-bootstrap.json');
 
 export function normalizeDatabaseSettings(input: Partial<MySqlConnectionSettings>): MySqlConnectionSettings {
+  const driver: DatabaseDriver = input.driver === 'postgres' ? 'postgres' : 'mysql';
   const host = typeof input.host === 'string' ? input.host.trim() : '';
   const database = typeof input.database === 'string' ? input.database.trim() : '';
   const user = typeof input.user === 'string' ? input.user.trim() : '';
   const password = typeof input.password === 'string' ? input.password : '';
-  const port = Number(input.port ?? 3306);
+  const port = Number(input.port ?? (driver === 'postgres' ? 5432 : 3306));
   const connectionLimit = Number(input.connectionLimit ?? 3);
   if (!host || !database || !user || password === '' || !Number.isInteger(port) || port < 1 || port > 65535 || !Number.isInteger(connectionLimit) || connectionLimit < 1 || connectionLimit > 16) {
-    throw new Error('请填写完整的 MySQL 地址、端口、数据库名、账号和密码。');
+    throw new Error(`请填写完整的${driver === 'postgres' ? ' PostgreSQL' : ' MySQL'} 地址、端口、数据库名、账号和密码。`);
   }
-  return { host, port, database, user, password, connectionLimit };
+  return { driver, host, port, database, user, password, connectionLimit };
 }
 
 export function environmentDatabaseSettings(): MySqlConnectionSettings | null {
-  const password = process.env.MYSQL_PASSWORD;
-  if (!process.env.MYSQL_HOST?.trim() || !process.env.MYSQL_DATABASE?.trim() || !process.env.MYSQL_USER?.trim() || password === undefined) return null;
-  return normalizeDatabaseSettings({ host: process.env.MYSQL_HOST, port: Number(process.env.MYSQL_PORT ?? 3306), database: process.env.MYSQL_DATABASE, user: process.env.MYSQL_USER, password, connectionLimit: Number(process.env.MYSQL_CONNECTION_LIMIT ?? 3) });
+  // 新部署使用 DATABASE_*；旧的 MYSQL_* 变量继续兼容，便于老容器平滑升级。
+  const usingDatabasePrefix = Boolean(process.env.DATABASE_HOST?.trim());
+  const host = process.env.DATABASE_HOST?.trim() || process.env.MYSQL_HOST?.trim();
+  const database = process.env.DATABASE_NAME?.trim() || process.env.MYSQL_DATABASE?.trim();
+  const user = process.env.DATABASE_USER?.trim() || process.env.MYSQL_USER?.trim();
+  const password = process.env.DATABASE_PASSWORD ?? process.env.MYSQL_PASSWORD;
+  if (!host || !database || !user || password === undefined) return null;
+  const driver: DatabaseDriver = process.env.DB_DRIVER === 'mysql'
+    ? 'mysql'
+    : process.env.DB_DRIVER === 'postgres'
+      ? 'postgres'
+      // 用 DATABASE_* 却没写 DB_DRIVER 时按 PostgreSQL 处理（新部署默认）；只有旧的 MYSQL_* 才回落到 MySQL。
+      : usingDatabasePrefix ? 'postgres' : 'mysql';
+  const port = Number(process.env.DATABASE_PORT ?? process.env.MYSQL_PORT ?? (driver === 'postgres' ? 5432 : 3306));
+  const connectionLimit = Number(process.env.DATABASE_CONNECTION_LIMIT ?? process.env.MYSQL_CONNECTION_LIMIT ?? 3);
+  return normalizeDatabaseSettings({ driver, host, port, database, user, password, connectionLimit });
 }
 
 function readBootstrapDocument(): DatabaseBootstrap | null {

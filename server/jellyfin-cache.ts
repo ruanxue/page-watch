@@ -40,8 +40,8 @@ export class JellyfinMediaIndexWriter {
         await tx.run(`INSERT INTO jellyfin_media_items
           (item_id, library_id, name, original_title, media_path, media_type, sync_id, synced_at)
           VALUES ${batch.map(() => '(?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}
-          ON DUPLICATE KEY UPDATE library_id = VALUES(library_id), name = VALUES(name), original_title = VALUES(original_title),
-            media_path = VALUES(media_path), media_type = VALUES(media_type), sync_id = VALUES(sync_id), synced_at = VALUES(synced_at)`,
+          ON CONFLICT (item_id) DO UPDATE SET library_id = EXCLUDED.library_id, name = EXCLUDED.name, original_title = EXCLUDED.original_title,
+            media_path = EXCLUDED.media_path, media_type = EXCLUDED.media_type, sync_id = EXCLUDED.sync_id, synced_at = EXCLUDED.synced_at`,
         batch.flatMap((item) => [item.id, item.libraryId, item.name, item.originalTitle, item.path, item.type, this.syncId, this.syncedAt]));
       }
       for (const batch of chunks(unique.map((item) => item.id), 250)) await tx.run(`DELETE FROM jellyfin_media_codes WHERE item_id IN (${placeholders(batch)})`, batch);
@@ -56,8 +56,8 @@ export class JellyfinMediaIndexWriter {
     const selected = selectedLibraryIds(this.libraryIds);
     const ids = placeholders(selected);
     await db.transaction(async (tx) => {
-      await tx.run(`DELETE c FROM jellyfin_media_codes c JOIN jellyfin_media_items m ON m.item_id = c.item_id
-        WHERE m.library_id IN (${ids}) AND m.sync_id <> ?`, [...selected, this.syncId]);
+      await tx.run(`DELETE FROM jellyfin_media_codes c USING jellyfin_media_items m
+        WHERE m.item_id = c.item_id AND m.library_id IN (${ids}) AND m.sync_id <> ?`, [...selected, this.syncId]);
       await tx.run(`DELETE FROM jellyfin_media_items WHERE library_id IN (${ids}) AND sync_id <> ?`, [...selected, this.syncId]);
     });
     return { mediaCount: this.mediaCount, codeCount: this.codeCount, syncedAt: this.syncedAt };

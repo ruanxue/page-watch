@@ -334,9 +334,9 @@ async function getMetricsSummary(range: string) {
 }
 
 async function getMetricsTimeseries() {
-  const throughput = await db.all<ThroughputRow>(`SELECT DATE_FORMAT(bucket_start, '%Y-%m-%d %H:%i:00') AS bucket_start, scope, SUM(sample_count) AS sample_count
-    FROM performance_metrics WHERE granularity = 'minute' AND metric = 'processed' AND bucket_start >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 60 MINUTE)
-    GROUP BY DATE_FORMAT(bucket_start, '%Y-%m-%d %H:%i:00'), scope ORDER BY bucket_start ASC, scope ASC`);
+  const throughput = await db.all<ThroughputRow>(`SELECT to_char(bucket_start, 'YYYY-MM-DD HH24:MI:00') AS bucket_start, scope, SUM(sample_count) AS sample_count
+    FROM performance_metrics WHERE granularity = 'minute' AND metric = 'processed' AND bucket_start >= (now() AT TIME ZONE 'UTC') - INTERVAL '60 minutes'
+    GROUP BY to_char(bucket_start, 'YYYY-MM-DD HH24:MI:00'), scope ORDER BY bucket_start ASC, scope ASC`);
   return { generatedAt: new Date().toISOString(), throughput: throughput.map((row) => ({ minute: `${row.bucket_start.replace(' ', 'T')}Z`, scope: row.scope, count: Number(row.sample_count) })) };
 }
 

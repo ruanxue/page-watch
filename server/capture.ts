@@ -352,7 +352,7 @@ async function captureInitialFullScan(subscription: Subscription, browserPriorit
       await tx.run(`UPDATE subscriptions SET initial_scan_run_id = ?, initial_scan_total = ?, initial_scan_pages_completed = 0, initial_scan_next_page = 1, last_error = NULL, updated_at = ? WHERE id = ?`, [scanId, total, now, subscription.id]);
       await tx.run(`INSERT INTO full_scan_batches (id, subscription_id, subscription_name, status, is_initial, page_count, scanned_count, archived_count, created_at)
         VALUES (?, ?, ?, 'scanning', ?, ?, 0, 0, ?)
-        ON DUPLICATE KEY UPDATE subscription_name = VALUES(subscription_name), page_count = VALUES(page_count), status = 'scanning'`,
+        ON CONFLICT (id) DO UPDATE SET subscription_name = EXCLUDED.subscription_name, page_count = EXCLUDED.page_count, status = 'scanning'`,
       [scanId, subscription.id, subscription.name, subscription.last_hash ? 0 : 1, total, now]);
     });
     await stagePage(subscription, scanId, 1, first.items);

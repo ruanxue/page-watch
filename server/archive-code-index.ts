@@ -71,13 +71,13 @@ export async function backfillArchiveCodeIndex() {
       if (rows.length) await replaceArchiveCodes(tx, rows);
       const at = rows.at(-1)?.id ?? target!.id;
       await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, ?, ?)
-        ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`, [cursorKey, String(at), new Date().toISOString()]);
+        ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`, [cursorKey, String(at), new Date().toISOString()]);
       return at;
     });
     cursor = next;
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
   await db.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, '1', ?)
-    ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)`, [migrationKey, new Date().toISOString()]);
+    ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`, [migrationKey, new Date().toISOString()]);
   await refreshSettings(true);
 }

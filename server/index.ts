@@ -177,8 +177,8 @@ function startOperationalServices() {
   const scheduleDownloadObserver = async () => {
     try {
       const getDownloadStateCounts = () => db.get<{ active: number; paused: number }>(`SELECT
-        SUM(download_status IN ('added', 'waiting', 'downloading')) AS active,
-        SUM(download_status = 'paused') AS paused
+        COUNT(*) FILTER (WHERE download_status IN ('added', 'waiting', 'downloading')) AS active,
+        COUNT(*) FILTER (WHERE download_status = 'paused') AS paused
         FROM archive_entries WHERE download_status IN ('added', 'waiting', 'downloading', 'paused')`);
       const initial = await getDownloadStateCounts();
       const activeCount = Number(initial?.active ?? 0);
