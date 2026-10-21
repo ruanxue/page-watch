@@ -183,7 +183,7 @@ async function archiveNewItems(subscription: Subscription, items: CapturedItem[]
   const jellyfin = getJellyfinSettings();
   const currentItems = uniqueItems(items);
   const archivedCount = existingState ? undefined : await client.get<{ count: number }>('SELECT COUNT(*) AS count FROM archive_entries WHERE subscription_id = ?', [subscription.id]);
-  const archiveWasEmpty = existingState?.archiveWasEmpty ?? (archivedCount?.count ?? 0) === 0;
+  const archiveWasEmpty = existingState?.archiveWasEmpty ?? Number(archivedCount?.count ?? 0) === 0;
   const previousItems = existingState?.previousItems ?? new Set(archiveItems(subscription.last_content ?? ''));
   const additions = archiveWasEmpty ? currentItems : currentItems.filter((item) => !previousItems.has(item.content));
   const insertedItems: CapturedItem[] = [];
@@ -403,7 +403,7 @@ async function captureInitialFullScan(subscription: Subscription, browserPriorit
     // semantics without retaining every staged row in memory.
     cursor = 0;
     const archiveCount = await tx.get<{ count: number }>('SELECT COUNT(*) AS count FROM archive_entries WHERE subscription_id = ?', [subscription.id]);
-    const existingState = { archiveWasEmpty: (archiveCount?.count ?? 0) === 0, previousItems: new Set(archiveItems(subscription.last_content ?? '')) };
+    const existingState = { archiveWasEmpty: Number(archiveCount?.count ?? 0) === 0, previousItems: new Set(archiveItems(subscription.last_content ?? '')) };
     while (true) {
       const batch = await tx.all<{ id: number; content: string; title: string | null; detail_url: string | null }>(`SELECT id, content, title, detail_url FROM initial_scan_items
         WHERE subscription_id = ? AND scan_id = ? AND id > ? ORDER BY page_number ASC, item_position ASC, id ASC LIMIT 200`, [subscription.id, scanId, cursor]);

@@ -52,7 +52,7 @@ async function runnableHandlers() {
         AND NOT EXISTS(SELECT 1 FROM archive_entries a JOIN release_jobs j ON j.archive_entry_id = a.id WHERE a.full_scan_batch_id = b.id AND j.status IN ('queued','running'))
         AND NOT EXISTS(SELECT 1 FROM archive_entries a JOIN magnet_jobs j ON j.archive_entry_id = a.id WHERE a.full_scan_batch_id = b.id AND j.status IN ('queued','running'))
         AND NOT EXISTS(SELECT 1 FROM archive_entries a JOIN library_jobs j ON j.archive_entry_id = a.id WHERE a.full_scan_batch_id = b.id AND j.status IN ('queued','running'))
-    ) AS notification`, [now, now, getInspectionRules().releaseDate.enabled ? 1 : 0, now, now, now, now, now]);
+    ) AS notification`, [now, now, now, getInspectionRules().releaseDate.enabled ? 1 : 0, now, now, now, now]);
   const jellyfin = getJellyfinSettings();
   const dueLibrarySync = jellyfin.enabled && jellyfin.libraryIds.length > 0 && isJellyfinSyncDue({
     lastSyncedAt: getSetting('jellyfin_last_synced_at'),

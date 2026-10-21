@@ -23,7 +23,7 @@ async function remainingJobs(subscriptionId: number) {
   const row = await db.get<{ count: number }>(`SELECT COUNT(*) AS count FROM magnet_jobs j
     JOIN archive_entries a ON a.id = j.archive_entry_id
     WHERE a.subscription_id = ? AND j.status IN ('queued', 'running')`, [subscriptionId]);
-  return row?.count ?? 0;
+  return Number(row?.count ?? 0);
 }
 
 async function logProgress(subscriptionId: number) {

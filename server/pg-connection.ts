@@ -1,4 +1,4 @@
-import { Pool, type PoolClient, type QueryResultRow } from 'pg';
+import { Pool, types as pgTypes, type PoolClient, type QueryResultRow } from 'pg';
 import { translateSql, withReturning } from './sql-translate.js';
 
 /**
@@ -10,6 +10,13 @@ import { translateSql, withReturning } from './sql-translate.js';
  * - INSERT 自动补 RETURNING，用来取回自增 id；
  * - affectedRows 用 rowCount 代替。
  */
+
+/**
+ * BIGINT（含 COUNT(*)）在 node-postgres 里默认返回字符串，而 MySQL 驱动返回数字。
+ * 业务代码里存在 `=== 0`、`% 50` 这类数字比较，统一按数字解析才能保持与 MySQL 一致；
+ * 本项目里的 BIGINT 都远小于 2^53，不存在精度风险。DECIMAL 仍保持字符串（与 MySQL 相同）。
+ */
+pgTypes.setTypeParser(pgTypes.builtins.INT8, (value: string) => Number(value));
 
 export type PostgresConnectionSettings = {
   host: string;
