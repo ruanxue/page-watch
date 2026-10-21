@@ -23,7 +23,7 @@ npm run dev
 
 打开 `http://localhost:5173`。API 在 `http://localhost:3030`。
 
-本地开发通常连接 NAS 上的同一个 MySQL 库，本地引擎会直接接续 NAS 容器中的队列；任务状态只保存在 MySQL，因此不会重复执行，但两边会共用同一批数据与运行日志。
+本地开发通常连接 NAS 上的同一个 PostgreSQL 库，本地引擎会直接接续 NAS 容器中的队列；任务状态只保存在数据库，因此不会重复执行，但两边会共用同一批数据与运行日志。
 
 ## Docker / NAS
 
@@ -33,28 +33,32 @@ npm run dev
 docker compose up -d --build
 ```
 
-打开 `http://NAS_IP:3030`。Compose 只启动一个 Page Watch 容器；容器内常驻的只有网页 API/SSE 进程与轻量执行引擎。网页检查、发行日期、磁力检索与预览由按需网页执行器处理，并和 Chromium 一起在设定的空闲时间后退出；Jellyfin 全量同步同样由按需同步器分页写入 MySQL。任务中心仍展示六项独立逻辑服务，订阅、档案、队列、下载与影视库状态、运行日志保存在 MySQL；请按你的 NAS 备份策略备份 `page_watch` 数据库。
+打开 `http://NAS_IP:3030`。Compose 只启动一个 Page Watch 容器；容器内常驻的只有网页 API/SSE 进程与轻量执行引擎。网页检查、发行日期、磁力检索与预览由按需网页执行器处理，并和 Chromium 一起在设定的空闲时间后退出；Jellyfin 全量同步同样由按需同步器分页写入 PostgreSQL。任务中心仍展示六项独立逻辑服务，订阅、档案、队列、下载与影视库状态、运行日志保存在 PostgreSQL；请按你的 NAS 备份策略备份 `pagewatch` 数据库。
 
-部署前请复制 `.env.example` 为 `.env`；新部署无需设置 `APP_ENCRYPTION_KEY`。首次打开网页只需填写 MySQL 地址、库名、账号和密码；连接信息以明文保存在 `data/database-bootstrap.json`，外部服务凭据以明文保存在 MySQL。MySQL 备份因此包含外部服务凭据，必须限制数据库网络访问、账号权限和备份文件读取权限。`APP_ENCRYPTION_KEY` 仅用于一次性迁移旧版 `pwenc:v1` 配置；旧 NAS 升级时要保留原环境变量或 `data/app-encryption-key`，直到迁移完成并确认 `database-bootstrap.json` 已变为 version 2。既有部署仍可使用 `MYSQL_*` 环境变量；网页不能覆盖由环境变量管理的连接。健康检查以 `curl /api/ready` 完成，不会周期性启动额外 Node 进程；安装引导尚未完成时它返回 503 是正常状态。
+部署前请复制 `.env.example` 为 `.env`；新部署无需设置 `APP_ENCRYPTION_KEY`。首次打开网页只需填写数据库地址、库名、账号和密码（默认 PostgreSQL，也可选 MySQL）；连接信息以明文保存在 `data/database-bootstrap.json`，外部服务凭据以明文保存在数据库。数据库备份因此包含外部服务凭据，必须限制数据库网络访问、账号权限和备份文件读取权限。`APP_ENCRYPTION_KEY` 仅用于一次性迁移旧版 `pwenc:v1` 配置；旧 NAS 升级时要保留原环境变量或 `data/app-encryption-key`，直到迁移完成并确认 `database-bootstrap.json` 已变为 version 2。既有部署仍可使用 `DATABASE_*`（或旧的 `MYSQL_*`）环境变量；网页不能覆盖由环境变量管理的连接。健康检查以 `curl /api/ready` 完成，不会周期性启动额外 Node 进程；安装引导尚未完成时它返回 503 是正常状态。
 
 ### 从旧版 NAS 升级
 
-先停止旧版容器，再用保留原有数据目录、旧 MySQL 连接和原 `APP_ENCRYPTION_KEY` / `data/app-encryption-key` 的新版启动一次。新版会在一个 MySQL 事务中验证并解密全部 `pwenc:v1` 设置，再统一改为明文；事务成功后才原子替换数据库引导文件为 version 2 明文格式。迁移时不要更改旧 NAS 使用的数据库地址。确认 version 2 后，本地新部署只需填写同一个 `page_watch` 数据库的局域网地址、库名、账号和密码。若要改用另一台 MySQL，先备份并把完整 `page_watch` 数据库恢复到新服务器，再将新部署指向它。迁移完成后可移除旧密钥配置。不要让旧版和新版同时运行，也不要让旧版在迁移后重新写入数据库；旧版无法读取 version 2 引导文件，且可能把已明文迁移的设置重新加密。
+先停止旧版容器，再用保留原有数据目录、旧数据库连接和原 `APP_ENCRYPTION_KEY` / `data/app-encryption-key` 的新版启动一次。新版会在一个数据库事务中验证并解密全部 `pwenc:v1` 设置，再统一改为明文；事务成功后才原子替换数据库引导文件为 version 2 明文格式。迁移时不要更改旧 NAS 使用的数据库地址。确认 version 2 后，本地新部署只需填写同一个数据库的局域网地址、库名、账号和密码。若要改用另一台数据库，先备份并把完整数据恢复到新服务器，再将新部署指向它。迁移完成后可移除旧密钥配置。不要让旧版和新版同时运行，也不要让旧版在迁移后重新写入数据库；旧版无法读取 version 2 引导文件，且可能把已明文迁移的设置重新加密。
 
-若旧密钥缺失、错误或发现未知的 `pwenc:` 版本，迁移会失败并保留原密文和 version 1 引导文件。恢复原密钥后重试，不要删除密文。如果 app_settings 的 MySQL 事务已提交为明文但引导文件原子写入失败，保留原密钥和数据库备份并再次启动新版完成引导文件迁移。迁移后旧版不能读取 version 2；回滚前必须恢复升级前的 MySQL 与 `data` 备份。
+若旧密钥缺失、错误或发现未知的 `pwenc:` 版本，迁移会失败并保留原密文和 version 1 引导文件。恢复原密钥后重试，不要删除密文。如果 app_settings 的数据库事务已提交为明文但引导文件原子写入失败，保留原密钥和数据库备份并再次启动新版完成引导文件迁移。迁移后旧版不能读取 version 2；回滚前必须恢复升级前的数据库与 `data` 备份。
 
 ### 首次访问与安全
 
-首次打开网页依次要求连接 MySQL、设置至少 12 位的访问密码，并可选配置 Jellyfin/qBittorrent；后两者绝不会在容器启动时自动连接。该密码使用加盐哈希保存，浏览器只持有 7 天有效的 HttpOnly 会话 Cookie。设置后，订阅、归档、日志、代理和 qBittorrent 配置接口都必须登录才能读取或修改。
+首次打开网页依次要求连接数据库（默认 PostgreSQL）、设置至少 12 位的访问密码，并可选配置 Jellyfin/qBittorrent；后两者绝不会在容器启动时自动连接。该密码使用加盐哈希保存，浏览器只持有 7 天有效的 HttpOnly 会话 Cookie。设置后，订阅、归档、日志、代理和 qBittorrent 配置接口都必须登录才能读取或修改。
 
 如果 NAS 前面使用 HTTPS 反向代理，请在 `.env` 设置 `APP_SESSION_SECURE=true`，让会话 Cookie 仅通过 HTTPS 传输；直接使用 `http://NAS_IP:3030` 时保持默认 `false`。请不要把 Web UI 端口直接暴露到公网，建议仅限家庭局域网或经 VPN / 反向代理访问。
 
-建议不要长期使用 MySQL `root` 账号运行网页服务。可在 NAS 的 MySQL 管理终端创建一个专用账号（将示例密码替换为强密码），然后更新 `.env` 中的 `MYSQL_USER` 和 `MYSQL_PASSWORD`：
+建议不要长期使用数据库超级用户（如 `postgres`）运行网页服务。可在数据库管理终端创建一个专用账号（将示例密码替换为强密码），然后更新 `.env` 中的 `DATABASE_USER` 和 `DATABASE_PASSWORD`：
 
 ```sql
-CREATE USER 'page_watch_app'@'%' IDENTIFIED BY '请替换为强密码';
-GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX ON page_watch.* TO 'page_watch_app'@'%';
-FLUSH PRIVILEGES;
+CREATE ROLE page_watch_app LOGIN PASSWORD '请替换为强密码';
+GRANT CONNECT ON DATABASE pagewatch TO page_watch_app;
+GRANT USAGE, CREATE ON SCHEMA public TO page_watch_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO page_watch_app;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO page_watch_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO page_watch_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO page_watch_app;
 ```
 
 ### 备份与恢复演练
@@ -62,20 +66,25 @@ FLUSH PRIVILEGES;
 建议每天从 NAS 执行一次一致性备份，并定期在临时库验证可恢复：
 
 ```bash
-mysqldump --single-transaction --routines --events -h MYSQL_HOST -u page_watch_app -p page_watch > page_watch-$(date +%F).sql
+pg_dump -h DATABASE_HOST -U page_watch_app -d pagewatch -Fc -f pagewatch-$(date +%F).dump
 ```
 
-备份文件应存放在不同于 MySQL 数据卷的位置。升级或修改抓取规则前，也建议先手动备份一次。运行日志最多保留最近 1,000 条，业务数据不会被该清理策略删除。
+恢复演练可用 `pg_restore -h 临时库 -U 账号 -d 库名 pagewatch-日期.dump`。备份文件应存放在不同于数据库数据卷的位置。升级或修改抓取规则前，也建议先手动备份一次。运行日志最多保留最近 1,000 条，业务数据不会被该清理策略删除。
 
-### 从旧版 SQLite 导入
+### 从 MySQL 迁移到 PostgreSQL
 
-如果仍持有旧版 SQLite 数据文件，可在首次切换前运行：
+项目已切换到 PostgreSQL。若仍有旧的 MySQL 数据要搬过来（**只读源库，不修改 MySQL**）：
 
 ```bash
-npm run migrate:mysql
+# 目标库用 PG_* 指定；源库默认读 data/database-bootstrap.json
+PG_HOST=192.168.1.20 PG_PORT=5432 PG_DATABASE=pagewatch PG_USER=postgres PG_PASSWORD=*** \
+  npm run migrate:postgres            # 预演，只报告行数
+
+PG_HOST=192.168.1.20 PG_PORT=5432 PG_DATABASE=pagewatch PG_USER=postgres PG_PASSWORD=*** \
+  npm run migrate:postgres -- --apply # 实际导入
 ```
 
-迁移会在目标数据库为空时导入订阅、规则、内容档案、磁力状态、任务与运行日志；为防止覆盖，目标库已存在 Page Watch 数据时会停止。当前工作目录不会保留 SQLite 数据或备份。
+源库也可用 `SOURCE_MYSQL_HOST` / `SOURCE_MYSQL_PORT` / `SOURCE_MYSQL_DATABASE` / `SOURCE_MYSQL_USER` / `SOURCE_MYSQL_PASSWORD` 指定。脚本会保留原始 id、跳过 PostgreSQL 的生成列、导入后重置自增序列，并逐表比对行数；MySQL 数据原样保留，确认无误后再自行下线。
 
 ## 网络代理
 
@@ -83,7 +92,7 @@ npm run migrate:mysql
 
 也可在 NAS 的 `.env` 中设置 `OUTBOUND_PROXY=http://代理地址:端口`，它会覆盖网页内的设置。若代理运行在 NAS 外的另一台设备，请使用其局域网 IP；容器中的 `127.0.0.1` 指向容器自身。
 
-本地开发使用项目版本对应的 Playwright Chromium；首次运行前执行 `npx playwright install chromium`，不要依赖系统已安装的 Chrome 或 Edge。NAS 的 Docker 镜像已自带 Chromium。若需指定其他浏览器，可设置 `PLAYWRIGHT_EXECUTABLE_PATH`。网页中的“网络代理”设置同时提供“运行性能”：默认“稳妥”模式只运行一个 MissAV 页面，浏览器空闲 10 分钟自动回收；“性能”模式最多两页并发，会增加内存和站点访问风险。运行中心会分别显示 API、执行引擎、网页执行器与 Jellyfin 同步器的内存；网页执行器显示“已回收”时，承载 Playwright/Cheerio 的 Node 进程和 Chromium 都已退出。大批任务完成后，若网页执行器和 Jellyfin 同步器均已退出、所有队列和 Worker 都持续空闲而执行引擎 RSS 仍超过回收阈值（默认 160MB，可用 `ENGINE_MEMORY_RECYCLE_THRESHOLD_MB` 调整，有效范围 64-4096），系统会先执行受控 GC；仍未回落才只重启执行引擎。网页服务自身则只做内存告警（默认 256MB，可用 `APP_MEMORY_GUARD_MB` 调整），不会因内存偏高而重启，以免中断 SSE 与登录会话。网页 API、SSE 与登录会话不中断，全部任务状态由 MySQL 队列续跑。
+本地开发使用项目版本对应的 Playwright Chromium；首次运行前执行 `npx playwright install chromium`，不要依赖系统已安装的 Chrome 或 Edge。NAS 的 Docker 镜像已自带 Chromium。若需指定其他浏览器，可设置 `PLAYWRIGHT_EXECUTABLE_PATH`。网页中的“网络代理”设置同时提供“运行性能”：默认“稳妥”模式只运行一个 MissAV 页面，浏览器空闲 10 分钟自动回收；“性能”模式最多两页并发，会增加内存和站点访问风险。运行中心会分别显示 API、执行引擎、网页执行器与 Jellyfin 同步器的内存；网页执行器显示“已回收”时，承载 Playwright/Cheerio 的 Node 进程和 Chromium 都已退出。大批任务完成后，若网页执行器和 Jellyfin 同步器均已退出、所有队列和 Worker 都持续空闲而执行引擎 RSS 仍超过回收阈值（默认 160MB，可用 `ENGINE_MEMORY_RECYCLE_THRESHOLD_MB` 调整，有效范围 64-4096），系统会先执行受控 GC；仍未回落才只重启执行引擎。网页服务自身则只做内存告警（默认 256MB，可用 `APP_MEMORY_GUARD_MB` 调整），不会因内存偏高而重启，以免中断 SSE 与登录会话。网页 API、SSE 与登录会话不中断，全部任务状态由 PostgreSQL 队列续跑。
 
 ### 推荐的 NAS 持续部署
 
@@ -101,7 +110,7 @@ npm run migrate:mysql
 
 在左侧“通知设置”中可选择企业微信机器人、钉钉机器人或通用 Webhook 作为唯一主通知渠道。默认仅发送“发现新内容”和“任务最终失败”；“已找到磁力链接”“下载完成”可按需开启。首次建立内容历史不会发送通知；一次检查发现多条新内容时会汇总为一条，并最多列出 5 条。企业微信机器人发送纯文本，以便个人微信查看；钉钉使用 Markdown 格式。
 
-通知地址、钉钉签名密钥和 Webhook HMAC 密钥以明文保存在 MySQL 中，网页只显示是否已配置。业务事件先写入 MySQL Outbox，发送失败会自动重试三次；相同订阅的相同最终错误会在 30 分钟内合并。通用 Webhook 使用 JSON `POST`，包含事件类型、时间、订阅、任务和条目摘要；配置 HMAC 密钥后，请用 `X-Page-Watch-Timestamp` 与 `X-Page-Watch-Signature`（`sha256=<hex>`，签名输入为 `timestamp.body`）验签。
+通知地址、钉钉签名密钥和 Webhook HMAC 密钥以明文保存在数据库中，网页只显示是否已配置。业务事件先写入数据库 Outbox，发送失败会自动重试三次；相同订阅的相同最终错误会在 30 分钟内合并。通用 Webhook 使用 JSON `POST`，包含事件类型、时间、订阅、任务和条目摘要；配置 HMAC 密钥后，请用 `X-Page-Watch-Timestamp` 与 `X-Page-Watch-Signature`（`sha256=<hex>`，签名输入为 `timestamp.body`）验签。
 
 ## qBittorrent 下载
 
@@ -111,7 +120,7 @@ npm run migrate:mysql
 
 ## Jellyfin 影视库
 
-在“下载与影视库”页面填写 Jellyfin Web 地址和 API 密钥，点击“保存并检测媒体库”后选择需要同步的库，再保存并点击“立即同步影视库”。密钥只保存于服务端，网页不会回显。点击同步会立即返回“已加入同步队列”，读取媒体库、建立索引与批量写入进度在运行中心实时显示。同步器按配置间隔（默认 60 分钟）拉取所选媒体库的完整快照，按页写入 MySQL；新归档及后续匹配都只查询本地索引，不会逐条访问 Jellyfin。内容档案会显示“已入库”“未入库”“待同步”或“同步失败”。Jellyfin 只用于判断媒体是否已经扫描入库，不会修改 Jellyfin 内的影片、元数据或文件。
+在“下载与影视库”页面填写 Jellyfin Web 地址和 API 密钥，点击“保存并检测媒体库”后选择需要同步的库，再保存并点击“立即同步影视库”。密钥只保存于服务端，网页不会回显。点击同步会立即返回“已加入同步队列”，读取媒体库、建立索引与批量写入进度在运行中心实时显示。同步器按配置间隔（默认 60 分钟）拉取所选媒体库的完整快照，按页写入 PostgreSQL；新归档及后续匹配都只查询本地索引，不会逐条访问 Jellyfin。内容档案会显示“已入库”“未入库”“待同步”或“同步失败”。Jellyfin 只用于判断媒体是否已经扫描入库，不会修改 Jellyfin 内的影片、元数据或文件。
 
 初版把自动化边界控制在“订阅、提取、比较、记录”。`server/capture.ts` 是后续扩展页面登录、点击、填写、条件与通知动作的入口。
 首次安装或重新执行依赖校验时：

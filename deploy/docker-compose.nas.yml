@@ -2,14 +2,14 @@ name: page-watch
 
 x-page-watch-environment: &page-watch-environment
   OUTBOUND_PROXY: ${OUTBOUND_PROXY:-}
-  # Optional legacy bootstrap values. New deployments configure MySQL in the
-  # browser.
-  MYSQL_HOST: ${MYSQL_HOST:-}
-  MYSQL_PORT: ${MYSQL_PORT:-3306}
-  MYSQL_DATABASE: ${MYSQL_DATABASE:-}
-  MYSQL_USER: ${MYSQL_USER:-}
-  MYSQL_PASSWORD: ${MYSQL_PASSWORD:-}
-  MYSQL_CONNECTION_LIMIT: ${MYSQL_CONNECTION_LIMIT:-3}
+  # 数据库连接留空则在网页安装引导中填写；DB_DRIVER 可显式指定 postgres 或 mysql。
+  DB_DRIVER: ${DB_DRIVER:-postgres}
+  DATABASE_HOST: ${DATABASE_HOST:-}
+  DATABASE_PORT: ${DATABASE_PORT:-5432}
+  DATABASE_NAME: ${DATABASE_NAME:-}
+  DATABASE_USER: ${DATABASE_USER:-}
+  DATABASE_PASSWORD: ${DATABASE_PASSWORD:-}
+  DATABASE_CONNECTION_LIMIT: ${DATABASE_CONNECTION_LIMIT:-3}
   # Migration-only: keep the original value while upgrading legacy pwenc:v1 data.
   APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:-}
 
