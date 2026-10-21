@@ -137,7 +137,11 @@ export async function resolveMissavPayload(payload: SubscriptionPayload): Promis
     if (!allowedHosts.includes(host)) throw new Error(`这组检查规则只适用于已声明的站点：${groupSites.join('、')}。`);
   }
   const override = payload.renderModeOverride === 'static' || payload.renderModeOverride === 'dynamic' ? payload.renderModeOverride : null;
-  const values = await normalizePayload({ ...payload, selector: preset.selector, renderMode: override ?? preset.render_mode, contentSource: preset.content_source, attributeName: preset.attribute_name ?? '', matchPattern: preset.match_pattern ?? '', titleSelector: preset.title_selector ?? '', titleContentSource: preset.title_content_source, titleAttributeName: preset.title_attribute_name ?? '', titleMatchPattern: preset.title_match_pattern ?? '', resultMode: preset.result_mode, paginationSelector: preset.pagination_selector ?? '', paginationParameter: preset.pagination_parameter, paginationMatchPattern: preset.pagination_match_pattern ?? '' });
+  // 匹配规则允许订阅级覆盖：规则组里留空表示「不下发」，此时沿用本次提交的值，
+  // 否则每次保存订阅都会把用户写好的屏蔽正则清空。
+  const matchPattern = preset.match_pattern?.trim() ? preset.match_pattern : (payload.matchPattern ?? '');
+  const titleMatchPattern = preset.title_match_pattern?.trim() ? preset.title_match_pattern : (payload.titleMatchPattern ?? '');
+  const values = await normalizePayload({ ...payload, selector: preset.selector, renderMode: override ?? preset.render_mode, contentSource: preset.content_source, attributeName: preset.attribute_name ?? '', matchPattern, titleSelector: preset.title_selector ?? '', titleContentSource: preset.title_content_source, titleAttributeName: preset.title_attribute_name ?? '', titleMatchPattern, resultMode: preset.result_mode, paginationSelector: preset.pagination_selector ?? '', paginationParameter: preset.pagination_parameter, paginationMatchPattern: preset.pagination_match_pattern ?? '' });
   return { values, family: 'missav', presetId, override };
 }
 

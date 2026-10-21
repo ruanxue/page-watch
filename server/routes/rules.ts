@@ -37,11 +37,16 @@ export function registerRulesRoutes(app: FastifyInstance) {
     await tx.run(`UPDATE subscriptions s JOIN subscription_presets p ON p.id=s.preset_id
       SET s.initial_scan_completed=0, s.initial_scan_total=NULL, s.initial_scan_pages_completed=0, s.initial_scan_next_page=1
       WHERE s.rule_family='missav' AND s.pagination_selector IS NULL AND p.pagination_selector IS NOT NULL AND s.initial_scan_run_id IS NULL${filter}`, params);
+    // 匹配规则（内容/标题）允许订阅自行设置：规则组里留空表示「不下发」，此时
+    // 保留订阅已有的值。否则保存一次规则组，就会把用户给单条订阅写好的屏蔽正则
+    // 一起刷成空，导致原本要过滤的内容重新入档。
     await tx.run(`UPDATE subscriptions s JOIN subscription_presets p ON p.id=s.preset_id SET
       s.selector=p.selector, s.render_mode=COALESCE(s.render_mode_override,p.render_mode), s.content_source=p.content_source,
-      s.attribute_name=p.attribute_name, s.match_pattern=p.match_pattern, s.title_selector=p.title_selector,
+      s.attribute_name=p.attribute_name,
+      s.match_pattern=COALESCE(NULLIF(TRIM(p.match_pattern),''), s.match_pattern), s.title_selector=p.title_selector,
       s.title_content_source=p.title_content_source, s.title_attribute_name=p.title_attribute_name,
-      s.title_match_pattern=p.title_match_pattern, s.result_mode=p.result_mode, s.pagination_selector=p.pagination_selector,
+      s.title_match_pattern=COALESCE(NULLIF(TRIM(p.title_match_pattern),''), s.title_match_pattern),
+      s.result_mode=p.result_mode, s.pagination_selector=p.pagination_selector,
       s.pagination_parameter=p.pagination_parameter, s.pagination_match_pattern=p.pagination_match_pattern, s.updated_at=?
       WHERE s.rule_family='missav'${filter}`, [now, ...params]);
   }
