@@ -4,17 +4,15 @@ import { translateSql, withReturning } from './sql-translate.js';
 /**
  * PostgreSQL 连接与结果适配。
  *
- * 项目里所有 SQL 都经过 `db.all/get/run`，所以这里把「MySQL 写法 + ? 占位符」
- * 翻译成 PG 能跑的形式，让上层查询尽量不改：
- * - 占位符、反引号、INSERT IGNORE 由 sql-translate 处理；
+ * 项目里所有 SQL 都经过 `db.all/get/run`：
+ * - 由 sql-translate 转换参数占位符；
  * - INSERT 自动补 RETURNING，用来取回自增 id；
  * - affectedRows 用 rowCount 代替。
  */
 
 /**
- * BIGINT（含 COUNT(*)）在 node-postgres 里默认返回字符串，而 MySQL 驱动返回数字。
- * 业务代码里存在 `=== 0`、`% 50` 这类数字比较，统一按数字解析才能保持与 MySQL 一致；
- * 本项目里的 BIGINT 都远小于 2^53，不存在精度风险。DECIMAL 仍保持字符串（与 MySQL 相同）。
+ * BIGINT（含 COUNT(*)）统一按数字解析，供业务计数与进度比较使用。
+ * 本项目里的 BIGINT 均小于安全整数上限；DECIMAL 继续保留字符串精度。
  */
 pgTypes.setTypeParser(pgTypes.builtins.INT8, (value: string) => Number(value));
 
@@ -38,13 +36,13 @@ export type PgDatabaseClient = {
 type Runner = Pool | PoolClient;
 
 export function createPostgresPool(config: PostgresConnectionSettings) {
-  return new Pool({
+  const pool = new Pool({
     host: config.host,
     port: config.port,
     database: config.database,
     user: config.user,
     password: config.password,
-    // 与 MySQL 一样，每个进程保持很小的连接数：容器里有网页服务加执行引擎，
+    // 每个进程保持很小的连接数：容器里有网页服务加执行引擎，
     // 进程一多很容易把 NAS 上的连接数吃满。
     max: config.connectionLimit,
     idleTimeoutMillis: 30_000,
@@ -52,6 +50,18 @@ export function createPostgresPool(config: PostgresConnectionSettings) {
     // 统一按 UTC 取时间，项目里时间一律以 ISO 字符串存 VARCHAR，逻辑不依赖时区。
     options: '-c timezone=UTC'
   });
+  let lastConnectionErrorAt = 0;
+  const reportConnectionError = (error: Error & { code?: string }) => {
+    // pg 会自动移除出错的空闲连接；这里只记录安全的错误码，不能输出含凭据的 client。
+    if (Date.now() - lastConnectionErrorAt < 60_000) return;
+    lastConnectionErrorAt = Date.now();
+    const code = /^[A-Z0-9_]{1,32}$/.test(error.code ?? '') ? error.code : '连接中断';
+    console.warn(`PostgreSQL 连接已断开（${code}），后续请求将重新连接。`);
+  };
+  pool.on('error', reportConnectionError);
+  // 事务在两条语句之间也可能断线，此时连接已借出，pool 的空闲错误监听不会触发。
+  pool.on('connect', (client) => client.on('error', reportConnectionError));
+  return pool;
 }
 
 export function pgClientFor(runner: Runner): PgDatabaseClient {

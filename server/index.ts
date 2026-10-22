@@ -2,7 +2,8 @@ import path from 'node:path';
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
 import fastifyCompress from '@fastify/compress';
-import { appendRuntimeLog, db, isDatabaseConfigured, maintainPerformanceMetrics, rebuildSubscriptionProgress, reportRuntimeMetrics, reportWorkerHeartbeat } from './db.js';
+import { appendRuntimeLog, closeDatabase, db, isDatabaseConfigured, reportRuntimeMetrics, reportWorkerHeartbeat } from './db.js';
+import { maintainDatabase } from './database-maintenance.js';
 import { startRuntimeMemoryReporter } from './runtime-observability.js';
 import { statusFor } from './auth.js';
 import { emitLive, registerLiveRoutes, startLivePolling } from './sse-hub.js';
@@ -102,7 +103,7 @@ app.addHook('onRequest', async (request, reply) => {
   if (!requestPath.startsWith('/api/') || requestPath === '/api/health' || requestPath === '/api/ready' || requestPath.startsWith('/api/auth/') || requestPath.startsWith('/api/internal/events')) return;
   if (!isDatabaseConfigured()) {
     if (requestPath === '/api/setup/database') return;
-    return reply.code(503).send({ error: '数据库尚未配置。请先完成 MySQL 安装引导。' });
+    return reply.code(503).send({ error: '数据库尚未配置。请先完成 PostgreSQL 安装引导。' });
   }
   const status = await statusFor(request.headers.cookie);
   // The first-run sequence is database connection, then access password.
@@ -211,18 +212,8 @@ function startOperationalServices() {
   void scheduleDownloadObserver();
   void appendRuntimeLog({ level: 'info', source: 'system', message: `网页服务已启动，监听端口 ${port}。` })
     .catch((error) => app.log.warn(`Unable to save service startup log: ${error instanceof Error ? error.message : String(error)}`));
-  const maintainMetrics = async () => {
-    try {
-      await maintainPerformanceMetrics();
-      await rebuildSubscriptionProgress();
-    }
-    catch (error) {
-      const detail = error instanceof Error ? error.message : '未知数据库错误';
-      await appendRuntimeLog({ level: 'error', source: 'system', message: `长期性能指标维护失败：${detail}` }).catch(() => undefined);
-    }
-  };
-  void maintainMetrics();
-  const maintenanceTimer = setInterval(() => void maintainMetrics(), 24 * 60 * 60_000);
+  void maintainDatabase();
+  const maintenanceTimer = setInterval(() => void maintainDatabase(), 24 * 60 * 60_000);
   maintenanceTimer.unref();
 }
 
@@ -281,6 +272,7 @@ async function stopApi() {
   engineWakeScheduler.stop();
   await engineController.stop().catch(() => undefined);
   await app.close().catch(() => undefined);
+  await closeDatabase().catch(() => undefined);
 }
 process.once('SIGTERM', () => { void stopApi(); });
 process.once('SIGINT', () => { void stopApi(); });

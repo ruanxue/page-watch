@@ -19,6 +19,20 @@ jobs:
   verify:
     name: Verify application
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: pagewatch_test
+          POSTGRES_PASSWORD: pagewatch_test
+          POSTGRES_DB: pagewatch_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pagewatch_test -d pagewatch_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Check out source
         uses: actions/checkout@v6
@@ -37,6 +51,11 @@ jobs:
 
       - name: Run test suite
         run: npm test
+
+      - name: Verify PostgreSQL behavior
+        run: npm run test:postgres
+        env:
+          PAGE_WATCH_TEST_DATABASE_URL: postgresql://pagewatch_test:pagewatch_test@127.0.0.1:5432/pagewatch_test
 
       - name: Compile production server
         run: npm run build:server

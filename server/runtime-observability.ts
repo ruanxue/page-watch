@@ -46,7 +46,7 @@ export function startRuntimeMemoryReporter(role: RuntimeProcessRole, browser?: (
   const report = () => void reportRuntimeMemory(role, browser?.()).catch(() => undefined);
   report();
   // Gauges are for an operational overview, not a per-second graph. A slower
-  // cadence keeps idle API↔MySQL traffic negligible while meaningful changes
+  // cadence keeps idle API↔PostgreSQL traffic negligible while meaningful changes
   // still publish immediately through reportRuntimeMetrics.
   const timer = setInterval(report, 30_000);
   timer.unref();

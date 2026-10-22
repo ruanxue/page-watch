@@ -1,11 +1,10 @@
 import { createServer } from 'node:http';
-import { db, flushSubscriptionProgressRebuilds, flushTelemetry, getJellyfinSettings, getSetting, refreshSettings, reportRuntimeMetrics, reportWorkerHeartbeat, type WorkerName } from './db.js';
+import { flushSubscriptionProgressRebuilds, flushTelemetry, refreshSettings, reportRuntimeMetrics, reportWorkerHeartbeat, type WorkerName } from './db.js';
 import { webExecutor } from './web-executor-client.js';
 import { librarySyncExecutor } from './library-sync-client.js';
 import { startRuntimeMemoryReporter } from './runtime-observability.js';
 import { isExecutionEngineDraining } from './engine-drain.js';
-import { isJellyfinSyncDue } from './library-sync-schedule.js';
-import { getInspectionRules } from './inspection-rules.js';
+import { runnableHandlers, type HandlerName } from './engine-queue.js';
 
 console.log('Page Watch unified runner started');
 await refreshSettings(true);
@@ -25,7 +24,6 @@ let idleSince: number | null = null;
 let dispatching = false;
 let dispatchRequested = false;
 let shuttingDown = false;
-type HandlerName = 'capture' | 'release' | 'magnet' | 'download' | 'library' | 'notification';
 const activeHandlers = new Set<HandlerName>();
 // API 的健康检查在 90 秒收不到心跳落库后就把 worker 判为不可用。这里的
 // worker 运行时带着 PAGE_WATCH_WORKER_AUTOSTART=0，它们自己的 15 秒心跳定时器
@@ -35,40 +33,6 @@ const heartbeatWorkers: WorkerName[] = ['capture', 'release', 'magnet', 'downloa
 function send(message: unknown) { if (process.send) process.send(message); }
 function reportState(state: 'running' | 'sleeping', detail: string) { send({ type: 'state', state, detail }); }
 
-async function runnableHandlers() {
-  await refreshSettings();
-  const now = new Date().toISOString();
-  const rows = await db.get<Record<HandlerName | 'librarySyncRunning', number>>(`SELECT
-    EXISTS(SELECT 1 FROM jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) OR EXISTS(SELECT 1 FROM subscriptions WHERE is_active = 1 AND (next_scheduled_at IS NULL OR next_scheduled_at <= ?)) AS capture,
-    EXISTS(SELECT 1 FROM release_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) OR
-      (? = 1 AND EXISTS(SELECT 1 FROM archive_entries WHERE release_status = 'unsearched' OR
-        (release_status = 'unavailable' AND release_error = '详情页未找到标签“发行日期”对应的日期值。'))) AS \`release\`,
-    EXISTS(SELECT 1 FROM magnet_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) AS magnet,
-    EXISTS(SELECT 1 FROM download_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) AS download,
-    EXISTS(SELECT 1 FROM library_jobs WHERE status = 'queued' AND (retry_after IS NULL OR retry_after <= ?)) OR EXISTS(SELECT 1 FROM library_sync_jobs WHERE status = 'queued') AS library,
-    EXISTS(SELECT 1 FROM library_sync_jobs WHERE status = 'running') AS librarySyncRunning,
-    EXISTS(SELECT 1 FROM notification_outbox WHERE status = 'queued' AND next_attempt_at <= ?) OR EXISTS(
-      SELECT 1 FROM full_scan_batches b WHERE b.status = 'processing'
-        AND NOT EXISTS(SELECT 1 FROM archive_entries a JOIN release_jobs j ON j.archive_entry_id = a.id WHERE a.full_scan_batch_id = b.id AND j.status IN ('queued','running'))
-        AND NOT EXISTS(SELECT 1 FROM archive_entries a JOIN magnet_jobs j ON j.archive_entry_id = a.id WHERE a.full_scan_batch_id = b.id AND j.status IN ('queued','running'))
-        AND NOT EXISTS(SELECT 1 FROM archive_entries a JOIN library_jobs j ON j.archive_entry_id = a.id WHERE a.full_scan_batch_id = b.id AND j.status IN ('queued','running'))
-    ) AS notification`, [now, now, now, getInspectionRules().releaseDate.enabled ? 1 : 0, now, now, now, now]);
-  const jellyfin = getJellyfinSettings();
-  const dueLibrarySync = jellyfin.enabled && jellyfin.libraryIds.length > 0 && isJellyfinSyncDue({
-    lastSyncedAt: getSetting('jellyfin_last_synced_at'),
-    lastAttemptAt: getSetting('jellyfin_last_sync_attempt_at'),
-    mediaIndexSyncedAt: getSetting('jellyfin_media_index_synced_at'),
-    intervalMinutes: jellyfin.syncIntervalMinutes
-  });
-  return {
-    capture: Boolean(rows?.capture),
-    release: Boolean(rows?.release),
-    magnet: Boolean(rows?.magnet),
-    download: Boolean(rows?.download),
-    library: Boolean(rows?.library) || (dueLibrarySync && !Boolean(rows?.librarySyncRunning)),
-    notification: Boolean(rows?.notification)
-  };
-}
 
 async function runHandler(name: HandlerName) {
   if (activeHandlers.has(name) || shuttingDown) return;

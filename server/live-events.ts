@@ -22,7 +22,7 @@ function flush() {
 /**
  * Workers are separate Node processes even in the single Docker container.
  * The all-in-one supervisor gives them a short-lived private token so they can
- * notify the API immediately without continuously polling MySQL.
+ * notify the API immediately without continuously polling PostgreSQL.
  */
 export function notifyLive(channel: LiveEventChannel, subscriptionId?: number) {
   if (!process.env.WORKER_EVENT_TOKEN) return;

@@ -52,28 +52,11 @@
 
 打开 `http://NAS_LAN_IP:3030`。首次安装只需在网页填写数据库服务地址、数据库名、专用账号及密码（默认 PostgreSQL）。连接信息会以明文保存在 `data/database-bootstrap.json`，外部服务凭据会以明文保存在数据库；数据库备份也会包含这些凭据，请限制网络访问、账号权限和备份文件权限。Page Watch 只运行一个容器；容器内常驻网页 API/SSE 进程和轻量执行引擎，网页执行器（含 Chromium）与 Jellyfin 全量同步器只会在有任务时启动，并在完成/空闲后退出。任务中心仍会分别展示网页检查、发行日期、磁力检索、qBittorrent 下载和 Jellyfin 同步任务。
 
-## 从现有 MySQL 数据迁移到 PostgreSQL
+## 已有 PostgreSQL 部署升级
 
-旧版 Page Watch 用 MySQL。切换时先在开发机执行一次性搬迁（只读源库，不修改 MySQL）：
+保留现有 PostgreSQL 数据库与 `data` 目录。程序只读取 `DATABASE_*` 环境变量，或带有 `driver: "postgres"` 的 version 2 引导文件；环境变量管理的连接不能在网页修改。旧 MySQL 连接、回退和搬迁工具均已删除，旧 `MYSQL_*` 变量或不明确的引导文件会被拒绝。旧的 `DB_DRIVER=postgres` 仍可读取，但已不需要配置。
 
-```bash
-PG_HOST=数据库地址 PG_PORT=5432 PG_DATABASE=pagewatch PG_USER=账号 PG_PASSWORD=密码 \
-  npm run migrate:postgres -- --apply
-```
-
-源库从 `data/database-bootstrap.json` 读取，或由 `SOURCE_MYSQL_*` 环境变量指定。脚本会保留原始 id、跳过生成列、重置自增序列并逐表校验行数。
-
-## 从旧版加密配置迁移
-
-升级前先备份数据库和 `data` 目录，并停止旧版容器。新版启动时会使用原 `APP_ENCRYPTION_KEY` 或 `data/app-encryption-key`，先在一个数据库事务中解密并迁移旧 `pwenc:v1` 设置，再把数据库连接文件原子改为 version 2 明文格式。旧密钥缺失或不正确时不会修改旧密文；保留旧密钥、修复数据库连接后再重试。
-
-如果旧引导文件使用 `DATABASE_*`（或旧版 `MYSQL_*`）环境变量启动，请确保环境变量连接的数据库与旧 `database-bootstrap.json` 指向同一个数据库，否则新版会停止迁移且不写入文件。迁移时保留旧 NAS 使用的数据库地址，先完成迁移并确认 version 2。然后在本地新部署首次引导中填写同一个数据库的局域网地址、库名、账号和密码。若要让现有 NAS 容器改用另一台数据库，先备份并将完整数据恢复到新服务器，再在 `deploy/.env` 中设置 `DB_DRIVER`、`DATABASE_HOST`、`DATABASE_PORT`、`DATABASE_NAME`、`DATABASE_USER` 和 `DATABASE_PASSWORD` 后重启容器；不要只改地址连到空库。`DATABASE_*` 设置会覆盖引导文件，网页不能修改这种环境变量管理的连接。迁移期间不要运行旧版容器。旧版不能读取 version 2 引导文件，而且可能将已迁移的设置重新加密。迁移完成后可从 `deploy/.env` 移除 `APP_ENCRYPTION_KEY`；不要删除 `data` 目录。若设置迁移成功但引导文件替换失败，保留旧密钥和备份，重启新版即可重试。可用下面的命令只查看引导文件版本，不会输出其中的连接密码：
-
-```bash
-docker exec pagewatch node -e "console.log(JSON.parse(require('fs').readFileSync('/data/database-bootstrap.json','utf8')).version)"
-```
-
-输出 `2` 表示引导文件已迁移。若原密钥永久丢失，旧密文无法解密，新版会停止迁移并保留原数据；需要恢复匹配的旧密钥，或在数据库备份后由管理员人工处理受影响的加密项。
+若 PostgreSQL 中仍有旧版 `pwenc:v1` 外部服务凭据，请保留原 `APP_ENCRYPTION_KEY` 或 `data/app-encryption-key`。程序先验证全部密文，再用同一事务解密；原密钥缺失或错误时保留原值。此处只处理现有数据库中的凭据，不负责迁移旧引导文件。
 
 ## 内部服务地址
 

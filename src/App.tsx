@@ -752,12 +752,10 @@ export default function App() {
 }
 
 function DatabaseSetupGate({ onConfigured }: { onConfigured: () => Promise<void> }) {
-  const [form, setForm] = useState({ driver: 'postgres' as 'postgres' | 'mysql', host: '', port: 5432, database: 'pagewatch', user: 'postgres', password: '', connectionLimit: 3 });
+  const [form, setForm] = useState({ host: '', port: 5432, database: 'pagewatch', user: 'postgres', password: '', connectionLimit: 3 });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const update = <K extends keyof typeof form>(key: K, value: typeof form[K]) => setForm((current) => ({ ...current, [key]: value }));
-  // 切换数据库类型时，端口跟着换成各自的默认值，避免填了 5432 却连 MySQL。
-  const changeDriver = (driver: 'postgres' | 'mysql') => setForm((current) => ({ ...current, driver, port: driver === 'postgres' ? 5432 : 3306, user: driver === 'postgres' ? 'postgres' : 'page_watch', database: driver === 'postgres' ? 'pagewatch' : 'page_watch' }));
   const submit = (event: FormEvent) => {
     event.preventDefault(); setBusy(true); setError('');
     void request('/api/setup/database', { method: 'POST', body: JSON.stringify(form) })
@@ -767,9 +765,8 @@ function DatabaseSetupGate({ onConfigured }: { onConfigured: () => Promise<void>
   };
   return <main className="access-gate"><form className="access-card database-setup-card" onSubmit={submit}>
     <div className="brand"><span className="brand-mark">⌁</span><span>PAGE WATCH</span></div>
-    <p className="eyebrow">安装引导 · 第一步</p><h1>连接数据库</h1>
+    <p className="eyebrow">安装引导 · 第一步</p><h1>连接 PostgreSQL</h1>
     <p>验证成功后，连接信息会以明文保存在 Docker 持久目录，外部服务凭据会以明文保存在数据库。请限制数据目录、数据库及备份的访问权限。Jellyfin 与 qBittorrent 不会在容器启动时被访问。</p>
-    <label>数据库类型<select disabled={busy} value={form.driver} onChange={(event) => changeDriver(event.target.value === 'mysql' ? 'mysql' : 'postgres')}><option value="postgres">PostgreSQL（推荐）</option><option value="mysql">MySQL（旧部署）</option></select></label>
     <label>数据库主机<input autoFocus required disabled={busy} value={form.host} onChange={(event) => update('host', event.target.value)} placeholder="例如 postgres 或 192.168.1.20" /></label>
     <div className="two-col"><label>端口<input required type="number" min="1" max="65535" disabled={busy} value={form.port} onChange={(event) => update('port', Number(event.target.value))} /></label><label>数据库名<input required disabled={busy} value={form.database} onChange={(event) => update('database', event.target.value)} /></label></div>
     <label>数据库账号<input required autoComplete="username" disabled={busy} value={form.user} onChange={(event) => update('user', event.target.value)} /></label>

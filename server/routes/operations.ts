@@ -91,7 +91,7 @@ app.get('/api/ready', async (_request, reply) => {
     const status = await readinessStatus();
     return reply.code(status.ok ? 200 : 503).send(status);
   } catch {
-    return reply.code(503).send({ ok: false, database: 'unavailable', unavailable: ['MySQL'], services: [], external: [] });
+    return reply.code(503).send({ ok: false, database: 'unavailable', unavailable: ['PostgreSQL'], services: [], external: [] });
   }
 });
 

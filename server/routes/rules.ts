@@ -34,7 +34,7 @@ export function registerRulesRoutes(app: FastifyInstance) {
   async function syncSubscriptionsFromPresets(tx: Pick<DatabaseClient, 'run'>, now: string, presetId?: number) {
     const filter = presetId === undefined ? '' : ' AND p.id = ?';
     const params = presetId === undefined ? [] : [presetId];
-    // PostgreSQL 不支持 MySQL 的「UPDATE ... JOIN」，改用 UPDATE ... FROM。
+    // 按规则组关联同步订阅读取字段。
     await tx.run(`UPDATE subscriptions s
       SET initial_scan_completed=0, initial_scan_total=NULL, initial_scan_pages_completed=0, initial_scan_next_page=1
       FROM subscription_presets p
@@ -181,7 +181,7 @@ export function registerRulesRoutes(app: FastifyInstance) {
     base: ReturnType<typeof getInspectionRules> = getInspectionRules()
   ) {
     const rules = { ...base, sites };
-    await client.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES ('inspection_rules', ?, ?)
+    await client.run(`INSERT INTO app_settings ("key", value, updated_at) VALUES ('inspection_rules', ?, ?)
       ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`, [inspectionRulesJson(rules), now]);
     return rules;
   }
@@ -218,7 +218,7 @@ export function registerRulesRoutes(app: FastifyInstance) {
       const rules = normalizeInspectionRules(request.body);
       const now = new Date().toISOString();
       await db.transaction(async (tx) => {
-        await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES ('inspection_rules', ?, ?)
+        await tx.run(`INSERT INTO app_settings ("key", value, updated_at) VALUES ('inspection_rules', ?, ?)
           ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`, [inspectionRulesJson(rules), now]);
         if (!rules.releaseDate.enabled) {
           await tx.run("UPDATE release_jobs SET status = 'completed', finished_at = ?, error = '发行日期规则已停用' WHERE status = 'queued'", [now]);
@@ -483,7 +483,7 @@ export function registerRulesRoutes(app: FastifyInstance) {
           [preset.name, preset.description, preset.selector, preset.renderMode, preset.contentSource, preset.attributeName, preset.matchPattern, preset.titleSelector, preset.titleContentSource, preset.titleAttributeName, preset.titleMatchPattern, preset.resultMode, preset.interval, preset.paginationSelector, preset.paginationParameter, preset.paginationMatchPattern, preset.isActive, now, now]);
           id = inserted.lastInsertRowid;
         }
-        await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES ('inspection_rules', ?, ?)
+        await tx.run(`INSERT INTO app_settings ("key", value, updated_at) VALUES ('inspection_rules', ?, ?)
           ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`, [inspectionRulesJson(rules), now]);
         if (!rules.releaseDate.enabled) {
           await tx.run("UPDATE release_jobs SET status = 'completed', finished_at = ?, error = '发行日期规则已停用' WHERE status = 'queued'", [now]);

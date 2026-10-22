@@ -45,8 +45,8 @@ export class JellyfinMediaIndexWriter {
         batch.flatMap((item) => [item.id, item.libraryId, item.name, item.originalTitle, item.path, item.type, this.syncId, this.syncedAt]));
       }
       for (const batch of chunks(unique.map((item) => item.id), 250)) await tx.run(`DELETE FROM jellyfin_media_codes WHERE item_id IN (${placeholders(batch)})`, batch);
-      for (const batch of chunks(codes, 250)) await tx.run(`INSERT IGNORE INTO jellyfin_media_codes (item_id, code)
-        VALUES ${batch.map(() => '(?, ?)').join(', ')}`, batch.flatMap((item) => [item.itemId, item.code]));
+      for (const batch of chunks(codes, 250)) await tx.run(`INSERT INTO jellyfin_media_codes (item_id, code)
+        VALUES ${batch.map(() => '(?, ?)').join(', ')} ON CONFLICT (item_id, code) DO NOTHING`, batch.flatMap((item) => [item.itemId, item.code]));
     });
     this.mediaCount += unique.length;
     this.codeCount += codes.length;
@@ -71,7 +71,7 @@ export async function saveJellyfinMediaIndex(media: JellyfinMedia[], libraryIds:
   return writer.finalize();
 }
 
-/** Build the full-sync matcher from the persisted MySQL index, never the raw API response. */
+/** Build the full-sync matcher from the persisted PostgreSQL index, never the raw API response. */
 export async function readJellyfinMediaIndex(libraryIds: string[]) {
   const selected = selectedLibraryIds(libraryIds);
   if (!selected.length) return new Map<string, CachedJellyfinMatch>();

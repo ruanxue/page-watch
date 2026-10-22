@@ -242,8 +242,8 @@ export function registerCodeSearchRoutes(app: FastifyInstance) {
         }
 
         if (fullScanBatchId) {
-          await tx.run(`INSERT IGNORE INTO full_scan_batches (id, subscription_id, subscription_name, status, is_initial, page_count, scanned_count, archived_count, created_at)
-            VALUES (?, ?, ?, 'scanning', ?, NULL, 0, 0, ?)`,
+          await tx.run(`INSERT INTO full_scan_batches (id, subscription_id, subscription_name, status, is_initial, page_count, scanned_count, archived_count, created_at)
+            VALUES (?, ?, ?, 'scanning', ?, NULL, 0, 0, ?) ON CONFLICT (id) DO NOTHING`,
           [fullScanBatchId, subscriptionId, actress.name, duplicate?.last_hash ? 0 : 1, now]);
         }
 

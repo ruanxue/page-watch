@@ -17,7 +17,7 @@ app.post('/api/setup/database', async (request, reply) => {
     deps.startOperationalServices();
     return reply.code(201).send({ configured: true });
   } catch (error) {
-    return reply.code(400).send({ error: error instanceof Error ? error.message : 'MySQL 连接或初始化失败。' });
+    return reply.code(400).send({ error: error instanceof Error ? error.message : 'PostgreSQL 连接或初始化失败。' });
   }
 });
 app.post('/api/auth/setup', async (request, reply) => {

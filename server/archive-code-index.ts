@@ -20,7 +20,7 @@ export async function replaceArchiveCodes(client: DatabaseClient, rows: ArchiveC
     const aliases = batch.flatMap((row) => codesForArchiveEntry(row.content, row.title).map((code) => [row.id, row.subscription_id, code]));
     for (let index = 0; index < aliases.length; index += 200) {
       const values = aliases.slice(index, index + 200);
-      await client.run(`INSERT IGNORE INTO archive_entry_codes (archive_entry_id, subscription_id, code) VALUES ${values.map(() => '(?, ?, ?)').join(', ')}`, values.flat());
+      await client.run(`INSERT INTO archive_entry_codes (archive_entry_id, subscription_id, code) VALUES ${values.map(() => '(?, ?, ?)').join(', ')} ON CONFLICT (archive_entry_id, code) DO NOTHING`, values.flat());
     }
   }
 }
@@ -44,11 +44,11 @@ export async function findArchiveCodeMatches(client: DatabaseClient, codes: stri
   if (!patterns.length) return indexed;
   const clause = patterns.map(() => 'LOWER(content) LIKE ?').concat(patterns.map(() => "LOWER(COALESCE(title, '')) LIKE ?")).join(' OR ');
   const wanted = new Set(searchCodes);
-  let before = Number.MAX_SAFE_INTEGER;
+  let before: number | undefined;
   while (true) {
     const legacy = await client.all<ArchiveCodeRow>(`SELECT id, subscription_id, content, title FROM archive_entries
-      WHERE ${subscriptionId === undefined ? '' : 'subscription_id = ? AND '}id < ? AND (${clause})
-      ORDER BY id DESC LIMIT 200`, [...(subscriptionId === undefined ? [] : [subscriptionId]), before, ...patterns, ...patterns]);
+      WHERE ${subscriptionId === undefined ? '' : 'subscription_id = ? AND '}${before === undefined ? '' : 'id < ? AND '}(${clause})
+      ORDER BY id DESC LIMIT 200`, [...(subscriptionId === undefined ? [] : [subscriptionId]), ...(before === undefined ? [] : [before]), ...patterns, ...patterns]);
     for (const row of legacy) for (const code of codesForArchiveEntry(row.content, row.title)) {
       const key = `${row.id}:${code}`;
       if (wanted.has(code) && !found.has(key)) { indexed.push({ id: row.id, code }); found.add(key); }
@@ -70,14 +70,14 @@ export async function backfillArchiveCodeIndex() {
         WHERE id > ? AND id <= ? ORDER BY id ASC LIMIT ${chunkSize} FOR UPDATE`, [cursor, target!.id]);
       if (rows.length) await replaceArchiveCodes(tx, rows);
       const at = rows.at(-1)?.id ?? target!.id;
-      await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, ?, ?)
+      await tx.run(`INSERT INTO app_settings ("key", value, updated_at) VALUES (?, ?, ?)
         ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`, [cursorKey, String(at), new Date().toISOString()]);
       return at;
     });
     cursor = next;
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
-  await db.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, '1', ?)
+  await db.run(`INSERT INTO app_settings ("key", value, updated_at) VALUES (?, '1', ?)
     ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`, [migrationKey, new Date().toISOString()]);
   await refreshSettings(true);
 }

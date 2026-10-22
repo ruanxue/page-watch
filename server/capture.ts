@@ -200,9 +200,9 @@ async function archiveNewItems(subscription: Subscription, items: CapturedItem[]
     const detailUrl = item.detailUrl;
     const releaseUrl = useMissavRules && rules.releaseDate.enabled ? expandReleaseUrl(rules.releaseDate.urlTemplate, { detailUrl, subscriptionUrl: subscription.url, content: item.content }) : null;
     const shouldCheckLibraryFirst = useMissavRules && rules.magnet.enabled && jellyfin.enabled && jellyfin.libraryIds.length > 0 && jellyfin.skipMagnetWhenAvailable;
-    const result = await client.run(`INSERT IGNORE INTO archive_entries
+    const result = await client.run(`INSERT INTO archive_entries
       (subscription_id, content, title, archive_code, content_hash, first_seen_at, detail_url, release_status, magnet_status, auto_download_suppressed, full_scan_batch_id, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [subscription.id, item.content, item.title, archiveKey(item.content), hash(item.content), capturedAt, detailUrl, releaseUrl ? 'pending' : 'unsearched', useMissavRules && rules.magnet.enabled && !shouldCheckLibraryFirst ? 'pending' : 'unsearched', suppressAutoDownload ? 1 : 0, fullScanBatchId, capturedAt]);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (subscription_id, content_hash) DO NOTHING RETURNING id`, [subscription.id, item.content, item.title, archiveKey(item.content), hash(item.content), capturedAt, detailUrl, releaseUrl ? 'pending' : 'unsearched', useMissavRules && rules.magnet.enabled && !shouldCheckLibraryFirst ? 'pending' : 'unsearched', suppressAutoDownload ? 1 : 0, fullScanBatchId, capturedAt]);
     if (result.changes) {
       insertedItems.push(item);
       insertedRows.push({ id: result.lastInsertRowid, subscription_id: subscription.id, content: item.content, title: item.title });
@@ -322,12 +322,12 @@ async function stagePage(subscription: Subscription, scanId: string, page: numbe
   const now = new Date().toISOString();
   await db.transaction(async (tx) => {
     // Use bounded multi-row inserts: a large pagination page must not turn
-    // into hundreds of per-row MySQL round trips or one unbounded statement.
+    // into hundreds of per-row PostgreSQL round trips or one unbounded statement.
     for (let offset = 0; offset < items.length; offset += 100) {
       const batch = items.slice(offset, offset + 100);
-      await tx.run(`INSERT IGNORE INTO initial_scan_items
+      await tx.run(`INSERT INTO initial_scan_items
         (subscription_id, scan_id, page_number, item_position, content, title, detail_url, content_hash, created_at)
-        VALUES ${batch.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}`,
+        VALUES ${batch.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')} ON CONFLICT (subscription_id, scan_id, content_hash) DO NOTHING`,
       batch.flatMap((item, index) => [subscription.id, scanId, page, offset + index + 1, item.content, item.title, item.detailUrl, hash(item.content), now]));
     }
     await tx.run(`UPDATE subscriptions SET initial_scan_pages_completed = GREATEST(initial_scan_pages_completed, ?), initial_scan_next_page = ?, last_error = NULL, updated_at = ?
@@ -358,8 +358,8 @@ async function captureInitialFullScan(subscription: Subscription, browserPriorit
     await stagePage(subscription, scanId, 1, first.items);
     nextPage = 2;
   } else {
-    await db.run(`INSERT IGNORE INTO full_scan_batches (id, subscription_id, subscription_name, status, is_initial, page_count, scanned_count, archived_count, created_at)
-      VALUES (?, ?, ?, 'scanning', ?, ?, 0, 0, ?)`, [scanId, subscription.id, subscription.name, subscription.last_hash ? 0 : 1, total, new Date().toISOString()]);
+    await db.run(`INSERT INTO full_scan_batches (id, subscription_id, subscription_name, status, is_initial, page_count, scanned_count, archived_count, created_at)
+      VALUES (?, ?, ?, 'scanning', ?, ?, 0, 0, ?) ON CONFLICT (id) DO NOTHING`, [scanId, subscription.id, subscription.name, subscription.last_hash ? 0 : 1, total, new Date().toISOString()]);
   }
   for (let page = nextPage; page <= total; page += 1) {
     const url = new URL(subscription.url);
@@ -412,7 +412,8 @@ async function captureInitialFullScan(subscription: Subscription, browserPriorit
       const inserted = await archiveNewItems(subscription, batch.map((item) => ({ content: item.content, title: item.title, detailUrl: item.detail_url })), now, tx, !subscription.last_hash, scanId, existingState);
       addedCount += inserted.length;
     }
-    await tx.run('UPDATE subscriptions SET last_scan_added_count = ? WHERE id = ? AND initial_scan_run_id = ?', [addedCount, subscription.id, scanId]);
+    // 上面的条件更新已确认本次扫描并清空运行编号；仍在同一事务中，按成功时间写回新增数。
+    await tx.run('UPDATE subscriptions SET last_scan_added_count = ? WHERE id = ? AND last_checked_at = ?', [addedCount, subscription.id, now]);
     if (!subscription.last_hash) {
       // A one-click subscription may have inserted and started enriching its
       // searched film before the first paginated scan began. Include it in

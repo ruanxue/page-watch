@@ -11,8 +11,7 @@ services:
     environment:
       PORT: 3030
       OUTBOUND_PROXY: ${OUTBOUND_PROXY:-}
-      # 数据库连接留空则在网页安装引导中填写；DB_DRIVER 可显式指定 postgres 或 mysql。
-      DB_DRIVER: ${DB_DRIVER:-postgres}
+      # PostgreSQL 连接留空则在网页安装引导中填写。
       DATABASE_HOST: ${DATABASE_HOST:-}
       DATABASE_PORT: ${DATABASE_PORT:-5432}
       DATABASE_NAME: ${DATABASE_NAME:-}

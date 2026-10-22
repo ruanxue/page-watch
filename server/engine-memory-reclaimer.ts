@@ -43,7 +43,7 @@ async function runControlledGc() {
  * Node deliberately retains a high-water mark after a large scan. When all
  * durable queues are empty, Chromium is gone and a controlled GC has not
  * brought RSS down, restart only the disposable execution engine. The API is
- * never touched, and every task state already lives in MySQL.
+ * never touched, and every task state already lives in PostgreSQL.
  */
 export class ExecutionEngineMemoryReclaimer {
   private readonly startedAt = Date.now();

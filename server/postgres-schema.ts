@@ -1,19 +1,10 @@
 import type { Pool } from 'pg';
 
 /**
- * PostgreSQL 版建表脚本，与 MySQL 版一一对应。
- *
- * 类型映射：
- * - INT AUTO_INCREMENT      → INTEGER GENERATED ALWAYS AS IDENTITY
- * - BIGINT AUTO_INCREMENT   → BIGINT GENERATED ALWAYS AS IDENTITY
- * - TINYINT（0/1 开关）      → SMALLINT（保留 0/1 语义，避免改动业务判断）
- * - MEDIUMTEXT              → TEXT
- * - DATETIME                → TIMESTAMP
- * - 行内 KEY / UNIQUE KEY    → 独立的 CREATE INDEX / CREATE UNIQUE INDEX
- * - ENGINE / CHARSET        → 删除（PG 不需要）
+ * PostgreSQL 数据结构与索引。
  *
  * 「一个订阅/条目同时只能有一个在途任务」仍然靠生成列 + 唯一索引实现：
- * PG 的唯一索引默认把 NULL 视为互不相等，与 MySQL 行为一致。
+ * 唯一索引允许多条终态任务的生成列为 NULL。
  *
  * 每条语句都写成 IF NOT EXISTS，可重复执行；API 与执行引擎同时启动也不会冲突。
  */
@@ -404,7 +395,7 @@ export async function ensurePostgresSchema(pool: Pool) {
 }
 
 /**
- * 与 MySQL 版对应的数据修补：
+ * 历史数据修补：
  * 1. 早期版本写入的占位时间统一改成首次发现时间；
  * 2. 已完成下载的条目补上「已通知」时间，避免迁移后重复通知。
  */

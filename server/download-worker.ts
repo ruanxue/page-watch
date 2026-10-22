@@ -254,7 +254,7 @@ async function syncDownloadStates() {
   lastStatusSyncAt = Date.now();
   const settings = getQbittorrentSettings();
   if (!settings.enabled) return false;
-  // Completed entries are terminal: neither load them from MySQL nor probe
+  // Completed entries are terminal: neither load them from PostgreSQL nor probe
   // their qBittorrent hashes during background observation.
   const [activeEntries, pausedEntries] = await Promise.all([
     db.all<TrackedDownload>(`SELECT a.id, a.subscription_id, s.name AS subscription_name, a.content, a.download_status, a.download_completion_notified_at, a.download_added_at, a.download_checked_at, a.download_torrent_hash, a.magnet_value,

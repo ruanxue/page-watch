@@ -1,10 +1,8 @@
 import 'dotenv/config';
-import mysql, { type Pool, type PoolConnection, type ResultSetHeader } from 'mysql2/promise';
-import { Pool as PgPool, type PoolClient } from 'pg';
+import type { Pool } from 'pg';
 import { createPostgresPool, pgClientFor } from './pg-connection.js';
 import { ensurePostgresSchema } from './postgres-schema.js';
-import { ensureMySqlSchema } from './mysql-schema.js';
-import { databaseBootstrapForStartup, databaseBootstrapNeedsMigration, environmentDatabaseSettings, migrateLegacyDatabaseSettingsToPlaintext, normalizeDatabaseSettings, savedDatabaseSettings, saveDatabaseSettings, type MySqlConnectionSettings } from './database-bootstrap.js';
+import { environmentDatabaseSettings, normalizeDatabaseSettings, savedDatabaseSettings, saveDatabaseSettings, type DatabaseConnectionSettings } from './database-bootstrap.js';
 import { defaultInspectionRules, inspectionRulesJson } from './inspection-rules.js';
 import { BUILTIN_GROUP_NAME, builtinSupplementSteps, legacyMissavGroupName, parseSitesJson, serializeSitesJson } from './rule-groups.js';
 import { notifyLive } from './live-events.js';
@@ -12,73 +10,22 @@ import { decryptSecret, isEncryptedSecret, isPageWatchEncryptedValue, readOption
 import { resolveHeartbeatWrite, type WorkerHeartbeatContext, type WorkerHeartbeatOptions, type WorkerName, type WorkerTaskContext } from './worker-heartbeat.js';
 import { defaultRuntimeSettings, normalizeRuntimeSettings, type RuntimeSettings } from './runtime-settings.js';
 
-/**
- * 当前生效的数据库驱动。新安装默认 PostgreSQL；引导文件里写明 driver 时以文件为准，
- * 因此旧的 MySQL 配置文件（没有 driver 字段）会被识别成 MySQL，不会连错库。
- * 需要临时指定时可用环境变量 DB_DRIVER=mysql|postgres 覆盖。
- */
-export type DatabaseDriver = 'mysql' | 'postgres';
-export let databaseDriver: DatabaseDriver = 'postgres';
-
-/** 依据连接配置决定驱动：文件里写了就用文件的，否则看环境变量。 */
-function driverFrom(config: MySqlConnectionSettings): DatabaseDriver {
-  if (config.driver === 'postgres') return 'postgres';
-  if (config.driver === 'mysql') return 'mysql';
-  return process.env.DB_DRIVER === 'mysql' ? 'mysql' : 'postgres';
-}
-
-let pool: Pool | PgPool | null = null;
+let pool: Pool | null = null;
 let databaseSource: 'environment' | 'saved' | null = null;
 let databaseConfigurationProblem: string | null = null;
 let databaseConfigurationInProgress = false;
-let legacyBootstrapCiphertextForMigration: string | null = null;
-let legacyBootstrapSettingsForMigration: MySqlConnectionSettings | null = null;
-
-function createPool(config: MySqlConnectionSettings) {
-  if (databaseDriver === 'postgres') return createPostgresPool(config);
-  return mysql.createPool({
-  host: config.host,
-  port: config.port,
-  user: config.user,
-  password: config.password,
-  database: config.database,
-  waitForConnections: true,
-  // Six workers live in one container. A small per-process pool avoids each
-  // of them reserving eight connections on the NAS MySQL server.
-  connectionLimit: config.connectionLimit,
-  queueLimit: 0,
-  charset: 'utf8mb4_unicode_ci',
-  timezone: 'Z'
-  });
-}
-
-/** 按驱动建表：两边结构一一对应，新库直接是最终形态。 */
-async function ensureSchema(target: Pool | PgPool) {
-  if (databaseDriver === 'postgres') return ensurePostgresSchema(target as PgPool);
-  return ensureMySqlSchema(target as Pool);
-}
 
 function loadDatabasePool() {
   try {
     const environment = environmentDatabaseSettings();
-    const bootstrap = databaseBootstrapForStartup();
-    const saved = bootstrap?.settings ?? null;
-    const legacyBootstrap = bootstrap && bootstrap.ciphertext !== null ? bootstrap : null;
-    if (legacyBootstrap) {
-      if (environment && (environment.host !== legacyBootstrap.settings.host || environment.port !== legacyBootstrap.settings.port || environment.database !== legacyBootstrap.settings.database)) {
-        throw new Error('MYSQL_* 环境变量指向的数据库与旧版引导文件不同。为避免迁移错误的数据库，请暂时清除 MYSQL_* 环境变量并使用旧版引导连接完成迁移；数据库和引导文件未修改。');
-      }
-      legacyBootstrapCiphertextForMigration = legacyBootstrap.ciphertext;
-      legacyBootstrapSettingsForMigration = legacyBootstrap.settings;
-    }
+    const saved = savedDatabaseSettings();
     const config = environment ?? saved;
     if (!config) return null;
     databaseSource = environment ? 'environment' : 'saved';
-    databaseDriver = driverFrom(config);
-    return createPool(config);
+    return createPostgresPool(config);
   } catch (error) {
-    databaseConfigurationProblem = error instanceof Error ? error.message : '已保存的数据库连接无法读取。请确认 APP_ENCRYPTION_KEY 未变更。';
-    console.warn(`Unable to read saved database connection: ${error instanceof Error ? error.message : String(error)}`);
+    databaseConfigurationProblem = error instanceof Error ? error.message : '数据库连接配置无法读取。';
+    console.warn('数据库配置读取失败：' + databaseConfigurationProblem);
     return null;
   }
 }
@@ -86,7 +33,7 @@ function loadDatabasePool() {
 pool = loadDatabasePool();
 
 export class DatabaseNotConfiguredError extends Error {
-  constructor() { super('数据库尚未配置。请先完成 MySQL 安装引导。'); }
+  constructor() { super('数据库尚未配置。请先完成 PostgreSQL 安装引导。'); }
 }
 export function isDatabaseConfigured() { return pool !== null && !databaseConfigurationInProgress; }
 export function databaseConfigurationSource() { return databaseSource; }
@@ -95,7 +42,6 @@ function requirePool() {
   if (!pool) throw new DatabaseNotConfiguredError();
   return pool;
 }
-type Runner = Pool | PoolConnection | PgPool | PoolClient;
 export type RunResult = { changes: number; lastInsertRowid: number };
 export type DatabaseClient = {
   all<T>(sql: string, params?: unknown[]): Promise<T[]>;
@@ -103,98 +49,57 @@ export type DatabaseClient = {
   run(sql: string, params?: unknown[]): Promise<RunResult>;
 };
 
-function clientFor(runner: Runner): DatabaseClient {
-  // PostgreSQL 走统一适配层：翻译占位符、把 rowCount 映射成 changes、
-  // 用 RETURNING 取回自增 id。MySQL 仍是原来的实现。
-  if (databaseDriver === 'postgres') return pgClientFor(runner as PgPool | PoolClient) as DatabaseClient;
-  const queryable = runner as Pool | PoolConnection;
-  return {
-    async all<T>(sql: string, params: unknown[] = []) {
-      const [rows] = await queryable.query(sql, params as any);
-      return rows as T[];
-    },
-    async get<T>(sql: string, params: unknown[] = []) {
-      const [rows] = await queryable.query(sql, params as any);
-      return (rows as T[])[0];
-    },
-    async run(sql: string, params: unknown[] = []) {
-      const [result] = await queryable.execute(sql, params as any);
-      const header = result as ResultSetHeader;
-      return { changes: header.affectedRows, lastInsertRowid: Number(header.insertId) };
-    }
-  };
-}
-
 export const db: DatabaseClient & { transaction<T>(work: (tx: DatabaseClient) => Promise<T>): Promise<T> } = {
-  async all<T>(sql: string, params: unknown[] = []) { return clientFor(requirePool()).all<T>(sql, params); },
-  async get<T>(sql: string, params: unknown[] = []) { return clientFor(requirePool()).get<T>(sql, params); },
-  async run(sql: string, params: unknown[] = []) { return clientFor(requirePool()).run(sql, params); },
+  async all<T>(sql: string, params: unknown[] = []) { return pgClientFor(requirePool()).all<T>(sql, params); },
+  async get<T>(sql: string, params: unknown[] = []) { return pgClientFor(requirePool()).get<T>(sql, params); },
+  async run(sql: string, params: unknown[] = []) { return pgClientFor(requirePool()).run(sql, params); },
   async transaction<T>(work: (tx: DatabaseClient) => Promise<T>) {
-    const target = requirePool();
-    if (databaseDriver === 'postgres') {
-      const client = await (target as PgPool).connect();
-      try {
-        await client.query('BEGIN');
-        const result = await work(clientFor(client));
-        await client.query('COMMIT');
-        return result;
-      } catch (error) {
-        await client.query('ROLLBACK').catch(() => undefined);
-        throw error;
-      } finally {
-        client.release();
-      }
-    }
-    const connection = await (target as Pool).getConnection();
+    const client = await requirePool().connect();
+    let broken = false;
     try {
-      await connection.beginTransaction();
-      const result = await work(clientFor(connection));
-      await connection.commit();
+      await client.query('BEGIN');
+      const result = await work(pgClientFor(client));
+      await client.query('COMMIT');
       return result;
     } catch (error) {
-      await connection.rollback();
+      try { await client.query('ROLLBACK'); } catch { broken = true; }
       throw error;
     } finally {
-      connection.release();
+      client.release(broken);
     }
   }
 };
 
-/** Test, initialise and persist a browser-provided MySQL connection only after it succeeds. */
-export async function configureDatabase(input: Partial<MySqlConnectionSettings>) {
+/** 关闭连接池；用于服务退出及隔离测试结束后的资源回收。 */
+export async function closeDatabase() {
+  const previous = pool;
+  pool = null;
+  await previous?.end();
+}
+
+/** 完整验证与初始化成功后才保存 PostgreSQL 连接。 */
+export async function configureDatabase(input: Partial<DatabaseConnectionSettings>) {
   if (databaseSource === 'environment') throw new Error('当前数据库连接由 Docker 环境变量管理，请在部署配置中修改。');
-  if (databaseBootstrapNeedsMigration()) {
-    // Do not let the setup form replace a v1 bootstrap when the legacy key is
-    // absent or wrong. First migrate the stored destination with its old key.
-    savedDatabaseSettings();
-    throw new Error('旧版数据库引导配置尚未迁移；请保留原数据库连接和旧密钥，让新版先完成迁移，再更改 MySQL 地址。');
-  }
+  environmentDatabaseSettings();
+  savedDatabaseSettings();
   const settings = normalizeDatabaseSettings(input);
-  const previousDriver = databaseDriver;
-  databaseDriver = driverFrom(settings);
-  const candidate = createPool(settings);
+  const candidate = createPostgresPool(settings);
   const previousPool = pool;
   const previousSource = databaseSource;
   const previousProblem = databaseConfigurationProblem;
   const previousInitialization = initialization;
   try {
-    // 两种驱动的 pool 都提供 query，但联合类型的签名无法直接调用，这里收敛成最小接口。
-    await (candidate as { query(sql: string): Promise<unknown> }).query('SELECT 1');
-    await ensureSchema(candidate);
+    await candidate.query('SELECT 1');
     pool = candidate;
     databaseSource = 'saved';
     databaseConfigurationProblem = null;
     databaseConfigurationInProgress = true;
     initialization = null;
     await initializeDatabase();
-    // Persist only after every initialization step succeeds. Otherwise a
-    // failed setup would leave the browser on the database page while the API
-    // considered the database configured and required an impossible login.
     saveDatabaseSettings(settings);
     databaseConfigurationInProgress = false;
-    await previousPool?.end().catch((error) => console.warn(`Unable to close previous database pool: ${error instanceof Error ? error.message : String(error)}`));
+    await previousPool?.end().catch(() => console.warn('旧 PostgreSQL 连接池关闭失败。'));
   } catch (error) {
-    databaseDriver = previousDriver;
     if (pool === candidate) {
       pool = previousPool;
       databaseSource = previousSource;
@@ -268,25 +173,25 @@ export const JOB_PRIORITY = { normal: 0, manual: 100 } as const;
 export type JobPriority = (typeof JOB_PRIORITY)[keyof typeof JOB_PRIORITY];
 
 async function queueUnique(table: 'jobs' | 'release_jobs' | 'magnet_jobs' | 'download_jobs' | 'library_jobs', column: 'subscription_id' | 'archive_entry_id', id: number, priority: JobPriority, client: DatabaseClient) {
-  const existing = await client.get<{ id: number; priority: number }>(`SELECT id, priority FROM \`${table}\` WHERE \`${column}\` = ? AND status IN ('queued', 'running')`, [id]);
-  if (existing) {
-    // A manual request upgrades waiting automatic work, but never interrupts a
-    // running worker task.
-    if (existing.priority < priority) {
-      await client.run(`UPDATE \`${table}\` SET priority = ? WHERE id = ? AND status = 'queued'`, [priority, existing.id]);
-      if (client === db) notifyLive('tasks');
+  const activeColumn = column === 'subscription_id' ? 'active_subscription_id' : 'active_archive_entry_id';
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const existing = await client.get<{ id: number; priority: number }>(`SELECT id, priority FROM "${table}" WHERE "${column}" = ? AND status IN ('queued', 'running')`, [id]);
+    if (existing) {
+      if (existing.priority < priority) {
+        const promoted = await client.run(`UPDATE "${table}" SET priority = ? WHERE id = ? AND status = 'queued' AND priority < ?`, [priority, existing.id, priority]);
+        if (promoted.changes && client === db) notifyLive('tasks');
+      }
+      return { id: existing.id, queued: false };
     }
-    return { id: existing.id, queued: false };
+    // 冲突是正常的并发结果，不能通过 SQL 异常处理，否则会使整笔事务失效。
+    const result = await client.run(`INSERT INTO "${table}" ("${column}", status, requested_at, priority) VALUES (?, 'queued', ?, ?)
+      ON CONFLICT ("${activeColumn}") DO NOTHING RETURNING id`, [id, new Date().toISOString(), priority]);
+    if (result.changes) {
+      if (client === db) notifyLive('tasks');
+      return { id: result.lastInsertRowid, queued: true };
+    }
   }
-  try {
-    const result = await client.run(`INSERT INTO \`${table}\` (\`${column}\`, status, requested_at, priority) VALUES (?, 'queued', ?, ?)`, [id, new Date().toISOString(), priority]);
-    if (client === db) notifyLive('tasks');
-    return { id: result.lastInsertRowid, queued: true };
-  } catch (error) {
-    const duplicate = await client.get<{ id: number }>(`SELECT id FROM \`${table}\` WHERE \`${column}\` = ? AND status IN ('queued', 'running')`, [id]);
-    if (duplicate) return { id: duplicate.id, queued: false };
-    throw error;
-  }
+  throw new Error('任务状态正在变化，请稍后重试。');
 }
 
 export async function queueJob(subscriptionId: number, priority: JobPriority = JOB_PRIORITY.normal, client: DatabaseClient = db) {
@@ -368,11 +273,7 @@ export async function rebuildSubscriptionProgress(subscriptionId?: number, clien
       library_total=EXCLUDED.library_total, library_done=EXCLUDED.library_done, download_total=EXCLUDED.download_total, download_done=EXCLUDED.download_done, updated_at=EXCLUDED.updated_at`, params);
 }
 
-// NAS MySQL deployments commonly deny CREATE TRIGGER while binary logging is
-// enabled. Keep the compact read-model up to date in the application instead:
-// transitions for the same subscription are coalesced, so a batch of archive
-// jobs costs one bounded aggregate query rather than one query per row or a
-// full archive scan whenever the UI refreshes.
+// 按订阅合并统计刷新，避免每条档案状态变化都重新汇总。
 const pendingProgressRebuilds = new Set<number>();
 let progressRebuildTimer: NodeJS.Timeout | null = null;
 const PROGRESS_REBUILD_DEBOUNCE_MS = 2_000;
@@ -436,24 +337,23 @@ export type LibrarySyncJob = {
 /** Queue only one active complete snapshot. A manual click upgrades a waiting
  * scheduled run but never interrupts a currently-running child. */
 export async function queueLibrarySyncJob(trigger: 'manual' | 'scheduled', priority: JobPriority = JOB_PRIORITY.normal) {
-  const existing = await db.get<Pick<LibrarySyncJob, 'id' | 'priority' | 'status'>>("SELECT id, priority, status FROM library_sync_jobs WHERE status IN ('queued', 'running') ORDER BY id DESC LIMIT 1");
-  if (existing) {
-    if (existing.status === 'queued' && Number(existing.priority) < priority) {
-      await db.run("UPDATE library_sync_jobs SET priority = ?, trigger_type = 'manual' WHERE id = ?", [priority, existing.id]);
-      notifyLive('tasks');
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const existing = await db.get<Pick<LibrarySyncJob, 'id' | 'priority' | 'status'>>("SELECT id, priority, status FROM library_sync_jobs WHERE status IN ('queued', 'running') ORDER BY id DESC LIMIT 1");
+    if (existing) {
+      if (existing.status === 'queued' && Number(existing.priority) < priority) {
+        const promoted = await db.run("UPDATE library_sync_jobs SET priority = ?, trigger_type = 'manual' WHERE id = ? AND status = 'queued' AND priority < ?", [priority, existing.id, priority]);
+        if (promoted.changes) notifyLive('tasks');
+      }
+      return { id: existing.id, queued: false };
     }
-    return { id: existing.id, queued: false };
-  }
-  try {
     const result = await db.run(`INSERT INTO library_sync_jobs (trigger_type, status, requested_at, priority)
-      VALUES (?, 'queued', ?, ?)`, [trigger, new Date().toISOString(), priority]);
-    notifyLive('tasks');
-    return { id: result.lastInsertRowid, queued: true };
-  } catch (error) {
-    const raced = await db.get<Pick<LibrarySyncJob, 'id'>>("SELECT id FROM library_sync_jobs WHERE status IN ('queued', 'running') ORDER BY id DESC LIMIT 1");
-    if (raced) return { id: raced.id, queued: false };
-    throw error;
+      VALUES (?, 'queued', ?, ?) ON CONFLICT (active_marker) DO NOTHING RETURNING id`, [trigger, new Date().toISOString(), priority]);
+    if (result.changes) {
+      notifyLive('tasks');
+      return { id: result.lastInsertRowid, queued: true };
+    }
   }
+  throw new Error('影视库同步任务状态正在变化，请稍后重试。');
 }
 
 /** A runner can exit while its external Jellyfin child is running. Release its
@@ -475,13 +375,14 @@ export async function recoverStaleLibrarySyncJobs() {
  * megabytes is never worth delaying a user's queued task.
  */
 export async function getExecutionEngineQueueState() {
+  const heartbeatCutoff = new Date(Date.now() - 45_000).toISOString();
   const row = await db.get<{ queued: number | string; running: number | string; busy_workers: number | string }>(`SELECT
       COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued,
       COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running,
       (SELECT COUNT(*) FROM worker_heartbeats
         WHERE worker_name IN ('capture', 'release', 'magnet', 'download', 'library')
           AND status = 'busy'
-          AND last_seen_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 45 SECOND)) AS busy_workers
+          AND last_seen_at >= ?) AS busy_workers
     FROM (
       SELECT status FROM jobs
       UNION ALL SELECT status FROM release_jobs
@@ -490,7 +391,7 @@ export async function getExecutionEngineQueueState() {
       UNION ALL SELECT status FROM download_jobs
       UNION ALL SELECT status FROM library_sync_jobs
       UNION ALL SELECT status FROM notification_outbox
-    ) AS execution_queue`);
+    ) AS execution_queue`, [heartbeatCutoff]);
   return { queued: Number(row?.queued ?? 0), running: Number(row?.running ?? 0), busyWorkers: Number(row?.busy_workers ?? 0) };
 }
 
@@ -546,7 +447,7 @@ function readableSettingValue(key: string, value: string) {
 }
 
 export async function setSetting(key: string, value: string) {
-  await db.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, ?, ?)
+  await db.run(`INSERT INTO app_settings ("key", value, updated_at) VALUES (?, ?, ?)
     ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`, [key, value, new Date().toISOString()]);
   settings.set(key, value);
 }
@@ -558,7 +459,7 @@ export async function setSetting(key: string, value: string) {
  */
 export async function refreshSettings(force = false) {
   if (!force && Date.now() - lastSettingsRefreshAt < SETTINGS_REFRESH_MS) return;
-  const rows = await db.all<{ key: string; value: string }>('SELECT `key`, value FROM app_settings');
+  const rows = await db.all<{ key: string; value: string }>('SELECT "key", value FROM app_settings');
   const next = new Map(rows.map((row) => [row.key, readableSettingValue(row.key, row.value)]));
   settings.clear();
   for (const [key, value] of next) settings.set(key, value);
@@ -570,7 +471,7 @@ async function migrateEncryptedSettingsToPlaintext() {
   const keyToClear: { current: Buffer | null } = { current: null };
   try {
     await db.transaction(async (tx) => {
-      const rows = await tx.all<{ key: string; value: string }>('SELECT `key`, value FROM app_settings FOR UPDATE');
+      const rows = await tx.all<{ key: string; value: string }>('SELECT "key", value FROM app_settings FOR UPDATE');
       const encrypted = rows.filter((row) => isPageWatchEncryptedValue(row.value));
       const unsupported = encrypted.find((row) => !isEncryptedSecret(row.value));
       if (unsupported) throw new Error(`app_settings 中发现不支持的 pwenc 加密版本（${unsupported.key}）；数据库和引导文件未修改。`);
@@ -587,21 +488,13 @@ async function migrateEncryptedSettingsToPlaintext() {
       });
       const now = new Date().toISOString();
       for (const row of plaintextRows) {
-        const result = await tx.run('UPDATE app_settings SET value = ?, updated_at = ? WHERE `key` = ? AND value = ?', [row.plaintext, now, row.key, row.value]);
+        const result = await tx.run('UPDATE app_settings SET value = ?, updated_at = ? WHERE "key" = ? AND value = ?', [row.plaintext, now, row.key, row.value]);
         if (result.changes !== 1) throw new Error(`迁移 app_settings 中的旧版密文时配置已变化（${row.key}）；数据库事务已回滚。`);
       }
     });
   } finally {
     keyToClear.current?.fill(0);
   }
-}
-
-async function migrateDatabaseBootstrapToPlaintext() {
-  if (!legacyBootstrapCiphertextForMigration || !databaseBootstrapNeedsMigration()) return;
-  if (!legacyBootstrapSettingsForMigration) throw new Error('旧版数据库引导配置无法读取；未修改引导文件。');
-  migrateLegacyDatabaseSettingsToPlaintext(legacyBootstrapSettingsForMigration, legacyBootstrapCiphertextForMigration);
-  legacyBootstrapCiphertextForMigration = null;
-  legacyBootstrapSettingsForMigration = null;
 }
 
 export type PerformanceMetricInput = {
@@ -685,7 +578,7 @@ export async function flushTelemetry() {
 /** Keep performance history as a rolling seven-day window. */
 export async function maintainPerformanceMetrics() {
   // This also clears hourly aggregates left behind by older versions.
-  await db.run("DELETE FROM performance_metrics WHERE bucket_start < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 7 DAY)");
+  await db.run("DELETE FROM performance_metrics WHERE bucket_start < (now() AT TIME ZONE 'UTC') - INTERVAL '7 days'");
 }
 
 export type RuntimeMetric = { key: string; value?: number | null; text?: string | null };
@@ -843,7 +736,7 @@ async function seedDefaultSubscriptionPresets() {
         (name, description, selector, render_mode, content_source, attribute_name, match_pattern, title_selector, title_content_source, title_attribute_name, title_match_pattern, result_mode, interval_minutes, pagination_selector, pagination_parameter, pagination_match_pattern, is_active, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [...preset, now, now]);
     }
-    await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, ?, ?)
+    await tx.run(`INSERT INTO app_settings ("key", value, updated_at) VALUES (?, ?, ?)
       ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`, ['subscription_presets_seeded', '1', now]);
   });
   settings.set('subscription_presets_seeded', '1');
@@ -872,7 +765,7 @@ async function backfillMissavPaginationDefaults() {
         AND (pagination_selector IS NULL OR TRIM(pagination_selector) = '')
         AND (url LIKE 'https://missav123.com/%' OR url LIKE 'http://missav123.com/%')`,
     ['#price-currency', 'page', '/\\s*(\\d+)', now]);
-    await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, '1', ?)
+    await tx.run(`INSERT INTO app_settings ("key", value, updated_at) VALUES (?, '1', ?)
       ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`, [migrationKey, now]);
   });
   settings.set(migrationKey, '1');
@@ -911,7 +804,7 @@ async function assignLegacyMissavRules() {
       }
       lastId = batch[batch.length - 1].id;
     }
-    await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, '1', ?) ON CONFLICT ("key") DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at`, [migrationKey, now]);
+    await tx.run(`INSERT INTO app_settings ("key", value, updated_at) VALUES (?, '1', ?) ON CONFLICT ("key") DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at`, [migrationKey, now]);
   });
   settings.set(migrationKey, '1');
 }
@@ -959,7 +852,7 @@ async function migrateRuleGroups() {
     // 其余预设（以及上面新建时没覆盖到的行）补空数组，但不覆盖已有配置。
     await tx.run(`UPDATE subscription_presets SET sites_json = COALESCE(sites_json, '[]'), steps_json = COALESCE(steps_json, '[]')
       WHERE sites_json IS NULL OR steps_json IS NULL`);
-    await tx.run(`INSERT INTO app_settings (\`key\`, value, updated_at) VALUES (?, '1', ?)
+    await tx.run(`INSERT INTO app_settings ("key", value, updated_at) VALUES (?, '1', ?)
       ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`, [migrationKey, now]);
   });
   settings.set(migrationKey, '1');
@@ -975,9 +868,8 @@ let initialization: Promise<void> | null = null;
  */
 export function initializeDatabase() {
   if (!initialization) initialization = (async () => {
-    await ensureSchema(requirePool());
+    await ensurePostgresSchema(requirePool());
     await migrateEncryptedSettingsToPlaintext();
-    await migrateDatabaseBootstrapToPlaintext();
     await preloadSettings();
     await seedDefaultSubscriptionPresets();
     await backfillMissavPaginationDefaults();

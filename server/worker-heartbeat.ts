@@ -44,7 +44,7 @@ const heartbeatCache = new Map<WorkerName, { signature: string; persistedAt: num
 const heartbeatPersistIntervalMs = 60_000;
 
 /**
- * 判断一次心跳是否需要写 MySQL。保持为纯函数，才能在不需要数据库连接池的
+ * 判断一次心跳是否需要写 PostgreSQL。保持为纯函数，才能在不需要数据库连接池的
  * 前提下直接测试节流逻辑。
  */
 export function resolveHeartbeatWrite(workerName: WorkerName, context: WorkerHeartbeatContext, nowMs = Date.now(), options: WorkerHeartbeatOptions = {}): WorkerHeartbeatWrite {

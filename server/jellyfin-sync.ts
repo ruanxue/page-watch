@@ -103,7 +103,7 @@ async function writeArchiveMatches(libraryIds: string[], skipMagnetWhenAvailable
 /**
  * Synchronize a complete Jellyfin snapshot without keeping the entire remote
  * library, code index or archive list in Node. All live matching remains the
- * same MySQL index used by incoming archive entries.
+ * same PostgreSQL index used by incoming archive entries.
  */
 export async function syncJellyfinLibrary(trigger: 'manual' | 'scheduled' = 'scheduled', onProgress?: (progress: JellyfinSyncProgress) => Promise<void> | void): Promise<JellyfinSyncResult> {
   const settings = getJellyfinSettings();
@@ -117,7 +117,7 @@ export async function syncJellyfinLibrary(trigger: 'manual' | 'scheduled' = 'sch
     scanned = rawCount;
     await onProgress?.({ phase: 'indexing', current: rawCount, total, label: `正在读取 Jellyfin 媒体库（${rawCount}${total ? ` / ${total}` : ''}）` });
     await writer.writePage(page);
-    await onProgress?.({ phase: 'caching', current: rawCount, total, label: `已分批写入 MySQL Jellyfin 索引（${rawCount}${total ? ` / ${total}` : ''}）` });
+    await onProgress?.({ phase: 'caching', current: rawCount, total, label: `已分批写入 PostgreSQL Jellyfin 索引（${rawCount}${total ? ` / ${total}` : ''}）` });
   });
   const cache = await writer.finalize();
   await setSetting('jellyfin_media_index_synced_at', cache.syncedAt);

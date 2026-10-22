@@ -25,6 +25,17 @@ npm run dev
 
 本地开发通常连接 NAS 上的同一个 PostgreSQL 库，本地引擎会直接接续 NAS 容器中的队列；任务状态只保存在数据库，因此不会重复执行，但两边会共用同一批数据与运行日志。
 
+## 数据库回归测试
+
+先准备 PostgreSQL 18 专用测试库，库名必须包含 `test`，测试账号需要创建临时数据库的权限。显式设置连接后运行：
+
+```powershell
+$env:PAGE_WATCH_TEST_DATABASE_URL="postgresql://测试账号:测试密码@数据库地址:5432/pagewatch_test"
+npm run test:postgres
+```
+
+测试不会读取日常数据库配置作为替代连接；缺少测试连接会直接失败。每轮创建独立的临时测试库并在结束后删除，不改写提供连接的基础测试库或日常数据库。自动验证流程使用 PostgreSQL 18 测试服务。
+
 ## Docker / NAS
 
 本地或直接源码部署可使用下面的 Compose 文件：
@@ -35,13 +46,13 @@ docker compose up -d --build
 
 打开 `http://NAS_IP:3030`。Compose 只启动一个 Page Watch 容器；容器内常驻的只有网页 API/SSE 进程与轻量执行引擎。网页检查、发行日期、磁力检索与预览由按需网页执行器处理，并和 Chromium 一起在设定的空闲时间后退出；Jellyfin 全量同步同样由按需同步器分页写入 PostgreSQL。任务中心仍展示六项独立逻辑服务，订阅、档案、队列、下载与影视库状态、运行日志保存在 PostgreSQL；请按你的 NAS 备份策略备份 `pagewatch` 数据库。
 
-部署前请复制 `.env.example` 为 `.env`；新部署无需设置 `APP_ENCRYPTION_KEY`。首次打开网页只需填写数据库地址、库名、账号和密码（默认 PostgreSQL，也可选 MySQL）；连接信息以明文保存在 `data/database-bootstrap.json`，外部服务凭据以明文保存在数据库。数据库备份因此包含外部服务凭据，必须限制数据库网络访问、账号权限和备份文件读取权限。`APP_ENCRYPTION_KEY` 仅用于一次性迁移旧版 `pwenc:v1` 配置；旧 NAS 升级时要保留原环境变量或 `data/app-encryption-key`，直到迁移完成并确认 `database-bootstrap.json` 已变为 version 2。既有部署仍可使用 `DATABASE_*`（或旧的 `MYSQL_*`）环境变量；网页不能覆盖由环境变量管理的连接。健康检查以 `curl /api/ready` 完成，不会周期性启动额外 Node 进程；安装引导尚未完成时它返回 503 是正常状态。
+部署前请复制 `.env.example` 为 `.env`。项目只支持 PostgreSQL；首次在网页填写连接信息，或使用 `DATABASE_*` 环境变量。现有明确标记为 PostgreSQL 的 version 2 引导文件可继续使用；旧 MySQL 配置、旧 `MYSQL_*` 变量和未注明类型的旧引导文件会被明确拒绝，不会误连或覆盖。连接信息保存在 `data/database-bootstrap.json`，外部服务凭据保存在数据库，请限制备份与数据目录的访问权限。健康检查使用 `/api/ready`，安装引导未完成时返回 503。
 
-### 从旧版 NAS 升级
+### 已有 PostgreSQL 部署升级
 
-先停止旧版容器，再用保留原有数据目录、旧数据库连接和原 `APP_ENCRYPTION_KEY` / `data/app-encryption-key` 的新版启动一次。新版会在一个数据库事务中验证并解密全部 `pwenc:v1` 设置，再统一改为明文；事务成功后才原子替换数据库引导文件为 version 2 明文格式。迁移时不要更改旧 NAS 使用的数据库地址。确认 version 2 后，本地新部署只需填写同一个数据库的局域网地址、库名、账号和密码。若要改用另一台数据库，先备份并把完整数据恢复到新服务器，再将新部署指向它。迁移完成后可移除旧密钥配置。不要让旧版和新版同时运行，也不要让旧版在迁移后重新写入数据库；旧版无法读取 version 2 引导文件，且可能把已明文迁移的设置重新加密。
+保留现有数据库和 `data` 目录即可。项目已移除 MySQL 运行、回退与搬迁工具。`DB_DRIVER=postgres` 可暂时保留，但其他驱动值不再接受，部署示例也不再提供此开关。
 
-若旧密钥缺失、错误或发现未知的 `pwenc:` 版本，迁移会失败并保留原密文和 version 1 引导文件。恢复原密钥后重试，不要删除密文。如果 app_settings 的数据库事务已提交为明文但引导文件原子写入失败，保留原密钥和数据库备份并再次启动新版完成引导文件迁移。迁移后旧版不能读取 version 2；回滚前必须恢复升级前的数据库与 `data` 备份。
+如果已搬到 PostgreSQL 的 `app_settings` 中仍有 `pwenc:v1` 凭据，保留原 `APP_ENCRYPTION_KEY` 或 `data/app-encryption-key`，新版会先验证全部密文，再在同一事务中统一解密；密钥缺失或错误时不会改写原值。该能力只处理现有 PostgreSQL 内的凭据，不迁移旧数据库引导文件。
 
 ### 首次访问与安全
 
@@ -70,21 +81,6 @@ pg_dump -h DATABASE_HOST -U page_watch_app -d pagewatch -Fc -f pagewatch-$(date 
 ```
 
 恢复演练可用 `pg_restore -h 临时库 -U 账号 -d 库名 pagewatch-日期.dump`。备份文件应存放在不同于数据库数据卷的位置。升级或修改抓取规则前，也建议先手动备份一次。运行日志最多保留最近 1,000 条，业务数据不会被该清理策略删除。
-
-### 从 MySQL 迁移到 PostgreSQL
-
-项目已切换到 PostgreSQL。若仍有旧的 MySQL 数据要搬过来（**只读源库，不修改 MySQL**）：
-
-```bash
-# 目标库用 PG_* 指定；源库默认读 data/database-bootstrap.json
-PG_HOST=192.168.1.20 PG_PORT=5432 PG_DATABASE=pagewatch PG_USER=postgres PG_PASSWORD=*** \
-  npm run migrate:postgres            # 预演，只报告行数
-
-PG_HOST=192.168.1.20 PG_PORT=5432 PG_DATABASE=pagewatch PG_USER=postgres PG_PASSWORD=*** \
-  npm run migrate:postgres -- --apply # 实际导入
-```
-
-源库也可用 `SOURCE_MYSQL_HOST` / `SOURCE_MYSQL_PORT` / `SOURCE_MYSQL_DATABASE` / `SOURCE_MYSQL_USER` / `SOURCE_MYSQL_PASSWORD` 指定。脚本会保留原始 id、跳过 PostgreSQL 的生成列、导入后重置自增序列，并逐表比对行数；MySQL 数据原样保留，确认无误后再自行下线。
 
 ## 网络代理
 

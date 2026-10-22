@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { translateSql, withReturning } from './sql-translate.js';
 
 /**
- * SQL 转换器是 MySQL → PostgreSQL 迁移的地基：占位符一旦转换错位，
+ * 占位符一旦转换错位，
  * 参数就会整体错配，查出来的数据看着「正常」其实是错的。因此这里覆盖
  * 项目里真实出现过的写法。
  */
@@ -32,9 +32,9 @@ test('磁力链接正则这类含问号的字面量保持原样', () => {
   assert.equal(result.paramCount, 1);
 });
 
-test('反引号标识符改成双引号，且里面的问号不转换', () => {
-  const result = translateSql('SELECT `key`, `value` FROM app_settings WHERE `key` = ?');
-  assert.equal(result.text, 'SELECT "key", "value" FROM app_settings WHERE "key" = $1');
+test('保留双引号标识符及其中的问号', () => {
+  const result = translateSql('SELECT "key?", "a""b" FROM app_settings WHERE "key" = ?');
+  assert.equal(result.text, 'SELECT "key?", "a""b" FROM app_settings WHERE "key" = $1');
   assert.equal(result.paramCount, 1);
 });
 
@@ -50,14 +50,14 @@ test('块注释里的问号不转换', () => {
   assert.equal(result.paramCount, 1);
 });
 
-test('INSERT IGNORE 翻译成 ON CONFLICT DO NOTHING', () => {
-  const result = translateSql('INSERT IGNORE INTO t (a, b) VALUES (?, ?)');
-  assert.equal(result.text, 'INSERT INTO t (a, b) VALUES ($1, $2) ON CONFLICT DO NOTHING');
+test('原生冲突忽略语句只转换占位符', () => {
+  const result = translateSql('INSERT INTO t (a, b) VALUES (?, ?) ON CONFLICT (a) DO NOTHING');
+  assert.equal(result.text, 'INSERT INTO t (a, b) VALUES ($1, $2) ON CONFLICT (a) DO NOTHING');
   assert.equal(result.paramCount, 2);
 });
 
 test('已经有冲突处理的语句不会重复追加', () => {
-  const result = translateSql('INSERT IGNORE INTO t (a) VALUES (?) ON CONFLICT (id) DO UPDATE SET a = EXCLUDED.a');
+  const result = translateSql('INSERT INTO t (a) VALUES (?) ON CONFLICT (id) DO UPDATE SET a = EXCLUDED.a');
   assert.equal(result.text, 'INSERT INTO t (a) VALUES ($1) ON CONFLICT (id) DO UPDATE SET a = EXCLUDED.a');
 });
 

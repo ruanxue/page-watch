@@ -10,7 +10,7 @@ import { isExecutionEngineDraining } from './engine-drain.js';
 import { createOperationFailureNotification, enqueueNotification } from './notifications.js';
 
 // An idle worker only needs a modest polling cadence. Once a complete local
-// Jellyfin index exists, however, individual matches are indexed MySQL reads
+// Jellyfin index exists, however, individual matches are indexed PostgreSQL reads
 // rather than remote API requests, so draining a small sequential batch is
 // both safe and dramatically faster for a newly added subscription.
 const POLL_MS = 15_000;
@@ -111,7 +111,7 @@ async function runNextLibraryJob() {
   try {
     const settings = getJellyfinSettings();
     if (!settings.enabled || !settings.libraryIds.length) throw new Error('Jellyfin 未启用或尚未选择媒体库。');
-    // After the first complete library sync, this is a single indexed MySQL
+    // After the first complete library sync, this is a single indexed PostgreSQL
     // lookup. The Jellyfin API fallback exists only while no local snapshot is
     // available yet (for example immediately after configuration changes).
     const indexReady = Boolean(getSetting('jellyfin_media_index_synced_at'));
@@ -212,7 +212,7 @@ async function tick() {
     let processed = 0;
     while (processed < LOCAL_MATCH_BATCH_SIZE && await runNextLibraryJob()) processed += 1;
     if (processed > 0) {
-      await reportWorkerHeartbeat('library', `正在查询 MySQL Jellyfin 媒体索引（本批已处理 ${processed} 项）`, 'busy');
+      await reportWorkerHeartbeat('library', `正在查询 PostgreSQL Jellyfin 媒体索引（本批已处理 ${processed} 项）`, 'busy');
       // Yield between bounded batches to keep this single Worker responsive
       // to heartbeats and the rest of the Node.js service, without returning
       // to the 15-second idle polling delay while a queue is still backed up.

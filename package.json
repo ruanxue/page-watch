@@ -13,10 +13,10 @@
     "dev:library-worker": "tsx server/library-worker.ts",
     "dev:runner": "tsx server/runner.ts",
     "dev:web": "vite --host 0.0.0.0",
-    "migrate:postgres": "tsx server/migrate-mysql-to-postgres.ts",
     "build:server": "tsc -p tsconfig.server.json",
     "build": "vite build",
     "test": "node --import tsx --test server/*.test.ts",
+    "test:postgres": "node --import tsx --test --test-concurrency=1 server/integration/*.test.ts",
     "all-in-one": "tsx server/all-in-one.ts",
     "start:production": "node build/server/index.js",
     "start": "tsx server/index.ts",
@@ -32,7 +32,6 @@
     "cheerio": "^1.1.2",
     "dotenv": "^17.4.2",
     "fastify": "^5.6.1",
-    "mysql2": "^3.24.4",
     "pg": "^8.23.1",
     "playwright": "1.63.0",
     "undici": "^7.16.0"
@@ -50,6 +49,6 @@
     "react-dom": "^19.1.1",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2",
-    "vite": "^7.1.4"
+    "vite": "^7.3.7"
   }
 }
