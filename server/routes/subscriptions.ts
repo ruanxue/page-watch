@@ -47,6 +47,9 @@ export function registerSubscriptionsRoutes(app: FastifyInstance, deps: { wakeEn
   app.delete('/api/subscriptions/:id', async (request, reply) => {
     const id = Number((request.params as { id: string }).id);
     await db.transaction(async (tx) => {
+      await tx.get('SELECT id FROM subscriptions WHERE id = ? FOR UPDATE', [id]);
+      await tx.run('DELETE FROM full_scan_batches WHERE subscription_id = ?', [id]);
+      await tx.run(`DELETE FROM notification_outbox WHERE status IN ('queued','running') AND payload::jsonb #>> '{subscription,id}' = ?`, [String(id)]);
       await tx.run('DELETE FROM download_jobs d USING archive_entries a WHERE a.id = d.archive_entry_id AND a.subscription_id = ?', [id]);
       await tx.run('DELETE FROM release_jobs r USING archive_entries a WHERE a.id = r.archive_entry_id AND a.subscription_id = ?', [id]);
       await tx.run('DELETE FROM magnet_jobs m USING archive_entries a WHERE a.id = m.archive_entry_id AND a.subscription_id = ?', [id]);
@@ -66,7 +69,10 @@ export function registerSubscriptionsRoutes(app: FastifyInstance, deps: { wakeEn
     const id = Number((request.params as { id: string }).id);
     if (!await getSubscription(id)) return reply.code(404).send({ error: '订阅不存在。' });
     const now = new Date().toISOString();
-    await db.transaction(async (tx) => {
+    const reset = await db.transaction(async (tx) => {
+      if (!await tx.get('SELECT id FROM subscriptions WHERE id = ? FOR UPDATE', [id])) return false;
+      await tx.run('DELETE FROM full_scan_batches WHERE subscription_id = ?', [id]);
+      await tx.run(`DELETE FROM notification_outbox WHERE status IN ('queued','running') AND payload::jsonb #>> '{subscription,id}' = ?`, [String(id)]);
       await tx.run('DELETE FROM download_jobs d USING archive_entries a WHERE a.id = d.archive_entry_id AND a.subscription_id = ?', [id]);
       await tx.run('DELETE FROM release_jobs r USING archive_entries a WHERE a.id = r.archive_entry_id AND a.subscription_id = ?', [id]);
       await tx.run('DELETE FROM magnet_jobs m USING archive_entries a WHERE a.id = m.archive_entry_id AND a.subscription_id = ?', [id]);
@@ -78,13 +84,15 @@ export function registerSubscriptionsRoutes(app: FastifyInstance, deps: { wakeEn
         (subscription_id, archive_total, jellyfin_available, release_total, release_done, magnet_total, magnet_done, library_total, library_done, download_total, download_done, updated_at)
         VALUES (?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ?)
         ON CONFLICT (subscription_id) DO UPDATE SET archive_total=0, jellyfin_available=0, release_total=0, release_done=0, magnet_total=0, magnet_done=0, library_total=0, library_done=0, download_total=0, download_done=0, updated_at=EXCLUDED.updated_at`, [id, now]);
-      await tx.run("DELETE FROM jobs WHERE subscription_id = ? AND status = 'queued'", [id]);
+      await tx.run('DELETE FROM jobs WHERE subscription_id = ?', [id]);
       await tx.run(`UPDATE subscriptions
         SET last_checked_at = NULL, last_hash = NULL, last_content = NULL, last_error = NULL,
           initial_scan_completed = CASE WHEN pagination_selector IS NULL THEN 1 ELSE 0 END,
           initial_scan_total = NULL, initial_scan_pages_completed = 0, initial_scan_run_id = NULL, initial_scan_next_page = 1, updated_at = ?
         WHERE id = ?`, [now, id]);
+      return true;
     });
+    if (!reset) return reply.code(404).send({ error: '订阅不存在。' });
     return reply.code(204).send();
   });
 

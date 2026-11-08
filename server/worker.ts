@@ -1,55 +1,13 @@
+import { recoverStalledJobs as recoverInterruptedJobs } from './job-recovery.js';
 import { webExecutor } from './web-executor-client.js';
 import { appendRuntimeLog, db, getSubscription, JOB_PRIORITY, queueJob, recordPerformanceMetric, refreshSettings, reportWorkerHeartbeat, type Subscription, type WorkerTaskContext } from './db.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
 import { notifyLive } from './live-events.js';
 import { isExecutionEngineDraining } from './engine-drain.js';
 import { createOperationFailureNotification, enqueueNotification } from './notifications.js';
+import { scheduledAfter, nextScheduledAt, scheduleStaggerMinutes } from './subscription-schedule.js';
 
 const POLL_MS = 10_000;
-
-function scheduledAfter(subscription: Subscription, last: Date) {
-  if (subscription.schedule_type === 'hourly') {
-    return new Date(last.getTime() + subscription.schedule_interval_hours * 60 * 60 * 1000);
-  }
-  const [hours, minutes] = subscription.schedule_time.split(':').map(Number);
-  const next = new Date(last);
-  next.setSeconds(0, 0);
-  next.setHours(hours, minutes, 0, 0);
-  if (subscription.schedule_type === 'daily') {
-    if (next <= last) next.setDate(next.getDate() + 1);
-    return next;
-  }
-  const daysUntil = (subscription.schedule_weekday - next.getDay() + 7) % 7;
-  next.setDate(next.getDate() + daysUntil);
-  if (next <= last) next.setDate(next.getDate() + 7);
-  return next;
-}
-
-function scheduleStaggerMinutes(subscription: Subscription) {
-  // Stable and tiny: recurring work does not bunch up after a restart, while
-  // a manually started task remains immediate.
-  return (subscription.id * 17) % 4;
-}
-
-function nextScheduledAt(subscription: Subscription, now: Date) {
-  if (subscription.schedule_type === 'hourly') {
-    const anchor = subscription.next_scheduled_at ? new Date(subscription.next_scheduled_at) : new Date(subscription.last_checked_at ?? subscription.updated_at);
-    let next = new Date(anchor.getTime() + subscription.schedule_interval_hours * 3_600_000);
-    while (next <= now) next = new Date(next.getTime() + subscription.schedule_interval_hours * 3_600_000);
-    return next;
-  }
-  const base = new Date(now);
-  const [hours, minutes] = subscription.schedule_time.split(':').map(Number);
-  base.setHours(hours, minutes + scheduleStaggerMinutes(subscription), 0, 0);
-  if (subscription.schedule_type === 'daily') {
-    if (base <= now) base.setDate(base.getDate() + 1);
-    return base;
-  }
-  const days = (subscription.schedule_weekday - base.getDay() + 7) % 7;
-  base.setDate(base.getDate() + days);
-  if (base <= now) base.setDate(base.getDate() + 7);
-  return base;
-}
 
 async function enqueueDueSubscriptions() {
   if (isExecutionEngineDraining()) return;
@@ -93,7 +51,8 @@ async function runNextJob() {
     await heartbeat();
     await appendRuntimeLog({ level: 'info', source: 'worker', subscriptionId: subscription.id, jobId: job.id, message: fullScan ? (subscription.initial_scan_run_id && subscription.initial_scan_pages_completed > 0 ? `恢复全量检查：从第 ${subscription.initial_scan_next_page} 页继续。` : '开始全量检查。') : '开始检查第一页。' });
     const result = await webExecutor.capture(subscription, job.priority);
-    await db.run("UPDATE jobs SET status = 'completed', finished_at = ? WHERE id = ?", [new Date().toISOString(), job.id]);
+    const finished = await db.run("UPDATE jobs SET status = 'completed', finished_at = ? WHERE id = ? AND status = 'running'", [new Date().toISOString(), job.id]);
+    if (!finished.changes || !result.stored) { activeTask = null; return; }
     const additions = result.addedCount ? `，新增 ${result.addedCount} 条内容` : '，没有新增内容';
     await appendRuntimeLog({ level: 'success', source: 'worker', subscriptionId: subscription.id, jobId: job.id, message: `${result.totalPages > 1 ? `全量检查完成，共读取 ${result.totalPages} 页` : '检查完成'}，提取 ${result.itemCount} 项${additions}。` });
     await recordPerformanceMetric({ scope: 'capture', metric: 'processed', dimension: fullScan ? 'full_scan' : 'check', durationMs: Date.now() - startedAtMs }).catch(() => undefined);
@@ -106,20 +65,30 @@ async function runNextJob() {
     const attempt = job.attempt_count + 1;
     const shouldRetry = attempt < MAX_JOB_ATTEMPTS && isRetryableJobError(error);
     const retryAt = new Date(Date.now() + retryDelayMs(attempt)).toISOString();
-    if (subscription) {
-      await db.run('UPDATE subscriptions SET last_error = ? WHERE id = ?', [shouldRetry ? `${retryDescription(attempt)}：${message}` : message, job.subscription_id]);
-    }
+    const handled = await db.transaction(async (tx) => {
+      // 与删除、重置串行确认有效任务，防止旧网络错误重新写回或产生通知。
+      const current = await tx.get('SELECT id FROM subscriptions WHERE id = ? FOR UPDATE', [job.subscription_id]);
+      if (!current) {
+        await tx.run('DELETE FROM jobs WHERE id = ?', [job.id]);
+        return false;
+      }
+      if (!await tx.get("SELECT id FROM jobs WHERE id = ? AND status = 'running' FOR UPDATE", [job.id])) return false;
+      await tx.run('UPDATE subscriptions SET last_error = ? WHERE id = ?', [shouldRetry ? `${retryDescription(attempt)}：${message}` : message, job.subscription_id]);
+      if (shouldRetry) {
+        await tx.run("UPDATE jobs SET status = 'queued', started_at = NULL, finished_at = NULL, error = ?, attempt_count = ?, retry_after = ? WHERE id = ?", [message, attempt, retryAt, job.id]);
+      } else {
+        const failedAt = new Date().toISOString();
+        await tx.run("UPDATE jobs SET status = 'failed', finished_at = ?, error = ?, attempt_count = ?, retry_after = NULL WHERE id = ?", [failedAt, message, attempt, job.id]);
+        if (fullScan && subscription) await tx.run(`UPDATE full_scan_batches SET status = 'scan_failed', completed_at = ? WHERE id = (SELECT initial_scan_run_id FROM subscriptions WHERE id = ?) AND status = 'scanning'`, [failedAt, subscription.id]);
+        if (subscription) await enqueueNotification(createOperationFailureNotification({ operation: '网页检查', error: message, subscription, jobId: job.id, occurredAt: failedAt }), tx);
+      }
+      return true;
+    });
+    if (!handled) { activeTask = null; return; }
     if (shouldRetry) {
-      await db.run("UPDATE jobs SET status = 'queued', started_at = NULL, finished_at = NULL, error = ?, attempt_count = ?, retry_after = ? WHERE id = ?", [message, attempt, retryAt, job.id]);
       await appendRuntimeLog({ level: 'info', source: 'worker', subscriptionId: job.subscription_id, jobId: job.id, message: `检查暂时失败，${retryDescription(attempt)}：${message}` });
       await recordPerformanceMetric({ scope: 'capture', metric: 'retry', dimension: retryReason(error) }).catch(() => undefined);
     } else {
-      const failedAt = new Date().toISOString();
-      await db.transaction(async (tx) => {
-        await tx.run("UPDATE jobs SET status = 'failed', finished_at = ?, error = ?, attempt_count = ?, retry_after = NULL WHERE id = ?", [failedAt, message, attempt, job.id]);
-        if (fullScan && subscription) await tx.run(`UPDATE full_scan_batches SET status = 'scan_failed', completed_at = ? WHERE subscription_id = ? AND status = 'scanning'`, [failedAt, subscription.id]);
-        if (subscription) await enqueueNotification(createOperationFailureNotification({ operation: '网页检查', error: message, subscription, jobId: job.id, occurredAt: failedAt }), tx);
-      });
       await appendRuntimeLog({ level: 'error', source: 'worker', subscriptionId: job.subscription_id, jobId: job.id, message: `检查失败：${message}` });
       await recordPerformanceMetric({ scope: 'capture', metric: 'processed', dimension: 'failed', durationMs: Date.now() - startedAtMs }).catch(() => undefined);
     }
@@ -155,19 +124,18 @@ async function reportInfrastructureError(error: unknown) {
 
 async function recoverStalledJobs() {
   if (Date.now() - lastStalledRecoveryAt < 60_000) return;
+  await recoverInterruptedJobs('capture');
   lastStalledRecoveryAt = Date.now();
-  const cutoff = new Date(Date.now() - 10 * 60_000).toISOString();
-  await db.run("UPDATE jobs SET status = 'queued', started_at = NULL WHERE status = 'running' AND started_at < ?", [cutoff]);
 }
 
 async function tick() {
   if (working) return;
   working = true;
   try {
-    await heartbeat();
     if (isExecutionEngineDraining()) return;
     await refreshSettings();
     await recoverStalledJobs();
+    await heartbeat();
     await enqueueDueSubscriptions();
     await runNextJob();
   } catch (error) {

@@ -46,6 +46,8 @@ docker compose up -d --build
 
 打开 `http://NAS_IP:3030`。Compose 只启动一个 Page Watch 容器；容器内常驻的只有网页 API/SSE 进程与轻量执行引擎。网页检查、发行日期、磁力检索与预览由按需网页执行器处理，并和 Chromium 一起在设定的空闲时间后退出；Jellyfin 全量同步同样由按需同步器分页写入 PostgreSQL。任务中心仍展示六项独立逻辑服务，订阅、档案、队列、下载与影视库状态、运行日志保存在 PostgreSQL；请按你的 NAS 备份策略备份 `pagewatch` 数据库。
 
+检查计划、网页和通知均使用北京时间（`Asia/Shanghai`），每日、每周检查保留按订阅固定的 0～3 分钟错峰；到期任务仍按队列依次执行。首次升级会一次性校正已有每日、每周计划，从下一个北京时间计划点继续执行，不补跑当天已错过的计划；按小时检查的间隔、已有任务和失败重试时间保持不变。数据库继续保存 UTC 时间，无需修改 PostgreSQL 的时区。
+
 部署前请复制 `.env.example` 为 `.env`。项目只支持 PostgreSQL；首次在网页填写连接信息，或使用 `DATABASE_*` 环境变量。现有明确标记为 PostgreSQL 的 version 2 引导文件可继续使用；旧 MySQL 配置、旧 `MYSQL_*` 变量和未注明类型的旧引导文件会被明确拒绝，不会误连或覆盖。连接信息保存在 `data/database-bootstrap.json`，外部服务凭据保存在数据库，请限制备份与数据目录的访问权限。健康检查使用 `/api/ready`，安装引导未完成时返回 503。
 
 ### 已有 PostgreSQL 部署升级

@@ -2,6 +2,8 @@ import { db, getJellyfinSettings, getSetting, recoverStaleLibrarySyncJobs, refre
 import type { ExecutionEngineController } from './engine-controller.js';
 import { nextJellyfinSyncAt } from './library-sync-schedule.js';
 import { getInspectionRules } from './inspection-rules.js';
+import { legacyReleasePredicate, readyFullScanBatchPredicate } from './queue-predicates.js';
+import { recoverStalledJobs } from './job-recovery.js';
 
 const FALLBACK_SCAN_MS = 60_000;
 
@@ -48,6 +50,7 @@ export class EngineWakeScheduler {
     await refreshSettings();
     if (Date.now() - this.lastRecoveryCheckAt >= FALLBACK_SCAN_MS) {
       await recoverStaleLibrarySyncJobs();
+      await recoverStalledJobs();
       this.lastRecoveryCheckAt = Date.now();
     }
     const queue = await db.get<NextWakeRow>(`SELECT MIN(wake_at) AS wake_at FROM (
@@ -58,12 +61,13 @@ export class EngineWakeScheduler {
       UNION ALL SELECT MIN(COALESCE(retry_after, requested_at)) FROM download_jobs WHERE status = 'queued'
       UNION ALL SELECT MIN(requested_at) FROM library_sync_jobs WHERE status = 'queued'
       UNION ALL SELECT MIN(next_attempt_at) FROM notification_outbox WHERE status = 'queued'
+      UNION ALL SELECT MIN(b.created_at) FROM full_scan_batches b WHERE ${readyFullScanBatchPredicate}
       UNION ALL SELECT MIN(COALESCE(next_scheduled_at, updated_at)) FROM subscriptions WHERE is_active = 1
     ) AS candidates`);
     let next = queue?.wake_at ? Date.parse(queue.wake_at) : Number.POSITIVE_INFINITY;
     if (getInspectionRules().releaseDate.enabled && next > Date.now()) {
-      const legacy = await db.get<{ id: number }>(`SELECT id FROM archive_entries WHERE release_status = 'unsearched'
-        OR (release_status = 'unavailable' AND release_error = '详情页未找到标签“发行日期”对应的日期值。') LIMIT 1`);
+      const legacy = await db.get<{ id: number }>(`SELECT a.id FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
+        WHERE ${legacyReleasePredicate} LIMIT 1`);
       if (legacy) next = Date.now();
     }
     const jellyfin = getJellyfinSettings();

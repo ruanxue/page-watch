@@ -8,6 +8,7 @@ import { isJellyfinSyncDue } from './library-sync-schedule.js';
 import { notifyLive } from './live-events.js';
 import { isExecutionEngineDraining } from './engine-drain.js';
 import { createOperationFailureNotification, enqueueNotification } from './notifications.js';
+import { recoverStalledJobs } from './job-recovery.js';
 
 // An idle worker only needs a modest polling cadence. Once a complete local
 // Jellyfin index exists, however, individual matches are indexed PostgreSQL reads
@@ -17,6 +18,7 @@ const POLL_MS = 15_000;
 const LOCAL_MATCH_BATCH_SIZE = 20;
 const LOCAL_MATCH_BATCH_YIELD_MS = 50;
 let working = false;
+let lastStalledRecoveryAt = 0;
 let syncing = false;
 let lastErrorLogAt = 0;
 let syncTask: WorkerTaskContext | null = null;
@@ -191,6 +193,10 @@ async function tick() {
   try {
     await refreshSettings();
     if (isExecutionEngineDraining()) return;
+    if (Date.now() - lastStalledRecoveryAt >= 60_000) {
+      await recoverStalledJobs('library');
+      lastStalledRecoveryAt = Date.now();
+    }
     const settings = getJellyfinSettings();
     if (!settings.enabled) {
       // Finish any already-queued gate checks by falling back to magnet work;

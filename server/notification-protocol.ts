@@ -1,5 +1,6 @@
 import { createHmac } from 'node:crypto';
 import type { NotificationPayload, NotificationSettings } from './notifications.js';
+import { SCHEDULE_TIME_ZONE } from './subscription-schedule.js';
 
 export type FetchLike = (input: string, init: RequestInit) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
 export type NotificationRequest = { url: string; body: string; headers: Record<string, string> };
@@ -28,7 +29,7 @@ function formatNotificationTime(occurredAt: string) {
   const date = new Date(occurredAt);
   if (!Number.isFinite(date.getTime())) return occurredAt;
   const parts = new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+    timeZone: SCHEDULE_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
   }).formatToParts(date);
   const values = Object.fromEntries(parts.filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]));

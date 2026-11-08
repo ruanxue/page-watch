@@ -349,6 +349,41 @@ test('PostgreSQL 真实数据库回归', { timeout: 120_000 }, async (t) => {
       assert.equal(await db.get('SELECT value FROM app_settings WHERE "key"=?', ['断线写入不可重放']), undefined);
       assert.equal((await db.get<{ value: number }>('SELECT 1 AS value'))!.value, 1);
     });
+    await t.test('一次性校正旧检查计划，保留错峰、小时计划和历史，失败完整回滚', async () => {
+      const { repairSubscriptionSchedules, SCHEDULE_REPAIR_KEY } = await import('../subscription-schedule-repair.js');
+      const { nextCalendarCheckAt } = await import('../subscription-schedule.js');
+      const daily = await createSubscription({ isActive: false });
+      const weekly = await createSubscription({ scheduleType: 'weekly', scheduleWeekday: 1 });
+      const hourly = await createSubscription({ scheduleType: 'hourly', scheduleIntervalHours: 2 });
+      const unscheduled = await createSubscription();
+      const oldWake = '2026-11-09T09:00:00.000Z';
+      for (const id of [daily.id, weekly.id, hourly.id]) await db.run('UPDATE subscriptions SET next_scheduled_at=? WHERE id=?', [oldWake, id]);
+      const snapshot = (await getSubscription(daily.id))!;
+      // 超过两个小批次，验证编号游标会继续处理后续订阅。
+      const inserted = await db.all<{ id: number }>(`INSERT INTO subscriptions (name,url,selector,created_at,updated_at,schedule_type,schedule_time,next_scheduled_at)
+        SELECT '计划校正批次', 'https://8.8.8.8/test', '.code', ?, ?, 'daily', '09:00', ? FROM generate_series(1,201) RETURNING id`,
+      [snapshot.created_at, snapshot.updated_at, oldWake]);
+      const reference = new Date('2026-11-08T11:00:00.000Z');
+      await db.run('DELETE FROM app_settings WHERE "key"=?', [SCHEDULE_REPAIR_KEY]);
+      await assert.rejects(db.transaction(async (tx) => {
+        await repairSubscriptionSchedules(tx, reference);
+        throw new Error('模拟校正失败');
+      }), /模拟校正失败/);
+      assert.equal((await getSubscription(daily.id))!.next_scheduled_at, oldWake);
+      assert.equal(await db.get('SELECT value FROM app_settings WHERE "key"=?', [SCHEDULE_REPAIR_KEY]), undefined);
+      assert.ok(await db.transaction((tx) => repairSubscriptionSchedules(tx, reference)) >= 203);
+      for (const id of [daily.id, weekly.id, inserted[0].id, inserted[200].id]) {
+        const current = (await getSubscription(id))!;
+        assert.equal(current.next_scheduled_at, nextCalendarCheckAt(current, reference).toISOString());
+      }
+      assert.equal((await getSubscription(hourly.id))!.next_scheduled_at, oldWake);
+      assert.equal((await getSubscription(unscheduled.id))!.next_scheduled_at, null);
+      const corrected = (await getSubscription(daily.id))!;
+      assert.deepEqual({ ...corrected, next_scheduled_at: snapshot.next_scheduled_at }, snapshot);
+      assert.equal(await db.transaction((tx) => repairSubscriptionSchedules(tx, new Date('2026-11-12T11:00:00Z'))), 0);
+      assert.equal((await getSubscription(daily.id))!.next_scheduled_at, corrected.next_scheduled_at);
+    });
+    await (await import('./queue-lifecycle-cases.js')).testQueueLifecycle(t, app);
   } finally {
     globalThis.fetch = originalFetch;
     const cleanupErrors: unknown[] = [];

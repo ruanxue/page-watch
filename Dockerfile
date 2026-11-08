@@ -17,6 +17,7 @@ WORKDIR /app
 
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV MALLOC_ARENA_MAX=2
+ENV TZ=Asia/Shanghai
 
 COPY package.json package-lock.json ./
 RUN apt-get update \

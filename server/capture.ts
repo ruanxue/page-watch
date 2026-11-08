@@ -320,7 +320,9 @@ export async function captureSubscription(subscription: Subscription, browserPri
 
 async function stagePage(subscription: Subscription, scanId: string, page: number, items: CapturedItem[]) {
   const now = new Date().toISOString();
-  await db.transaction(async (tx) => {
+  return db.transaction(async (tx) => {
+    const current = await tx.get('SELECT id FROM subscriptions WHERE id = ? AND initial_scan_run_id = ? FOR UPDATE', [subscription.id, scanId]);
+    if (!current) return false;
     // Use bounded multi-row inserts: a large pagination page must not turn
     // into hundreds of per-row PostgreSQL round trips or one unbounded statement.
     for (let offset = 0; offset < items.length; offset += 100) {
@@ -332,13 +334,27 @@ async function stagePage(subscription: Subscription, scanId: string, page: numbe
     }
     await tx.run(`UPDATE subscriptions SET initial_scan_pages_completed = GREATEST(initial_scan_pages_completed, ?), initial_scan_next_page = ?, last_error = NULL, updated_at = ?
       WHERE id = ? AND initial_scan_run_id = ?`, [page, page + 1, now, subscription.id, scanId]);
+    return true;
   });
 }
 
 async function captureInitialFullScan(subscription: Subscription, browserPriority = 0) {
-  const pendingBatch = subscription.initial_scan_run_id ? undefined : await db.get<{ id: string }>(`SELECT id FROM full_scan_batches
-    WHERE subscription_id = ? AND status = 'scanning' ORDER BY created_at DESC, id DESC LIMIT 1`, [subscription.id]);
-  let scanId = subscription.initial_scan_run_id ?? pendingBatch?.id ?? crypto.randomUUID();
+  const cancelled = () => ({ title: subscription.name, content: '', hash: hash(''), pageCount: 0,
+    changed: false, capturedAt: new Date().toISOString(), stored: false, addedCount: 0, itemCount: 0, totalPages: 0 });
+  // 在第一次网络等待之前认领扫描；重置与删除先锁同一行，使旧请求不能重新建立扫描。
+  const scanId = await db.transaction(async (tx) => {
+    const current = await tx.get<Subscription>('SELECT * FROM subscriptions WHERE id = ? FOR UPDATE', [subscription.id]);
+    if (!current || current.updated_at !== subscription.updated_at || current.initial_scan_completed) return null;
+    const pending = current.initial_scan_run_id ? undefined : await tx.get<{ id: string }>(`SELECT id FROM full_scan_batches
+      WHERE subscription_id = ? AND status = 'scanning' ORDER BY created_at DESC, id DESC LIMIT 1`, [subscription.id]);
+    const id = current.initial_scan_run_id ?? pending?.id ?? crypto.randomUUID();
+    await tx.run('UPDATE subscriptions SET initial_scan_run_id = ? WHERE id = ?', [id, subscription.id]);
+    await tx.run(`INSERT INTO full_scan_batches (id, subscription_id, subscription_name, status, is_initial, page_count, scanned_count, archived_count, created_at)
+      VALUES (?, ?, ?, 'scanning', ?, ?, 0, 0, ?) ON CONFLICT (id) DO UPDATE SET status = 'scanning'`,
+    [id, subscription.id, subscription.name, subscription.last_hash ? 0 : 1, subscription.initial_scan_total, new Date().toISOString()]);
+    return id;
+  });
+  if (!scanId) return cancelled();
   let total = subscription.initial_scan_total ?? 0;
   let first: CaptureResult | null = null;
   let nextPage = Math.max(1, subscription.initial_scan_next_page || 1);
@@ -347,27 +363,25 @@ async function captureInitialFullScan(subscription: Subscription, browserPriorit
     catch (error) { throw new Error(describeError(error, { action: '第 1 页读取', target: new URL(subscription.url).hostname, proxyUrl: getOutboundProxyUrl() }), { cause: error }); }
     total = first.pageCount ?? 1;
     const now = new Date().toISOString();
-    await db.transaction(async (tx) => {
+    const valid = await db.transaction(async (tx) => {
+      const current = await tx.get('SELECT id FROM subscriptions WHERE id = ? AND initial_scan_run_id = ? FOR UPDATE', [subscription.id, scanId]);
+      if (!current) return false;
       await tx.run('DELETE FROM initial_scan_items WHERE subscription_id = ?', [subscription.id]);
-      await tx.run(`UPDATE subscriptions SET initial_scan_run_id = ?, initial_scan_total = ?, initial_scan_pages_completed = 0, initial_scan_next_page = 1, last_error = NULL, updated_at = ? WHERE id = ?`, [scanId, total, now, subscription.id]);
-      await tx.run(`INSERT INTO full_scan_batches (id, subscription_id, subscription_name, status, is_initial, page_count, scanned_count, archived_count, created_at)
-        VALUES (?, ?, ?, 'scanning', ?, ?, 0, 0, ?)
-        ON CONFLICT (id) DO UPDATE SET subscription_name = EXCLUDED.subscription_name, page_count = EXCLUDED.page_count, status = 'scanning'`,
-      [scanId, subscription.id, subscription.name, subscription.last_hash ? 0 : 1, total, now]);
+      await tx.run(`UPDATE subscriptions SET initial_scan_total = ?, initial_scan_pages_completed = 0, initial_scan_next_page = 1, last_error = NULL, updated_at = ? WHERE id = ?`, [total, now, subscription.id]);
+      await tx.run('UPDATE full_scan_batches SET page_count = ? WHERE id = ?', [total, scanId]);
+      return true;
     });
-    await stagePage(subscription, scanId, 1, first.items);
+    if (!valid || !await stagePage(subscription, scanId, 1, first.items)) return cancelled();
     nextPage = 2;
-  } else {
-    await db.run(`INSERT INTO full_scan_batches (id, subscription_id, subscription_name, status, is_initial, page_count, scanned_count, archived_count, created_at)
-      VALUES (?, ?, ?, 'scanning', ?, ?, 0, 0, ?) ON CONFLICT (id) DO NOTHING`, [scanId, subscription.id, subscription.name, subscription.last_hash ? 0 : 1, total, new Date().toISOString()]);
   }
   for (let page = nextPage; page <= total; page += 1) {
+    if (!await db.get('SELECT id FROM subscriptions WHERE id = ? AND initial_scan_run_id = ?', [subscription.id, scanId])) return cancelled();
     const url = new URL(subscription.url);
     url.searchParams.set(subscription.pagination_parameter || 'page', String(page));
     let result: CaptureResult;
     try { result = await capturePage(subscription, url.toString(), false, browserPriority); }
     catch (error) { throw new Error(describeError(error, { action: `第 ${page}/${total} 页读取`, target: url.hostname, proxyUrl: getOutboundProxyUrl() }), { cause: error }); }
-    await stagePage(subscription, scanId, page, result.items);
+    if (!await stagePage(subscription, scanId, page, result.items)) return cancelled();
   }
   const now = new Date().toISOString();
   let cursor = 0;
@@ -377,6 +391,7 @@ async function captureInitialFullScan(subscription: Subscription, browserPriorit
   let addedCount = 0;
   let stored = false;
   await db.transaction(async (tx) => {
+    if (!await tx.get('SELECT id FROM subscriptions WHERE id = ? AND initial_scan_run_id = ? FOR UPDATE', [subscription.id, scanId])) return;
     // Keep the staged archive invisible until all pages have arrived and this
     // one transaction commits, while only retaining one 200-row slice in RAM.
     while (true) {

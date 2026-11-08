@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { flushSubscriptionProgressRebuilds, flushTelemetry, refreshSettings, reportRuntimeMetrics, reportWorkerHeartbeat, type WorkerName } from './db.js';
+import { flushSubscriptionProgressRebuilds, flushTelemetry, refreshSettings, reportRuntimeMetrics, renewWorkerHeartbeat, type WorkerName } from './db.js';
 import { webExecutor } from './web-executor-client.js';
 import { librarySyncExecutor } from './library-sync-client.js';
 import { startRuntimeMemoryReporter } from './runtime-observability.js';
@@ -28,7 +28,7 @@ const activeHandlers = new Set<HandlerName>();
 // API 的健康检查在 90 秒收不到心跳落库后就把 worker 判为不可用。这里的
 // worker 运行时带着 PAGE_WATCH_WORKER_AUTOSTART=0，它们自己的 15 秒心跳定时器
 // 根本不会启动，而一个长耗时的浏览器批次会让 handler 停在首次心跳里远超 90 秒。
-const heartbeatWorkers: WorkerName[] = ['capture', 'release', 'magnet', 'download', 'library'];
+const heartbeatWorkers = ['capture', 'release', 'magnet', 'download', 'library'] as const satisfies readonly WorkerName[];
 
 function send(message: unknown) { if (process.send) process.send(message); }
 function reportState(state: 'running' | 'sleeping', detail: string) { send({ type: 'state', state, detail }); }
@@ -112,7 +112,8 @@ function scheduleDispatch(delay: number) {
 
 function keepAliveHeartbeats() {
   for (const name of heartbeatWorkers) {
-    void reportWorkerHeartbeat(name, '正在执行引擎中处理队列', 'busy', null, { force: true })
+    if (!activeHandlers.has(name)) continue;
+    void renewWorkerHeartbeat(name)
       .catch((error) => console.error(`无法续报 ${name} 的心跳：${error instanceof Error ? error.message : String(error)}`));
   }
 }

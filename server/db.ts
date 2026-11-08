@@ -9,6 +9,7 @@ import { notifyLive } from './live-events.js';
 import { decryptSecret, isEncryptedSecret, isPageWatchEncryptedValue, readOptionalLegacyApplicationEncryptionKey } from './secret-storage.js';
 import { resolveHeartbeatWrite, type WorkerHeartbeatContext, type WorkerHeartbeatOptions, type WorkerName, type WorkerTaskContext } from './worker-heartbeat.js';
 import { defaultRuntimeSettings, normalizeRuntimeSettings, type RuntimeSettings } from './runtime-settings.js';
+import { repairSubscriptionSchedules, SCHEDULE_REPAIR_KEY } from './subscription-schedule-repair.js';
 
 let pool: Pool | null = null;
 let databaseSource: 'environment' | 'saved' | null = null;
@@ -202,6 +203,12 @@ export type MagnetStatus = 'unsearched' | 'pending' | 'found' | 'not_found' | 'f
 export type DownloadStatus = 'not_queued' | 'queued' | 'running' | 'added' | 'waiting' | 'downloading' | 'paused' | 'completed' | 'removed' | 'filtered' | 'failed';
 
 export type { WorkerName, WorkerTaskContext } from './worker-heartbeat.js';
+
+// 只续期正在处理的任务，保留处理器填写的任务编号与进度。
+export async function renewWorkerHeartbeat(workerName: WorkerName) {
+  await db.run(`UPDATE worker_heartbeats SET last_seen_at = ? WHERE worker_name = ? AND status = 'busy'`,
+    [new Date().toISOString(), workerName]);
+}
 
 /** A tiny, DB-backed heartbeat is reliable across the separate Docker services. */
 export async function reportWorkerHeartbeat(workerName: WorkerName, detail: string, status: 'ready' | 'busy' | 'sleeping' | 'error' = 'ready', task: WorkerTaskContext | null = null, options: WorkerHeartbeatOptions = {}) {
@@ -876,6 +883,10 @@ export function initializeDatabase() {
     await seedDefaultInspectionRules();
     await assignLegacyMissavRules();
     await migrateRuleGroups();
+    if (!getSetting(SCHEDULE_REPAIR_KEY)) {
+      await db.transaction((tx) => repairSubscriptionSchedules(tx));
+      settings.set(SCHEDULE_REPAIR_KEY, '1');
+    }
     await rebuildSubscriptionProgress();
   })();
   return initialization;

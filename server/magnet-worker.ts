@@ -1,3 +1,4 @@
+import { recoverStalledJobs as recoverInterruptedJobs } from './job-recovery.js';
 import { appendRuntimeLog, db, getQbittorrentSettings, queueDownloadJob, recordPerformanceMetric, refreshSettings, reportWorkerHeartbeat, scheduleSubscriptionProgressRebuild, type WorkerTaskContext } from './db.js';
 import { webExecutor } from './web-executor-client.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
@@ -145,19 +146,18 @@ async function reportInfrastructureError(error: unknown) {
 
 async function recoverStalledJobs() {
   if (Date.now() - lastStalledRecoveryAt < 60_000) return;
+  await recoverInterruptedJobs('magnet');
   lastStalledRecoveryAt = Date.now();
-  const cutoff = new Date(Date.now() - 10 * 60_000).toISOString();
-  await db.run("UPDATE magnet_jobs SET status = 'queued', started_at = NULL WHERE status = 'running' AND started_at < ?", [cutoff]);
 }
 
 async function tick() {
   if (working) return;
   working = true;
   try {
-    await heartbeat();
     if (isExecutionEngineDraining()) return;
     await refreshSettings();
     await recoverStalledJobs();
+    await heartbeat();
     await runNextMagnetJob();
   } catch (error) {
     await reportWorkerHeartbeat('magnet', '磁力检索 Worker 遇到基础设施错误', 'error').catch(() => undefined);

@@ -258,7 +258,7 @@ const defaultMissavPresetForm: PresetForm = {
 function formatTime(value: string | null) {
   if (!value) return '尚未检查';
   const date = new Date(value);
-  return new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(date);
+  return new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(date);
 }
 
 function shortUrl(value: string) {
@@ -328,7 +328,7 @@ function subscriptionToForm(item: Subscription): FormData {
 }
 
 function ScheduleControls({ form, update }: { form: Pick<FormData, 'scheduleType' | 'scheduleIntervalHours' | 'scheduleTime' | 'scheduleWeekday'>; update: <K extends 'scheduleType' | 'scheduleIntervalHours' | 'scheduleTime' | 'scheduleWeekday'>(key: K, value: FormData[K]) => void }) {
-  return <section className="schedule-settings"><div className="schedule-settings-heading">检查计划 <span>按 NAS 本地时间执行</span></div><div className="two-col"><label>执行方式<select value={form.scheduleType} onChange={(event) => update('scheduleType', event.target.value as FormData['scheduleType'])}><option value="hourly">按小时检查</option><option value="daily">每天定时检查</option><option value="weekly">每周定时检查</option></select></label>{form.scheduleType === 'hourly' ? <label>每隔（小时）<input type="number" min="1" max="168" value={form.scheduleIntervalHours} onChange={(event) => update('scheduleIntervalHours', Number(event.target.value))} /></label> : <label>检查时间<input type="time" value={form.scheduleTime} onChange={(event) => update('scheduleTime', event.target.value)} /></label>}</div>{form.scheduleType === 'weekly' && <label>执行日期<select value={form.scheduleWeekday} onChange={(event) => update('scheduleWeekday', Number(event.target.value))}>{weekdayLabels.map((label, weekday) => <option key={weekday} value={weekday}>{label}</option>)}</select></label>}</section>;
+  return <section className="schedule-settings"><div className="schedule-settings-heading">检查计划 <span>北京时间 · 错峰 0～3 分钟</span></div><div className="two-col"><label>执行方式<select value={form.scheduleType} onChange={(event) => update('scheduleType', event.target.value as FormData['scheduleType'])}><option value="hourly">按小时检查</option><option value="daily">每天定时检查</option><option value="weekly">每周定时检查</option></select></label>{form.scheduleType === 'hourly' ? <label>每隔（小时）<input type="number" min="1" max="168" value={form.scheduleIntervalHours} onChange={(event) => update('scheduleIntervalHours', Number(event.target.value))} /></label> : <label>检查时间<input type="time" value={form.scheduleTime} onChange={(event) => update('scheduleTime', event.target.value)} /></label>}</div>{form.scheduleType === 'weekly' && <label>执行日期<select value={form.scheduleWeekday} onChange={(event) => update('scheduleWeekday', Number(event.target.value))}>{weekdayLabels.map((label, weekday) => <option key={weekday} value={weekday}>{label}</option>)}</select></label>}</section>;
 }
 
 function AppShell({ onLogout }: { onLogout: () => Promise<void> }) {
@@ -789,7 +789,7 @@ function SubscriptionCard({ item, onOpenArchive, onRun, onEdit, onToggle }: { it
     onOpenArchive(item);
   }}>
     <div className="card-top"><div className="site-ident">{shortUrl(item.url).slice(0, 1).toUpperCase()}</div><div className="card-title"><h3><a className="card-archive-link" href={`#subscriptions/archive/${item.id}`} aria-label={`打开“${item.name}”的影片档案`} onClick={(event) => { event.preventDefault(); onOpenArchive(item); }}>{item.name}</a></h3><a href={item.url} target="_blank" rel="noreferrer">{shortUrl(item.url)} ↗</a></div>{showNewCount && <span className="subscription-new-count" title={`最近一次成功扫描新增 ${item.last_scan_added_count} 部影片`} aria-label={`最近一次成功扫描新增 ${item.last_scan_added_count} 部影片`}>+{item.last_scan_added_count}</span>}<button className="icon-button" title="编辑订阅" aria-label={`编辑“${item.name}”`} onClick={() => onEdit(item)}>⋯</button></div>
-    <div className="subscription-archive-count"><b>{item.archive_count}</b><span>部影片</span><small>点击卡片查看档案</small></div>
+    <div className="subscription-archive-count" title="Jellyfin 影视库中已入库的影片数量"><b>{item.jellyfin_available_count ?? 0}</b><span>部已入库</span><small>点击卡片查看档案</small></div>
     {item.last_error && <div className="error-line">上次失败：{item.last_error}</div>}
     <footer className="card-footer">
       <div className="card-time-info">{item.is_active && <span className="card-schedule">{scheduleLabel(item)}</span>}<span className={`card-check-result ${item.last_error ? 'failed' : item.last_checked_at ? 'success' : 'pending'}`}>{item.last_error ? '检查失败' : item.last_checked_at ? `检查正常 · ${formatTime(item.last_checked_at)}` : '尚未检查'}</span></div>

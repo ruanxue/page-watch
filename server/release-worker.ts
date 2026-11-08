@@ -1,3 +1,4 @@
+import { recoverStalledJobs as recoverInterruptedJobs } from './job-recovery.js';
 import { appendRuntimeLog, db, queueReleaseJob, recordPerformanceMetric, refreshSettings, reportWorkerHeartbeat, scheduleSubscriptionProgressRebuild, type WorkerTaskContext } from './db.js';
 import { webExecutor } from './web-executor-client.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
@@ -5,6 +6,7 @@ import { expandReleaseUrl, getInspectionRules } from './inspection-rules.js';
 import { notifyLive } from './live-events.js';
 import { isExecutionEngineDraining } from './engine-drain.js';
 import { createOperationFailureNotification, enqueueNotification } from './notifications.js';
+import { legacyReleasePredicate } from './queue-predicates.js';
 
 const POLL_MS = 1_000;
 const BACKFILL_BATCH_SIZE = 100;
@@ -34,9 +36,8 @@ async function queueLegacyReleaseLookups() {
   if (!rule.enabled) return;
   const entries = await db.all<LegacyEntry>(`SELECT a.id, a.subscription_id, a.content, a.detail_url, s.url AS subscription_url
     FROM archive_entries a JOIN subscriptions s ON s.id = a.subscription_id
-    WHERE s.rule_family = 'missav' AND (a.release_status = 'unsearched'
-      OR (a.release_status = 'unavailable' AND a.release_error = ?))
-    ORDER BY a.id ASC LIMIT ?`, [PREVIOUS_DATE_PATTERN_RESULT, BACKFILL_BATCH_SIZE]);
+    WHERE ${legacyReleasePredicate}
+    ORDER BY a.id ASC LIMIT ?`, [BACKFILL_BATCH_SIZE]);
   for (const entry of entries) {
     const detailUrl = expandReleaseUrl(rule.urlTemplate, { detailUrl: entry.detail_url, subscriptionUrl: entry.subscription_url, content: entry.content });
     const now = new Date().toISOString();
@@ -151,9 +152,8 @@ async function heartbeat() {
 
 async function recoverStalledJobs() {
   if (Date.now() - lastStalledRecoveryAt < 60_000) return;
+  await recoverInterruptedJobs('release');
   lastStalledRecoveryAt = Date.now();
-  const cutoff = new Date(Date.now() - 10 * 60_000).toISOString();
-  await db.run("UPDATE release_jobs SET status = 'queued', started_at = NULL WHERE status = 'running' AND started_at < ?", [cutoff]);
 }
 
 async function reportInfrastructureError(error: unknown) {
@@ -169,10 +169,10 @@ async function tick() {
   if (working) return;
   working = true;
   try {
-    await heartbeat();
     if (isExecutionEngineDraining()) return;
     await refreshSettings();
     await recoverStalledJobs();
+    await heartbeat();
     // Drain current work first. A legacy scan is needed only when the queue
     // runs dry, not once for every individual film.
     if (!await runNextReleaseJob()) {

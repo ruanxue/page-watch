@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { db, getSetting, refreshSettings, setSetting, type DatabaseClient } from './db.js';
 import { buildNotificationRequest, type FetchLike } from './notification-protocol.js';
+import { readyFullScanBatchPredicate } from './queue-predicates.js';
 
 export { dingtalkSignature, notificationMarkdown, webhookSignature } from './notification-protocol.js';
 
@@ -440,8 +441,17 @@ async function recoverStalledNotifications() {
 
 async function finalizeOneFullScanBatch() {
   return db.transaction(async (tx) => {
-    const batch = await tx.get<{ id: string; subscription_id: number; subscription_name: string; page_count: number | null; scanned_count: number | null; archived_count: number | null }>(`SELECT id, subscription_id, subscription_name, page_count, scanned_count, archived_count
-      FROM full_scan_batches WHERE status = 'processing' ORDER BY created_at ASC, id ASC LIMIT 1 FOR UPDATE`);
+    const candidate = await tx.get<{ id: string; subscription_id: number }>(`SELECT b.id, b.subscription_id
+      FROM full_scan_batches b WHERE ${readyFullScanBatchPredicate} ORDER BY b.created_at ASC, b.id ASC LIMIT 1`);
+    if (!candidate) return false;
+    // 与删除、重置采用同一锁顺序，通知入队与批次删除要么先完成、要么一起取消。
+    const subscription = await tx.get('SELECT id FROM subscriptions WHERE id = ? FOR UPDATE', [candidate.subscription_id]);
+    if (!subscription) {
+      await tx.run('DELETE FROM full_scan_batches WHERE id = ?', [candidate.id]);
+      return true;
+    }
+    const batch = await tx.get<{ id: string; subscription_id: number; subscription_name: string; page_count: number | null; scanned_count: number | null; archived_count: number | null }>(`SELECT b.*
+      FROM full_scan_batches b WHERE b.id = ? AND ${readyFullScanBatchPredicate} FOR UPDATE`, [candidate.id]);
     if (!batch) return false;
     const active = await tx.get<{ count: number }>(`SELECT
       (SELECT COUNT(*) FROM release_jobs j JOIN archive_entries a ON a.id = j.archive_entry_id WHERE a.full_scan_batch_id = ? AND j.status IN ('queued','running')) +
@@ -494,6 +504,11 @@ export async function runNotificationWorkerTick() {
     let payload: NotificationPayload;
     try { payload = JSON.parse(job.payload) as NotificationPayload; }
     catch { throw new Error('通知队列载荷格式无效。'); }
+    if (payload.subscription && !await db.get('SELECT id FROM subscriptions WHERE id = ?', [payload.subscription.id])) {
+      await db.run(`UPDATE notification_outbox SET status = 'skipped', failed_at = ?, last_error = '订阅已删除，取消通知。' WHERE id = ?`, [new Date().toISOString(), job.id]);
+      return;
+    }
+    if (!await db.get("SELECT id FROM notification_outbox WHERE id = ? AND status = 'running'", [job.id])) return;
     const settings = getNotificationSettings();
     if (!isNotificationEventEnabled(job.event_type, settings)) {
       await db.run(`UPDATE notification_outbox SET status = 'skipped', failed_at = ?, last_error = ? WHERE id = ?`, [new Date().toISOString(), '通知设置已停用或对应事件已关闭。', job.id]);

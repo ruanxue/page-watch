@@ -1,3 +1,4 @@
+import { recoverStalledJobs as recoverInterruptedJobs } from './job-recovery.js';
 import { appendRuntimeLog, db, getQbittorrentSettings, recordPerformanceMetric, refreshSettings, reportIntegrationStatus, reportWorkerHeartbeat, scheduleSubscriptionProgressRebuild, type DatabaseClient, type WorkerTaskContext } from './db.js';
 import { addMagnetToQbittorrent, getQbittorrentTorrentFiles, getQbittorrentTorrentStates, isQbittorrentDownloadComplete, isQbittorrentDownloadPaused, isQbittorrentReadyToStopSeeding, setQbittorrentTorrentFilePriority, startQbittorrentTorrents, stopQbittorrentTorrents, torrentHashFromMagnet, type QbittorrentTorrentFile, type QbittorrentTorrentState } from './qbittorrent.js';
 import { isRetryableJobError, MAX_JOB_ATTEMPTS, retryDelayMs, retryDescription, retryReason } from './retry.js';
@@ -170,9 +171,8 @@ async function reportInfrastructureError(error: unknown) {
 
 async function recoverStalledJobs() {
   if (Date.now() - lastStalledRecoveryAt < 60_000) return;
+  await recoverInterruptedJobs('download');
   lastStalledRecoveryAt = Date.now();
-  const cutoff = new Date(Date.now() - 10 * 60_000).toISOString();
-  await db.run("UPDATE download_jobs SET status = 'queued', started_at = NULL WHERE status = 'running' AND started_at < ?", [cutoff]);
 }
 
 function stateForDownload(torrent: QbittorrentTorrentState) {
@@ -495,10 +495,10 @@ async function tick(observe = true) {
   if (working) return;
   working = true;
   try {
-    await heartbeat();
     if (isExecutionEngineDraining()) return;
     await refreshSettings();
     await recoverStalledJobs();
+    await heartbeat();
     await runNextDownloadJob();
     if (observe) try {
       await syncDownloadStates();

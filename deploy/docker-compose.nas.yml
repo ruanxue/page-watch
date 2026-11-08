@@ -1,6 +1,7 @@
 name: page-watch
 
 x-page-watch-environment: &page-watch-environment
+  TZ: Asia/Shanghai
   OUTBOUND_PROXY: ${OUTBOUND_PROXY:-}
   # PostgreSQL 连接留空则在网页安装引导中填写。
   DATABASE_HOST: ${DATABASE_HOST:-}
